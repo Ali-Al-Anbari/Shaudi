@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import SwiftData
 
 @main
 struct ShaudiApp: App {
@@ -13,5 +14,6 @@ struct ShaudiApp: App {
         WindowGroup {
             ContentView()
         }
+        .modelContainer(for: [Track.self, Playlist.self])
     }
 }
