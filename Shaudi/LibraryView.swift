@@ -38,12 +38,12 @@ struct LibraryView: View {
                 TrackEditorView(
                     title: "New Track",
                     actionTitle: "Create"
-                ) { title, youtubeURL in
+                ) { title, youtubeVideo in
                     modelContext.insert(
                         Track(
                             title: title,
-                            youtubeURL: youtubeURL,
-                            youtubeVideoID: ""
+                            youtubeURL: youtubeVideo.url,
+                            youtubeVideoID: youtubeVideo.id
                         )
                     )
                 }
@@ -63,7 +63,7 @@ struct TrackEditorView: View {
 
     let title: String
     let actionTitle: String
-    let onSave: (String, URL) -> Void
+    let onSave: (String, YouTubeURLParser.Video) -> Void
 
     @State private var trackTitle: String
     @State private var youtubeURLText: String
@@ -73,7 +73,7 @@ struct TrackEditorView: View {
         actionTitle: String,
         initialTrackTitle: String = "",
         initialYouTubeURL: URL? = nil,
-        onSave: @escaping (String, URL) -> Void
+        onSave: @escaping (String, YouTubeURLParser.Video) -> Void
     ) {
         self.title = title
         self.actionTitle = actionTitle
@@ -90,17 +90,8 @@ struct TrackEditorView: View {
         youtubeURLText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private var validatedURL: URL? {
-        guard
-            let url = URL(string: trimmedURLText),
-            let scheme = url.scheme?.lowercased(),
-            scheme == "http" || scheme == "https",
-            url.host != nil
-        else {
-            return nil
-        }
-
-        return url
+    private var parsedYouTubeVideo: YouTubeURLParser.Video? {
+        YouTubeURLParser.parse(trimmedURLText)
     }
 
     var body: some View {
@@ -114,8 +105,8 @@ struct TrackEditorView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } footer: {
-                    if !trimmedURLText.isEmpty && validatedURL == nil {
-                        Text("Enter a valid web URL.")
+                    if !trimmedURLText.isEmpty && parsedYouTubeVideo == nil {
+                        Text("Enter a valid YouTube video URL.")
                     }
                 }
             }
@@ -130,14 +121,14 @@ struct TrackEditorView: View {
 
                 ToolbarItem(placement: .confirmationAction) {
                     Button(actionTitle) {
-                        guard let youtubeURL = validatedURL else {
+                        guard let youtubeVideo = parsedYouTubeVideo else {
                             return
                         }
 
-                        onSave(trimmedTitle, youtubeURL)
+                        onSave(trimmedTitle, youtubeVideo)
                         dismiss()
                     }
-                    .disabled(trimmedTitle.isEmpty || validatedURL == nil)
+                    .disabled(trimmedTitle.isEmpty || parsedYouTubeVideo == nil)
                 }
             }
         }
@@ -199,9 +190,13 @@ struct TrackDetailView: View {
                 actionTitle: "Save",
                 initialTrackTitle: track.title,
                 initialYouTubeURL: track.youtubeURL
-            ) { title, youtubeURL in
+            ) { title, youtubeVideo in
                 track.title = title
-                track.youtubeURL = youtubeURL
+
+                if track.youtubeURL != youtubeVideo.url {
+                    track.youtubeURL = youtubeVideo.url
+                    track.youtubeVideoID = youtubeVideo.id
+                }
             }
         }
     }

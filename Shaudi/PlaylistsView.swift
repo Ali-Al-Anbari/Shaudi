@@ -253,11 +253,11 @@ private struct AddTracksView: View {
                 TrackEditorView(
                     title: "New Track",
                     actionTitle: "Create"
-                ) { title, youtubeURL in
+                ) { title, youtubeVideo in
                     let track = Track(
                         title: title,
-                        youtubeURL: youtubeURL,
-                        youtubeVideoID: ""
+                        youtubeURL: youtubeVideo.url,
+                        youtubeVideoID: youtubeVideo.id
                     )
 
                     modelContext.insert(track)
