@@ -7,6 +7,8 @@ import SwiftData
 import SwiftUI
 
 struct PlaylistsView: View {
+    @Environment(\.modelContext) private var modelContext
+
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
@@ -14,12 +16,15 @@ struct PlaylistsView: View {
 
     var body: some View {
         NavigationStack {
-            List(playlists) { playlist in
-                NavigationLink {
-                    PlaylistDetailView(playlist: playlist)
-                } label: {
-                    Text(playlist.name)
+            List {
+                ForEach(playlists) { playlist in
+                    NavigationLink {
+                        PlaylistDetailView(playlist: playlist)
+                    } label: {
+                        Text(playlist.name)
+                    }
                 }
+                .onDelete(perform: deletePlaylists)
             }
             .navigationTitle("Playlists")
             .toolbar {
@@ -30,17 +35,43 @@ struct PlaylistsView: View {
                 }
             }
             .sheet(isPresented: $isShowingNewPlaylist) {
-                NewPlaylistView()
+                PlaylistNameEditor(
+                    title: "New Playlist",
+                    actionTitle: "Create"
+                ) { name in
+                    modelContext.insert(Playlist(name: name))
+                }
             }
+        }
+    }
+
+    private func deletePlaylists(at offsets: IndexSet) {
+        for index in offsets {
+            modelContext.delete(playlists[index])
         }
     }
 }
 
-private struct NewPlaylistView: View {
+private struct PlaylistNameEditor: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.modelContext) private var modelContext
 
-    @State private var name = ""
+    let title: String
+    let actionTitle: String
+    let onSave: (String) -> Void
+
+    @State private var name: String
+
+    init(
+        title: String,
+        actionTitle: String,
+        initialName: String = "",
+        onSave: @escaping (String) -> Void
+    ) {
+        self.title = title
+        self.actionTitle = actionTitle
+        self.onSave = onSave
+        _name = State(initialValue: initialName)
+    }
 
     private var trimmedName: String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -51,7 +82,7 @@ private struct NewPlaylistView: View {
             Form {
                 TextField("Playlist Name", text: $name)
             }
-            .navigationTitle("New Playlist")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -61,8 +92,8 @@ private struct NewPlaylistView: View {
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
-                        modelContext.insert(Playlist(name: trimmedName))
+                    Button(actionTitle) {
+                        onSave(trimmedName)
                         dismiss()
                     }
                     .disabled(trimmedName.isEmpty)
@@ -75,8 +106,24 @@ private struct NewPlaylistView: View {
 private struct PlaylistDetailView: View {
     let playlist: Playlist
 
+    @State private var isShowingRename = false
+
     var body: some View {
         Text("Playlist content will appear here.")
             .navigationTitle(playlist.name)
+            .toolbar {
+                Button("Rename") {
+                    isShowingRename = true
+                }
+            }
+            .sheet(isPresented: $isShowingRename) {
+                PlaylistNameEditor(
+                    title: "Rename Playlist",
+                    actionTitle: "Save",
+                    initialName: playlist.name
+                ) { name in
+                    playlist.name = name
+                }
+            }
     }
 }
