@@ -11,10 +11,7 @@ import SwiftData
 struct ContentView: View {
     var body: some View {
         TabView {
-            NavigationStack {
-                Text("Library")
-                    .navigationTitle("Library")
-            }
+            LibraryView()
             .tabItem {
                 Label("Library", systemImage: "music.note.house")
             }
