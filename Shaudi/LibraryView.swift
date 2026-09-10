@@ -136,12 +136,13 @@ struct TrackEditorView: View {
 }
 
 struct TrackDetailView: View {
+    @EnvironmentObject private var playbackManager: PlaybackManager
+
     let track: Track
 
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
-    @StateObject private var experimentalPlayer = ExperimentalTrackPlayer()
     @State private var isShowingEdit = false
 
     var body: some View {
@@ -155,35 +156,18 @@ struct TrackDetailView: View {
                 )
             }
 
-            Section("Experimental Playback") {
-                Button("Test Play") {
-                    experimentalPlayer.play(videoID: track.youtubeVideoID)
-                }
-                .disabled(experimentalPlayer.isResolving)
-
-                switch experimentalPlayer.state {
-                case .idle:
-                    Text("Ready to test this track.")
-                        .foregroundStyle(.secondary)
-
-                case .resolving:
-                    HStack {
-                        ProgressView()
-                        Text("Resolving audio stream…")
-                    }
-
-                case .playing:
-                    Label("Playing", systemImage: "speaker.wave.2.fill")
-
-                case .failed(let message):
-                    Text(message)
-                        .foregroundStyle(.red)
+            Section("Playback") {
+                if let currentTrack = playbackManager.currentTrack {
+                    LabeledContent("Current Track", value: currentTrack.title)
                 }
 
-                if experimentalPlayer.canStop {
-                    Button("Stop", role: .destructive) {
-                        experimentalPlayer.stop()
-                    }
+                playbackControls
+
+                if
+                    playbackManager.isCurrentTrack(track),
+                    let metrics = playbackManager.startupMetrics
+                {
+                    startupTiming(metrics)
                 }
             }
 
@@ -232,6 +216,93 @@ struct TrackDetailView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private var playbackControls: some View {
+        if playbackManager.isCurrentTrack(track) {
+            switch playbackManager.state {
+            case .idle:
+                playButton("Play Track")
+
+            case .resolving:
+                HStack {
+                    ProgressView()
+                    Text("Resolving audio stream…")
+                }
+                stopButton
+
+            case .loading:
+                HStack {
+                    ProgressView()
+                    Text("Preparing player…")
+                }
+                stopButton
+
+            case .playing:
+                Label("Playing", systemImage: "speaker.wave.2.fill")
+                Button("Pause") {
+                    playbackManager.pause()
+                }
+                stopButton
+
+            case .paused:
+                Label("Paused", systemImage: "pause.fill")
+                Button("Resume") {
+                    playbackManager.resume()
+                }
+                stopButton
+
+            case .failed(let message):
+                Text(message)
+                    .foregroundStyle(.red)
+                playButton("Retry")
+                stopButton
+            }
+        } else {
+            playButton(playbackManager.currentTrack == nil ? "Play Track" : "Play This Track")
+
+            if let currentTrack = playbackManager.currentTrack {
+                Text("Playback continues for \(currentTrack.title).")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func playButton(_ title: String) -> some View {
+        Button(title) {
+            playbackManager.play(track)
+        }
+    }
+
+    private var stopButton: some View {
+        Button("Stop", role: .destructive) {
+            playbackManager.stop()
+        }
+    }
+
+    private func startupTiming(_ metrics: PlaybackManager.StartupMetrics) -> some View {
+        DisclosureGroup("Startup Timing (Temporary)") {
+            LabeledContent("Stream Source", value: metrics.streamSource)
+            LabeledContent(
+                "Stream Resolution",
+                value: streamResolutionValue(metrics)
+            )
+            LabeledContent("Player Start", value: metrics.playerStartTime.map(formatTime) ?? "—")
+            LabeledContent("Total Start", value: metrics.totalStartTime.map(formatTime) ?? "—")
+        }
+    }
+
+    private func formatTime(_ time: TimeInterval) -> String {
+        String(format: "%.3f s", time)
+    }
+
+    private func streamResolutionValue(_ metrics: PlaybackManager.StartupMetrics) -> String {
+        if let time = metrics.streamResolutionTime {
+            return formatTime(time)
+        }
+
+        return metrics.streamSource == "In-memory cache" ? "Cache hit" : "—"
     }
 
     private func isInPlaylist(_ playlist: Playlist) -> Bool {

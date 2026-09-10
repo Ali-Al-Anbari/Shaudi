@@ -10,9 +10,12 @@ import SwiftData
 
 @main
 struct ShaudiApp: App {
+    @StateObject private var playbackManager = PlaybackManager()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(playbackManager)
         }
         .modelContainer(for: [Track.self, Playlist.self])
     }

@@ -26,5 +26,6 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .environmentObject(PlaybackManager())
         .modelContainer(for: [Track.self, Playlist.self], inMemory: true)
 }
