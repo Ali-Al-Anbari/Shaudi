@@ -253,15 +253,35 @@ private struct AddTracksView: View {
                 TrackEditorView(
                     title: "New Track",
                     actionTitle: "Create"
-                ) { title, youtubeVideo in
+                ) { request in
+                    if let existingTrack = libraryTracks.first(where: {
+                        $0.youtubeVideoID == request.youtubeVideo.id
+                    }) {
+                        guard !isAlreadyAdded(existingTrack) else {
+                            return "This YouTube video is already in this Playlist."
+                        }
+
+                        add(existingTrack)
+                        return nil
+                    }
+
+                    guard let metadata = request.metadata else {
+                        return "Fetch the YouTube metadata before creating this track."
+                    }
+
                     let track = Track(
-                        title: title,
-                        youtubeURL: youtubeVideo.url,
-                        youtubeVideoID: youtubeVideo.id
+                        title: metadata.title,
+                        youtubeURL: request.youtubeVideo.url,
+                        youtubeVideoID: request.youtubeVideo.id,
+                        channelTitle: metadata.channelTitle,
+                        thumbnailURL: metadata.thumbnailURL,
+                        duration: metadata.duration,
+                        metadataLastRefreshed: .now
                     )
 
                     modelContext.insert(track)
                     add(track)
+                    return nil
                 }
             }
         }

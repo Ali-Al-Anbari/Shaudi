@@ -12,6 +12,10 @@ final class Track {
     var youtubeURL: URL
     var youtubeVideoID: String
     var dateAdded: Date
+    var channelTitle: String?
+    var thumbnailURL: URL?
+    var duration: TimeInterval?
+    var metadataLastRefreshed: Date?
     var playlists: [Playlist]
 
     init(
@@ -19,12 +23,20 @@ final class Track {
         youtubeURL: URL,
         youtubeVideoID: String,
         dateAdded: Date = .now,
+        channelTitle: String? = nil,
+        thumbnailURL: URL? = nil,
+        duration: TimeInterval? = nil,
+        metadataLastRefreshed: Date? = nil,
         playlists: [Playlist] = []
     ) {
         self.title = title
         self.youtubeURL = youtubeURL
         self.youtubeVideoID = youtubeVideoID
         self.dateAdded = dateAdded
+        self.channelTitle = channelTitle
+        self.thumbnailURL = thumbnailURL
+        self.duration = duration
+        self.metadataLastRefreshed = metadataLastRefreshed
         self.playlists = playlists
     }
 }
