@@ -58,7 +58,7 @@ struct LibraryView: View {
     }
 }
 
-private struct TrackEditorView: View {
+struct TrackEditorView: View {
     @Environment(\.dismiss) private var dismiss
 
     let title: String
@@ -144,19 +144,48 @@ private struct TrackEditorView: View {
     }
 }
 
-private struct TrackDetailView: View {
+struct TrackDetailView: View {
     let track: Track
+
+    @Query(sort: \Playlist.dateCreated, order: .reverse)
+    private var playlists: [Playlist]
 
     @State private var isShowingEdit = false
 
     var body: some View {
         Form {
-            LabeledContent("Title", value: track.title)
-            LabeledContent("YouTube URL", value: track.youtubeURL.absoluteString)
-            LabeledContent(
-                "Date Added",
-                value: track.dateAdded.formatted(date: .abbreviated, time: .shortened)
-            )
+            Section("Track") {
+                LabeledContent("Title", value: track.title)
+                LabeledContent("YouTube URL", value: track.youtubeURL.absoluteString)
+                LabeledContent(
+                    "Date Added",
+                    value: track.dateAdded.formatted(date: .abbreviated, time: .shortened)
+                )
+            }
+
+            Section("Playlists") {
+                if playlists.isEmpty {
+                    Text("No playlists available.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(playlists) { playlist in
+                        Button {
+                            toggleMembership(in: playlist)
+                        } label: {
+                            HStack {
+                                Text(playlist.name)
+                                    .foregroundStyle(.primary)
+
+                                Spacer()
+
+                                if isInPlaylist(playlist) {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         .navigationTitle(track.title)
         .toolbar {
@@ -174,6 +203,18 @@ private struct TrackDetailView: View {
                 track.title = title
                 track.youtubeURL = youtubeURL
             }
+        }
+    }
+
+    private func isInPlaylist(_ playlist: Playlist) -> Bool {
+        track.playlists.contains { $0 === playlist }
+    }
+
+    private func toggleMembership(in playlist: Playlist) {
+        if let index = track.playlists.firstIndex(where: { $0 === playlist }) {
+            track.playlists.remove(at: index)
+        } else {
+            track.playlists.append(playlist)
         }
     }
 }
