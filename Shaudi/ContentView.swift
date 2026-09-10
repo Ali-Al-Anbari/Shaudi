@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import SwiftData
 
 struct ContentView: View {
     var body: some View {
@@ -18,10 +19,7 @@ struct ContentView: View {
                 Label("Library", systemImage: "music.note.house")
             }
 
-            NavigationStack {
-                Text("Playlists")
-                    .navigationTitle("Playlists")
-            }
+            PlaylistsView()
             .tabItem {
                 Label("Playlists", systemImage: "music.note.list")
             }
@@ -31,4 +29,5 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
+        .modelContainer(for: [Track.self, Playlist.self], inMemory: true)
 }
