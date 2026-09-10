@@ -141,6 +141,7 @@ struct TrackDetailView: View {
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
+    @StateObject private var experimentalPlayer = ExperimentalTrackPlayer()
     @State private var isShowingEdit = false
 
     var body: some View {
@@ -152,6 +153,38 @@ struct TrackDetailView: View {
                     "Date Added",
                     value: track.dateAdded.formatted(date: .abbreviated, time: .shortened)
                 )
+            }
+
+            Section("Experimental Playback") {
+                Button("Test Play") {
+                    experimentalPlayer.play(videoID: track.youtubeVideoID)
+                }
+                .disabled(experimentalPlayer.isResolving)
+
+                switch experimentalPlayer.state {
+                case .idle:
+                    Text("Ready to test this track.")
+                        .foregroundStyle(.secondary)
+
+                case .resolving:
+                    HStack {
+                        ProgressView()
+                        Text("Resolving audio stream…")
+                    }
+
+                case .playing:
+                    Label("Playing", systemImage: "speaker.wave.2.fill")
+
+                case .failed(let message):
+                    Text(message)
+                        .foregroundStyle(.red)
+                }
+
+                if experimentalPlayer.canStop {
+                    Button("Stop", role: .destructive) {
+                        experimentalPlayer.stop()
+                    }
+                }
             }
 
             Section("Playlists") {

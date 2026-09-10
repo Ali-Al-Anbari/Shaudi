@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		B85C1D0D3053485F0000701D /* YouTubeKit in Frameworks */ = {isa = PBXBuildFile; productRef = B85C1D0C3053485F0000701D /* YouTubeKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		B85C1CEF30526E770000701D /* Shaudi.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Shaudi.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -36,6 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B85C1D0D3053485F0000701D /* YouTubeKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 			);
 			name = Shaudi;
 			packageProductDependencies = (
+				B85C1D0C3053485F0000701D /* YouTubeKit */,
 			);
 			productName = Shaudi;
 			productReference = B85C1CEF30526E770000701D /* Shaudi.app */;
@@ -107,6 +113,9 @@
 			);
 			mainGroup = B85C1CE630526E760000701D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B85C1D0B3053485E0000701D /* XCRemoteSwiftPackageReference "YouTubeKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B85C1CF030526E770000701D /* Products */;
 			projectDirPath = "";
@@ -259,6 +268,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JFBQ8947T6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
@@ -312,6 +322,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JFBQ8947T6;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
@@ -380,6 +391,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B85C1D0B3053485E0000701D /* XCRemoteSwiftPackageReference "YouTubeKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/alexeichhorn/YouTubeKit";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.4.9;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B85C1D0C3053485F0000701D /* YouTubeKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B85C1D0B3053485E0000701D /* XCRemoteSwiftPackageReference "YouTubeKit" */;
+			productName = YouTubeKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = B85C1CE730526E760000701D /* Project object */;
 }
