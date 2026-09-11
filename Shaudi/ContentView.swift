@@ -21,6 +21,9 @@ struct ContentView: View {
                 Label("Playlists", systemImage: "music.note.list")
             }
         }
+        .tint(ShaudiTheme.accent)
+        .toolbarBackground(.visible, for: .tabBar)
+        .toolbarBackground(ShaudiTheme.card, for: .tabBar)
     }
 }
 

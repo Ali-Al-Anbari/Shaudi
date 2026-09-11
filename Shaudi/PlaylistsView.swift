@@ -16,16 +16,7 @@ struct PlaylistsView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                ForEach(playlists) { playlist in
-                    NavigationLink {
-                        PlaylistDetailView(playlist: playlist)
-                    } label: {
-                        Text(playlist.name)
-                    }
-                }
-                .onDelete(perform: deletePlaylists)
-            }
+            playlistList
             .navigationTitle("Playlists")
             .toolbar {
                 Button {
@@ -43,6 +34,45 @@ struct PlaylistsView: View {
                 }
             }
         }
+    }
+
+    private var playlistList: some View {
+        List {
+            ForEach(playlists) { playlist in
+                NavigationLink {
+                    PlaylistDetailView(playlist: playlist)
+                } label: {
+                    playlistRow(playlist)
+                }
+                .listRowBackground(ShaudiTheme.card)
+                .listRowSeparator(.hidden)
+            }
+            .onDelete(perform: deletePlaylists)
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(ShaudiTheme.canvas)
+    }
+
+    private func playlistRow(_ playlist: Playlist) -> some View {
+        HStack(spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(ShaudiTheme.accent.opacity(0.14))
+
+                Image(systemName: "rectangle.stack.fill")
+                    .font(.headline)
+                    .foregroundStyle(ShaudiTheme.accent)
+            }
+            .frame(width: 42, height: 42)
+
+            Text(playlist.name)
+                .font(.headline)
+                .foregroundStyle(.primary)
+
+            Spacer(minLength: 4)
+        }
+        .padding(.vertical, 5)
     }
 
     private func deletePlaylists(at offsets: IndexSet) {
@@ -82,6 +112,9 @@ private struct PlaylistNameEditor: View {
             Form {
                 TextField("Playlist Name", text: $name)
             }
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
+            .tint(ShaudiTheme.accent)
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -127,14 +160,40 @@ private struct PlaylistDetailView: View {
                         NavigationLink {
                             TrackDetailView(track: track, queue: tracks)
                         } label: {
-                            Text(track.title)
+                            HStack(spacing: 13) {
+                                Image(systemName: "music.note")
+                                    .foregroundStyle(ShaudiTheme.lavender)
+                                    .frame(width: 28, height: 28)
+                                    .background(ShaudiTheme.lavender.opacity(0.14), in: Circle())
+
+                                Text(track.title)
+                                    .font(.headline)
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(2)
+                            }
+                            .padding(.vertical, 5)
                         }
+                        .listRowBackground(ShaudiTheme.card)
+                        .listRowSeparator(.hidden)
                     }
                     .onDelete(perform: removeTracks)
                 }
+                .listStyle(.insetGrouped)
+                .scrollContentBackground(.hidden)
+                .background(ShaudiTheme.canvas)
             }
         }
+        .tint(ShaudiTheme.accent)
         .navigationTitle(playlist.name)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(playlist.name)
+                    .font(ShaudiTheme.scriptFont(size: 25, relativeTo: .title2))
+                    .foregroundStyle(ShaudiTheme.accent)
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
+            }
+        }
         .toolbar {
             Menu {
                 Button {
@@ -232,6 +291,10 @@ private struct AddTracksView: View {
                     }
                 }
             }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
+            .tint(ShaudiTheme.accent)
             .navigationTitle("Add Tracks")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

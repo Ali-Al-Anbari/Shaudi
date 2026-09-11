@@ -16,16 +16,7 @@ struct LibraryView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                ForEach(tracks) { track in
-                    NavigationLink {
-                        TrackDetailView(track: track, queue: tracks)
-                    } label: {
-                        Text(track.title)
-                    }
-                }
-                .onDelete(perform: deleteTracks)
-            }
+            libraryList
             .navigationTitle("Library")
             .toolbar {
                 Button {
@@ -65,10 +56,79 @@ struct LibraryView: View {
         }
     }
 
+    private var libraryList: some View {
+        List {
+            libraryRows
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(ShaudiTheme.canvas)
+    }
+
+    @ViewBuilder
+    private var libraryRows: some View {
+        if tracks.isEmpty {
+            ContentUnavailableView(
+                "Your Library Is Quiet",
+                systemImage: "music.note.list",
+                description: Text("Add a track to start your collection.")
+            )
+            .listRowBackground(Color.clear)
+        } else {
+            Section {
+                ForEach(tracks) { track in
+                    NavigationLink {
+                        TrackDetailView(track: track, queue: tracks)
+                    } label: {
+                        trackRow(track)
+                    }
+                    .listRowBackground(ShaudiTheme.card)
+                    .listRowSeparator(.hidden)
+                }
+                .onDelete(perform: deleteTracks)
+            } header: {
+                Text("All Tracks")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(ShaudiTheme.lavender)
+            }
+        }
+    }
+
     private func deleteTracks(at offsets: IndexSet) {
         for index in offsets {
             modelContext.delete(tracks[index])
         }
+    }
+
+    private func trackRow(_ track: Track) -> some View {
+        HStack(spacing: 13) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(ShaudiTheme.lavender.opacity(0.16))
+
+                Image(systemName: "music.note")
+                    .font(.headline)
+                    .foregroundStyle(ShaudiTheme.lavender)
+            }
+            .frame(width: 42, height: 42)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(track.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+
+                if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
+                    Text(channelTitle)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 4)
+        }
+        .padding(.vertical, 5)
     }
 }
 
@@ -174,6 +234,9 @@ struct TrackEditorView: View {
 
                 metadataState
             }
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
+            .tint(ShaudiTheme.accent)
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .onChange(of: youtubeURLText) {
@@ -317,6 +380,7 @@ private struct YouTubeMetadataView: View {
                     EmptyView()
                 }
             }
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
 
         LabeledContent("Title", value: title)
@@ -366,7 +430,11 @@ struct TrackDetailView: View {
             }
 
             Section("Track") {
-                LabeledContent("Title", value: track.title)
+                Text(track.title)
+                    .font(ShaudiTheme.scriptFont(size: 28, relativeTo: .title2))
+                    .foregroundStyle(ShaudiTheme.accent)
+                    .lineLimit(2)
+
                 LabeledContent("YouTube URL", value: track.youtubeURL.absoluteString)
                 LabeledContent(
                     "Date Added",
@@ -413,6 +481,9 @@ struct TrackDetailView: View {
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(ShaudiTheme.canvas)
+        .tint(ShaudiTheme.accent)
         .navigationTitle(track.title)
         .toolbar {
             Button("Edit") {
@@ -507,6 +578,8 @@ struct TrackDetailView: View {
         Button(title) {
             playbackManager.play(track, in: queue)
         }
+        .buttonStyle(.borderedProminent)
+        .tint(ShaudiTheme.accent)
     }
 
     private var queueControls: some View {
@@ -518,6 +591,10 @@ struct TrackDetailView: View {
                     .labelStyle(.iconOnly)
             }
             .disabled(!playbackManager.hasPreviousTrack)
+            .font(.headline)
+            .foregroundStyle(ShaudiTheme.accent)
+            .frame(width: 44, height: 44)
+            .background(ShaudiTheme.accent.opacity(0.12), in: Circle())
 
             Spacer()
 
@@ -529,6 +606,10 @@ struct TrackDetailView: View {
                     Label("Pause", systemImage: "pause.fill")
                         .labelStyle(.iconOnly)
                 }
+                .font(.title3)
+                .foregroundStyle(ShaudiTheme.accent)
+                .frame(width: 50, height: 50)
+                .background(ShaudiTheme.accent.opacity(0.18), in: Circle())
 
             case .paused:
                 Button {
@@ -537,11 +618,16 @@ struct TrackDetailView: View {
                     Label("Play", systemImage: "play.fill")
                         .labelStyle(.iconOnly)
                 }
+                .font(.title3)
+                .foregroundStyle(ShaudiTheme.accent)
+                .frame(width: 50, height: 50)
+                .background(ShaudiTheme.accent.opacity(0.18), in: Circle())
 
             case .idle, .resolving, .loading, .failed:
                 Image(systemName: "play.fill")
                     .foregroundStyle(.tertiary)
                     .accessibilityLabel("Play unavailable")
+                    .frame(width: 50, height: 50)
             }
 
             Spacer()
@@ -553,6 +639,10 @@ struct TrackDetailView: View {
                     .labelStyle(.iconOnly)
             }
             .disabled(!playbackManager.hasNextTrack)
+            .font(.headline)
+            .foregroundStyle(ShaudiTheme.accent)
+            .frame(width: 44, height: 44)
+            .background(ShaudiTheme.accent.opacity(0.12), in: Circle())
         }
         .buttonStyle(.borderless)
     }
