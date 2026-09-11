@@ -22,6 +22,8 @@ private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
 
 @MainActor
 final class PlaybackManager: ObservableObject {
+    private let streamLookaheadCount = 10
+
     enum PlaybackState {
         case idle
         case resolving
@@ -46,6 +48,7 @@ final class PlaybackManager: ObservableObject {
     private enum StreamResolutionSource: String {
         case foreground = "normal foreground extraction"
         case preResolution = "pre-resolution"
+        case lookahead = "lookahead"
         case memoryCache = "in-memory cache"
     }
 
@@ -76,6 +79,7 @@ final class PlaybackManager: ObservableObject {
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
     private var preResolutionTask: Task<Void, Never>?
+    private var lookaheadTask: Task<Void, Never>?
     private var nextItemPrerollTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
@@ -84,6 +88,7 @@ final class PlaybackManager: ObservableObject {
     private var playbackBoundaryObserver: Any?
     private var activeRequestID: UUID?
     private var activePreResolutionID: UUID?
+    private var activeLookaheadID: UUID?
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
     private var resolvedStreamCache: [String: URL] = [:]
@@ -470,7 +475,7 @@ final class PlaybackManager: ObservableObject {
         let nextIndex = currentIndex + 1
         let nextTrack = queue[nextIndex]
         let videoID = nextTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !videoID.isEmpty, preparedNextVideoID != videoID else {
+        guard preparedNextVideoID != videoID else {
             return
         }
 
@@ -478,6 +483,12 @@ final class PlaybackManager: ObservableObject {
         preparedNextVideoID = videoID
         let preResolutionID = UUID()
         activePreResolutionID = preResolutionID
+
+        guard !videoID.isEmpty else {
+            activePreResolutionID = nil
+            beginLookaheadFill(from: currentIndex)
+            return
+        }
 
         if let cachedURL = resolvedStreamCache[videoID] {
             log("Pre-resolution cache already available for \(videoID) (\(nextTrack.title))")
@@ -547,6 +558,7 @@ final class PlaybackManager: ObservableObject {
                 )
                 activePreResolutionID = nil
                 preResolutionTask = nil
+                beginLookaheadFill(from: nextIndex - 1)
             }
         }
     }
@@ -557,6 +569,7 @@ final class PlaybackManager: ObservableObject {
         preResolutionTask = nil
         preparedNextVideoID = nil
         discardPreparedNextPlayback()
+        cancelLookaheadFill()
     }
 
     private func beginPreparingNextItem(
@@ -616,6 +629,149 @@ final class PlaybackManager: ObservableObject {
                     videoID: videoID
                 )
             }
+        }
+
+        beginLookaheadFill(from: queueIndex - 1)
+    }
+
+    private func beginLookaheadFill(from anchorIndex: Int) {
+        guard
+            currentIndex == anchorIndex,
+            queue.indices.contains(anchorIndex)
+        else {
+            return
+        }
+
+        let firstLookaheadIndex = anchorIndex + 2
+        let finalLookaheadIndex = min(
+            anchorIndex + streamLookaheadCount,
+            queue.count - 1
+        )
+        guard firstLookaheadIndex <= finalLookaheadIndex else {
+            return
+        }
+
+        cancelLookaheadFill()
+
+        let lookaheadID = UUID()
+        activeLookaheadID = lookaheadID
+        let candidates = (firstLookaheadIndex...finalLookaheadIndex).map { queueIndex in
+            let track = queue[queueIndex]
+            return (
+                queueIndex: queueIndex,
+                track: track,
+                videoID: track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        log("Lookahead fill started from index \(anchorIndex)")
+
+        lookaheadTask = Task { [weak self] in
+            defer {
+                if let self, activeLookaheadID == lookaheadID {
+                    activeLookaheadID = nil
+                    lookaheadTask = nil
+                }
+            }
+
+            for candidate in candidates {
+                guard
+                    let self,
+                    !Task.isCancelled,
+                    isActiveLookahead(
+                        lookaheadID,
+                        anchorIndex: anchorIndex,
+                        candidate: candidate
+                    )
+                else {
+                    return
+                }
+
+                let videoID = candidate.videoID
+                let offset = candidate.queueIndex - anchorIndex
+                guard !videoID.isEmpty else {
+                    log("Lookahead resolution failed for unavailable video ID at +\(offset)")
+                    continue
+                }
+
+                if resolvedStreamCache[videoID] != nil {
+                    log("Lookahead cache hit for \(videoID) at +\(offset)")
+                    continue
+                }
+
+                let joinedExistingResolution = inFlightResolutions[videoID] != nil
+                if joinedExistingResolution {
+                    log("Lookahead joined existing resolution for \(videoID) at +\(offset)")
+                } else {
+                    log("Lookahead resolving \(videoID) at +\(offset)")
+                }
+
+                let startedAt = currentTime
+                let resolutionTask = resolutionTask(for: videoID, source: .lookahead)
+
+                do {
+                    _ = try await resolutionTask.value
+
+                    guard
+                        !Task.isCancelled,
+                        isActiveLookahead(
+                            lookaheadID,
+                            anchorIndex: anchorIndex,
+                            candidate: candidate
+                        )
+                    else {
+                        return
+                    }
+
+                    let elapsedTime = currentTime - startedAt
+                    log(
+                        "Lookahead resolved \(videoID) at +\(offset) in "
+                            + "\(String(format: "%.3f", elapsedTime)) s"
+                    )
+                } catch {
+                    guard
+                        !Task.isCancelled,
+                        isActiveLookahead(
+                            lookaheadID,
+                            anchorIndex: anchorIndex,
+                            candidate: candidate
+                        )
+                    else {
+                        return
+                    }
+
+                    log("Lookahead resolution failed for \(videoID) at +\(offset)")
+                }
+            }
+        }
+    }
+
+    private func isActiveLookahead(
+        _ lookaheadID: UUID,
+        anchorIndex: Int,
+        candidate: (queueIndex: Int, track: Track, videoID: String)
+    ) -> Bool {
+        guard
+            activeLookaheadID == lookaheadID,
+            currentIndex == anchorIndex,
+            queue.indices.contains(candidate.queueIndex)
+        else {
+            return false
+        }
+
+        let queuedTrack = queue[candidate.queueIndex]
+        return queuedTrack === candidate.track
+            && queuedTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                == candidate.videoID
+    }
+
+    private func cancelLookaheadFill() {
+        let hadActiveLookahead = activeLookaheadID != nil
+        activeLookaheadID = nil
+        lookaheadTask?.cancel()
+        lookaheadTask = nil
+
+        if hadActiveLookahead {
+            log("Lookahead cancelled")
         }
     }
 
