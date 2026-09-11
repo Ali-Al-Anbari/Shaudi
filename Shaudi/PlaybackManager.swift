@@ -54,6 +54,19 @@ final class PlaybackManager: ObservableObject {
         let audioBitrate: Int?
     }
 
+    // The auxiliary player drives loading/preroll and becomes the current player on handoff.
+    private struct PreparedNextPlayback {
+        let preparationID: UUID
+        let queueIndex: Int
+        let track: Track
+        let videoID: String
+        let streamURL: URL
+        let item: AVPlayerItem
+        let player: AVPlayer
+        let preparationStartedAt: TimeInterval
+        var readyAt: TimeInterval?
+    }
+
     @Published private(set) var currentTrack: Track?
     @Published private(set) var state: PlaybackState = .idle
     @Published private(set) var startupMetrics: StartupMetrics?
@@ -63,13 +76,16 @@ final class PlaybackManager: ObservableObject {
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
     private var preResolutionTask: Task<Void, Never>?
+    private var nextItemPrerollTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
+    private var nextItemStatusObservation: NSKeyValueObservation?
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackBoundaryObserver: Any?
     private var activeRequestID: UUID?
     private var activePreResolutionID: UUID?
     private var preparedNextVideoID: String?
+    private var preparedNextPlayback: PreparedNextPlayback?
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
     private var inFlightResolutions: [String: Task<URL, Error>] = [:]
@@ -124,16 +140,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func nextTrack() {
-        guard let currentIndex, queue.indices.contains(currentIndex + 1) else {
-            return
-        }
-
-        cancelUpcomingPreResolutionObservation()
-        self.currentIndex = currentIndex + 1
-#if os(iOS)
-        updateRemoteQueueCommands()
-#endif
-        startCurrentQueueTrack()
+        advanceToNextTrack(reason: "Next")
     }
 
     func previousTrack() {
@@ -141,15 +148,50 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
+        let requestedAt = currentTime
+        let previousIndex = currentIndex - 1
+        let videoID = queue[previousIndex].youtubeVideoID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        log("Previous requested for \(videoID)")
         cancelUpcomingPreResolutionObservation()
-        self.currentIndex = currentIndex - 1
+        self.currentIndex = previousIndex
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
-        startCurrentQueueTrack()
+        startCurrentQueueTrack(requestStartedAt: requestedAt)
     }
 
-    private func startCurrentQueueTrack() {
+    private func advanceToNextTrack(reason: String) {
+        guard let currentIndex, queue.indices.contains(currentIndex + 1) else {
+            return
+        }
+
+        let requestedAt = currentTime
+        let nextIndex = currentIndex + 1
+        let nextTrack = queue[nextIndex]
+        let videoID = nextTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("\(reason) advance requested for \(videoID)")
+
+        let preparedPlayback = takePreparedNextPlayback(
+            queueIndex: nextIndex,
+            track: nextTrack,
+            videoID: videoID
+        )
+        cancelUpcomingPreResolutionObservation()
+        self.currentIndex = nextIndex
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        startCurrentQueueTrack(
+            preparedPlayback: preparedPlayback,
+            requestStartedAt: requestedAt
+        )
+    }
+
+    private func startCurrentQueueTrack(
+        preparedPlayback: PreparedNextPlayback? = nil,
+        requestStartedAt: TimeInterval? = nil
+    ) {
         guard let currentIndex, queue.indices.contains(currentIndex) else {
             stop()
             return
@@ -160,7 +202,7 @@ final class PlaybackManager: ObservableObject {
         clearPlayer()
 
         let requestID = UUID()
-        let requestStartedAt = currentTime
+        let requestStartedAt = requestStartedAt ?? currentTime
         let videoID = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
 
         activeRequestID = requestID
@@ -170,12 +212,52 @@ final class PlaybackManager: ObservableObject {
 #endif
 
         guard !videoID.isEmpty else {
+            if let preparedPlayback {
+                discard(preparedPlayback)
+            }
             startupMetrics = nil
             state = .failed("This legacy track does not have a YouTube video ID.")
 #if os(iOS)
             clearNowPlaying()
 #endif
             return
+        }
+
+        if
+            let preparedPlayback,
+            preparedPlayback.queueIndex == currentIndex,
+            preparedPlayback.track === track,
+            preparedPlayback.videoID == videoID
+        {
+            let wasFullyPrepared = preparedPlayback.readyAt != nil
+            startupMetrics = StartupMetrics(
+                videoID: videoID,
+                streamSource: wasFullyPrepared
+                    ? "Prepared next item"
+                    : "Cached URL, item preparation in progress"
+            )
+            state = .loading
+
+            if wasFullyPrepared {
+                log("Using prepared item for \(videoID)")
+            } else {
+                log("Using cached URL but unprepared item for \(videoID)")
+            }
+
+            startPlayback(
+                with: preparedPlayback.item,
+                player: preparedPlayback.player,
+                videoID: videoID,
+                requestID: requestID,
+                requestStartedAt: requestStartedAt,
+                playerPreparationStartedAt: requestStartedAt,
+                usedCachedStream: true
+            )
+            return
+        }
+
+        if let preparedPlayback {
+            discard(preparedPlayback)
         }
 
         if let cachedURL = resolvedStreamCache[videoID] {
@@ -185,6 +267,7 @@ final class PlaybackManager: ObservableObject {
             )
             state = .loading
             log("Cache hit for \(videoID); skipping YouTubeKit resolution")
+            log("Using cached URL but unprepared item for \(videoID)")
             logSelectedStream(
                 videoID: videoID,
                 diagnostics: resolvedStreamDiagnostics[videoID],
@@ -206,6 +289,11 @@ final class PlaybackManager: ObservableObject {
                     ? "In-flight pre-resolution"
                     : "Fresh YouTubeKit resolution"
             )
+            if isJoiningInFlightResolution {
+                log("Waiting for pre-resolution; next item is not prepared for \(videoID)")
+            } else {
+                log("Using normal foreground extraction for \(videoID)")
+            }
             resolveAndStartPlayback(
                 videoID: videoID,
                 requestID: requestID,
@@ -289,6 +377,9 @@ final class PlaybackManager: ObservableObject {
 
                 playbackTask = nil
                 state = .loading
+                if isJoiningInFlightResolution {
+                    log("Using cached URL but unprepared item for \(videoID)")
+                }
                 startPlayback(
                     with: streamURL,
                     videoID: videoID,
@@ -376,7 +467,8 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        let nextTrack = queue[currentIndex + 1]
+        let nextIndex = currentIndex + 1
+        let nextTrack = queue[nextIndex]
         let videoID = nextTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !videoID.isEmpty, preparedNextVideoID != videoID else {
             return
@@ -384,17 +476,24 @@ final class PlaybackManager: ObservableObject {
 
         cancelUpcomingPreResolutionObservation()
         preparedNextVideoID = videoID
+        let preResolutionID = UUID()
+        activePreResolutionID = preResolutionID
 
-        if resolvedStreamCache[videoID] != nil {
+        if let cachedURL = resolvedStreamCache[videoID] {
             log("Pre-resolution cache already available for \(videoID) (\(nextTrack.title))")
+            beginPreparingNextItem(
+                with: cachedURL,
+                track: nextTrack,
+                queueIndex: nextIndex,
+                videoID: videoID,
+                preparationID: preResolutionID
+            )
             return
         }
 
         let wasAlreadyInFlight = inFlightResolutions[videoID] != nil
         let resolutionTask = resolutionTask(for: videoID, source: .preResolution)
-        let preResolutionID = UUID()
         let startedAt = currentTime
-        activePreResolutionID = preResolutionID
 
         if wasAlreadyInFlight {
             log("Pre-resolution already in progress for \(videoID) (\(nextTrack.title))")
@@ -404,10 +503,14 @@ final class PlaybackManager: ObservableObject {
 
         preResolutionTask = Task { [weak self] in
             do {
-                _ = try await resolutionTask.value
+                let streamURL = try await resolutionTask.value
                 try Task.checkCancellation()
 
-                guard let self, activePreResolutionID == preResolutionID else {
+                guard
+                    let self,
+                    activePreResolutionID == preResolutionID,
+                    isExpectedNextTrack(nextTrack, at: nextIndex, videoID: videoID)
+                else {
                     return
                 }
 
@@ -416,8 +519,14 @@ final class PlaybackManager: ObservableObject {
                     "Pre-resolution completed for \(videoID) in "
                         + "\(String(format: "%.3f", elapsedTime)) s"
                 )
-                activePreResolutionID = nil
                 preResolutionTask = nil
+                beginPreparingNextItem(
+                    with: streamURL,
+                    track: nextTrack,
+                    queueIndex: nextIndex,
+                    videoID: videoID,
+                    preparationID: preResolutionID
+                )
             } catch is CancellationError {
                 return
             } catch {
@@ -447,10 +556,276 @@ final class PlaybackManager: ObservableObject {
         preResolutionTask?.cancel()
         preResolutionTask = nil
         preparedNextVideoID = nil
+        discardPreparedNextPlayback()
+    }
+
+    private func beginPreparingNextItem(
+        with streamURL: URL,
+        track: Track,
+        queueIndex: Int,
+        videoID: String,
+        preparationID: UUID
+    ) {
+        guard
+            activePreResolutionID == preparationID,
+            isExpectedNextTrack(track, at: queueIndex, videoID: videoID)
+        else {
+            return
+        }
+
+        discardPreparedNextPlayback()
+
+        let preparationStartedAt = currentTime
+        let asset = AVURLAsset(url: streamURL)
+        let item = AVPlayerItem(
+            asset: asset,
+            automaticallyLoadedAssetKeys: [.isPlayable, .duration]
+        )
+        applyAuthoritativeEndTime(to: item, trackDuration: track.duration)
+
+        let preparationPlayer = AVPlayer(playerItem: item)
+        preparedNextPlayback = PreparedNextPlayback(
+            preparationID: preparationID,
+            queueIndex: queueIndex,
+            track: track,
+            videoID: videoID,
+            streamURL: streamURL,
+            item: item,
+            player: preparationPlayer,
+            preparationStartedAt: preparationStartedAt,
+            readyAt: nil
+        )
+        log("Next-item preparation started for \(videoID)")
+
+        let managerReference = WeakReference(self)
+        let itemReference = WeakReference(item)
+        nextItemStatusObservation = item.observe(\.status, options: [.initial, .new]) {
+            [managerReference, itemReference] _, _ in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    let item = itemReference.value
+                else {
+                    return
+                }
+
+                self.handleNextItemStatus(
+                    preparationPlayer,
+                    item: item,
+                    preparationID: preparationID,
+                    videoID: videoID
+                )
+            }
+        }
+    }
+
+    private func handleNextItemStatus(
+        _ preparationPlayer: AVPlayer,
+        item: AVPlayerItem,
+        preparationID: UUID,
+        videoID: String
+    ) {
+        guard
+            activePreResolutionID == preparationID,
+            let preparedNextPlayback,
+            preparedNextPlayback.preparationID == preparationID,
+            preparedNextPlayback.player === preparationPlayer,
+            preparedNextPlayback.item === item
+        else {
+            return
+        }
+
+        switch item.status {
+        case .readyToPlay:
+            beginPrerollingNextItem(
+                preparationPlayer,
+                item: item,
+                preparationID: preparationID,
+                videoID: videoID
+            )
+
+        case .failed:
+            handlePreparedNextItemFailure(
+                item,
+                preparationID: preparationID,
+                videoID: videoID
+            )
+
+        case .unknown:
+            break
+
+        @unknown default:
+            break
+        }
+    }
+
+    private func beginPrerollingNextItem(
+        _ preparationPlayer: AVPlayer,
+        item: AVPlayerItem,
+        preparationID: UUID,
+        videoID: String
+    ) {
+        guard nextItemPrerollTask == nil else {
+            return
+        }
+
+        nextItemPrerollTask = Task { [weak self] in
+            let finished = await preparationPlayer.preroll(atRate: 1)
+
+            guard
+                let self,
+                !Task.isCancelled,
+                activePreResolutionID == preparationID,
+                var preparedNextPlayback,
+                preparedNextPlayback.preparationID == preparationID,
+                preparedNextPlayback.player === preparationPlayer,
+                preparedNextPlayback.item === item
+            else {
+                return
+            }
+
+            nextItemPrerollTask = nil
+
+            if item.status == .failed {
+                handlePreparedNextItemFailure(
+                    item,
+                    preparationID: preparationID,
+                    videoID: videoID
+                )
+                return
+            }
+
+            guard finished else {
+                log("Next-item preparation did not finish for \(videoID)")
+                return
+            }
+
+            let readyAt = currentTime
+            preparedNextPlayback.readyAt = readyAt
+            self.preparedNextPlayback = preparedNextPlayback
+            let preparationTime = readyAt - preparedNextPlayback.preparationStartedAt
+            log(
+                "Next-item preparation ready for \(videoID) in "
+                    + "\(String(format: "%.3f", preparationTime)) s"
+            )
+        }
+    }
+
+    private func handlePreparedNextItemFailure(
+        _ item: AVPlayerItem,
+        preparationID: UUID,
+        videoID: String
+    ) {
+        guard
+            let preparedNextPlayback,
+            preparedNextPlayback.preparationID == preparationID,
+            preparedNextPlayback.item === item
+        else {
+            return
+        }
+
+        logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
+
+        if resolvedStreamCache[videoID] == preparedNextPlayback.streamURL {
+            resolvedStreamCache.removeValue(forKey: videoID)
+            resolvedStreamDiagnostics.removeValue(forKey: videoID)
+            log("Next-item preparation failed for \(videoID); cached URL evicted")
+        } else {
+            log("Next-item preparation failed for \(videoID); stale item discarded")
+        }
+
+        activePreResolutionID = nil
+        preResolutionTask = nil
+        discardPreparedNextPlayback()
+    }
+
+    private func isExpectedNextTrack(
+        _ track: Track,
+        at queueIndex: Int,
+        videoID: String
+    ) -> Bool {
+        guard
+            let currentIndex,
+            queueIndex == currentIndex + 1,
+            queue.indices.contains(queueIndex)
+        else {
+            return false
+        }
+
+        let queuedTrack = queue[queueIndex]
+        return queuedTrack === track
+            && queuedTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) == videoID
+    }
+
+    private func takePreparedNextPlayback(
+        queueIndex: Int,
+        track: Track,
+        videoID: String
+    ) -> PreparedNextPlayback? {
+        guard
+            let preparedNextPlayback,
+            preparedNextPlayback.queueIndex == queueIndex,
+            preparedNextPlayback.track === track,
+            preparedNextPlayback.videoID == videoID
+        else {
+            return nil
+        }
+
+        self.preparedNextPlayback = nil
+        nextItemStatusObservation = nil
+        nextItemPrerollTask?.cancel()
+        nextItemPrerollTask = nil
+        preparedNextPlayback.player.cancelPendingPrerolls()
+        activePreResolutionID = nil
+        preparedNextVideoID = nil
+        return preparedNextPlayback
+    }
+
+    private func discardPreparedNextPlayback() {
+        guard let preparedNextPlayback else {
+            nextItemStatusObservation = nil
+            nextItemPrerollTask?.cancel()
+            nextItemPrerollTask = nil
+            return
+        }
+
+        self.preparedNextPlayback = nil
+        nextItemStatusObservation = nil
+        nextItemPrerollTask?.cancel()
+        nextItemPrerollTask = nil
+        discard(preparedNextPlayback)
+    }
+
+    private func discard(_ preparedPlayback: PreparedNextPlayback) {
+        preparedPlayback.player.cancelPendingPrerolls()
+        preparedPlayback.player.pause()
+        preparedPlayback.player.replaceCurrentItem(with: nil)
     }
 
     private func startPlayback(
         with streamURL: URL,
+        videoID: String,
+        requestID: UUID,
+        requestStartedAt: TimeInterval,
+        playerPreparationStartedAt: TimeInterval,
+        usedCachedStream: Bool
+    ) {
+        let item = AVPlayerItem(url: streamURL)
+        let player = AVPlayer(playerItem: item)
+        startPlayback(
+            with: item,
+            player: player,
+            videoID: videoID,
+            requestID: requestID,
+            requestStartedAt: requestStartedAt,
+            playerPreparationStartedAt: playerPreparationStartedAt,
+            usedCachedStream: usedCachedStream
+        )
+    }
+
+    private func startPlayback(
+        with item: AVPlayerItem,
+        player: AVPlayer,
         videoID: String,
         requestID: UUID,
         requestStartedAt: TimeInterval,
@@ -468,19 +843,12 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        let item = AVPlayerItem(url: streamURL)
-        let player = AVPlayer(playerItem: item)
         let managerReference = WeakReference(self)
         let itemReference = WeakReference(item)
         let trackDuration = currentTrack?.duration
         let authoritativeDuration = validDuration(trackDuration)
 
-        if let authoritativeDuration {
-            item.forwardPlaybackEndTime = CMTime(
-                seconds: authoritativeDuration,
-                preferredTimescale: 600
-            )
-        }
+        applyAuthoritativeEndTime(to: item, trackDuration: trackDuration)
 
         self.player = player
 
@@ -613,6 +981,7 @@ final class PlaybackManager: ObservableObject {
         let failedDuringPreparation = startupMetrics?.totalStartTime == nil
         resolvedStreamCache.removeValue(forKey: videoID)
         resolvedStreamDiagnostics.removeValue(forKey: videoID)
+        cancelUpcomingPreResolutionObservation()
         clearPlayer()
 
         if usedCachedStream && failedDuringPreparation {
@@ -898,14 +1267,29 @@ final class PlaybackManager: ObservableObject {
         return duration
     }
 
+    private func applyAuthoritativeEndTime(
+        to item: AVPlayerItem,
+        trackDuration: TimeInterval?
+    ) {
+        guard let authoritativeDuration = validDuration(trackDuration) else {
+            return
+        }
+
+        item.forwardPlaybackEndTime = CMTime(
+            seconds: authoritativeDuration,
+            preferredTimescale: 600
+        )
+    }
+
     private func handlePlaybackCompletion(for item: AVPlayerItem, requestID: UUID) {
         guard isActive(requestID), player?.currentItem === item else {
             return
         }
 
         if hasNextTrack {
-            nextTrack()
+            advanceToNextTrack(reason: "Natural")
         } else {
+            log("Final item completed; stopping playback")
             stop()
         }
     }
@@ -1047,6 +1431,7 @@ final class PlaybackManager: ObservableObject {
         let playbackStartedAt = currentTime
         let playerStartTime = playbackStartedAt - playerPreparationStartedAt
         let totalStartTime = playbackStartedAt - requestStartedAt
+        let streamSource = startupMetrics?.streamSource ?? "unknown"
 
         updateMetrics { metrics in
             metrics.playerStartTime = playerStartTime
@@ -1054,6 +1439,18 @@ final class PlaybackManager: ObservableObject {
         }
         logTiming("Player preparation/start", seconds: playerStartTime, videoID: videoID)
         logTiming("Total startup", seconds: totalStartTime, videoID: videoID)
+        if streamSource == "Prepared next item" {
+            log(
+                "Prepared transition for \(videoID): "
+                    + "\(String(format: "%.3f", totalStartTime)) s"
+            )
+        } else {
+            log(
+                "Transition to \(videoID) reached playing in "
+                    + "\(String(format: "%.3f", totalStartTime)) s "
+                    + "(source: \(streamSource))"
+            )
+        }
     }
 
     private func activateAudioSession() throws {
