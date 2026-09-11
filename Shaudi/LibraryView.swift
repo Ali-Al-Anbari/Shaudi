@@ -382,7 +382,7 @@ struct TrackDetailView: View {
                 playbackControls
 
                 if
-                    playbackManager.isCurrentTrack(track),
+                    playbackManager.currentTrack != nil,
                     let metrics = playbackManager.startupMetrics
                 {
                     startupTiming(metrics)

@@ -43,6 +43,17 @@ final class PlaybackManager: ObservableObject {
         case noPlayableStream
     }
 
+    private enum StreamResolutionSource: String {
+        case foreground = "normal foreground extraction"
+        case preResolution = "pre-resolution"
+        case memoryCache = "in-memory cache"
+    }
+
+    private struct StreamDiagnostics {
+        let fileExtension: String
+        let audioBitrate: Int?
+    }
+
     @Published private(set) var currentTrack: Track?
     @Published private(set) var state: PlaybackState = .idle
     @Published private(set) var startupMetrics: StartupMetrics?
@@ -60,6 +71,7 @@ final class PlaybackManager: ObservableObject {
     private var activePreResolutionID: UUID?
     private var preparedNextVideoID: String?
     private var resolvedStreamCache: [String: URL] = [:]
+    private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
     private var inFlightResolutions: [String: Task<URL, Error>] = [:]
 #if os(iOS)
     private var remoteCommandTargets: [Any] = []
@@ -173,6 +185,11 @@ final class PlaybackManager: ObservableObject {
             )
             state = .loading
             log("Cache hit for \(videoID); skipping YouTubeKit resolution")
+            logSelectedStream(
+                videoID: videoID,
+                diagnostics: resolvedStreamDiagnostics[videoID],
+                source: .memoryCache
+            )
             startPlayback(
                 with: cachedURL,
                 videoID: videoID,
@@ -250,7 +267,7 @@ final class PlaybackManager: ObservableObject {
     ) {
         state = .resolving
         let resolutionStartedAt = currentTime
-        let resolutionTask = resolutionTask(for: videoID)
+        let resolutionTask = resolutionTask(for: videoID, source: .foreground)
 
         playbackTask = Task { [weak self] in
             do {
@@ -301,7 +318,10 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
-    private func resolutionTask(for videoID: String) -> Task<URL, Error> {
+    private func resolutionTask(
+        for videoID: String,
+        source: StreamResolutionSource
+    ) -> Task<URL, Error> {
         if let existingTask = inFlightResolutions[videoID] {
             return existingTask
         }
@@ -334,6 +354,12 @@ final class PlaybackManager: ObservableObject {
                 throw StreamResolutionError.noPlayableStream
             }
 
+            let diagnostics = StreamDiagnostics(
+                fileExtension: stream.fileExtension.rawValue,
+                audioBitrate: stream.bitrate ?? stream.averageBitrate
+            )
+            logSelectedStream(videoID: videoID, diagnostics: diagnostics, source: source)
+            resolvedStreamDiagnostics[videoID] = diagnostics
             resolvedStreamCache[videoID] = stream.url
             return stream.url
         }
@@ -365,7 +391,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         let wasAlreadyInFlight = inFlightResolutions[videoID] != nil
-        let resolutionTask = resolutionTask(for: videoID)
+        let resolutionTask = resolutionTask(for: videoID, source: .preResolution)
         let preResolutionID = UUID()
         let startedAt = currentTime
         activePreResolutionID = preResolutionID
@@ -519,7 +545,7 @@ final class PlaybackManager: ObservableObject {
 
                 case .failed:
                     self.handlePlayerFailure(
-                        item.error,
+                        item,
                         videoID: videoID,
                         requestID: requestID,
                         requestStartedAt: requestStartedAt,
@@ -571,7 +597,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handlePlayerFailure(
-        _ error: Error?,
+        _ item: AVPlayerItem,
         videoID: String,
         requestID: UUID,
         requestStartedAt: TimeInterval,
@@ -581,8 +607,12 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
+        let error = item.error
+        logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
+
         let failedDuringPreparation = startupMetrics?.totalStartTime == nil
         resolvedStreamCache.removeValue(forKey: videoID)
+        resolvedStreamDiagnostics.removeValue(forKey: videoID)
         clearPlayer()
 
         if usedCachedStream && failedDuringPreparation {
@@ -945,6 +975,66 @@ final class PlaybackManager: ObservableObject {
         return String(format: "%.3f s", duration)
     }
 
+    private func logSelectedStream(
+        videoID: String,
+        diagnostics: StreamDiagnostics?,
+        source: StreamResolutionSource
+    ) {
+        let fileExtension = diagnostics?.fileExtension ?? "unavailable"
+        let audioBitrate = diagnostics?.audioBitrate.map { "\($0) bps" } ?? "unavailable"
+
+        log(
+            "Selected audio stream for \(videoID): "
+                + "source=\(source.rawValue), "
+                + "itag=unavailable, "
+                + "fileExtension=\(fileExtension), "
+                + "audioBitrate=\(audioBitrate)"
+        )
+    }
+
+    private func logPlayerItemFailureDiagnostics(
+        for item: AVPlayerItem,
+        videoID: String
+    ) {
+        if let error = item.error as NSError? {
+            log(
+                "AVPlayerItem failed for \(videoID): "
+                    + "domain=\(Self.redactedDiagnosticText(error.domain)), "
+                    + "code=\(error.code), "
+                    + "description=\(Self.redactedDiagnosticText(error.localizedDescription))"
+            )
+
+            if let underlyingError = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                log(
+                    "AVPlayerItem underlying error for \(videoID): "
+                        + "domain=\(Self.redactedDiagnosticText(underlyingError.domain)), "
+                        + "code=\(underlyingError.code), "
+                        + "description="
+                        + Self.redactedDiagnosticText(underlyingError.localizedDescription)
+                )
+            }
+        } else {
+            log("AVPlayerItem failed for \(videoID): error unavailable")
+        }
+
+        guard let errorLog = item.errorLog(), !errorLog.events.isEmpty else {
+            log("AVPlayerItem error log for \(videoID): no events")
+            return
+        }
+
+        for (index, event) in errorLog.events.enumerated() {
+            let comment = event.errorComment.map(Self.redactedDiagnosticText) ?? "unavailable"
+            let uriHost = event.uri.flatMap { URLComponents(string: $0)?.host } ?? "unavailable"
+            log(
+                "AVPlayerItem error log event \(index + 1) for \(videoID): "
+                    + "statusCode=\(event.errorStatusCode), "
+                    + "domain=\(Self.redactedDiagnosticText(event.errorDomain)), "
+                    + "comment=\(comment), "
+                    + "uriHost=\(uriHost)"
+            )
+        }
+    }
+
     private func recordPlaybackStarted(
         videoID: String,
         requestStartedAt: TimeInterval,
@@ -1032,5 +1122,33 @@ final class PlaybackManager: ObservableObject {
         }
 
         return error.localizedDescription
+    }
+
+    private static func redactedDiagnosticText(_ text: String) -> String {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+"#
+        ) else {
+            return "unavailable"
+        }
+
+        var redactedText = text
+        let fullRange = NSRange(text.startIndex..., in: text)
+        let matches = expression.matches(in: text, range: fullRange)
+
+        for match in matches.reversed() {
+            guard
+                let textRange = Range(match.range, in: redactedText),
+                let originalRange = Range(match.range, in: text)
+            else {
+                continue
+            }
+
+            let uri = String(text[originalRange])
+            let host = URLComponents(string: uri)?.host
+            let replacement = host.map { "<URI host=\($0)>" } ?? "<URI redacted>"
+            redactedText.replaceSubrange(textRange, with: replacement)
+        }
+
+        return redactedText
     }
 }
