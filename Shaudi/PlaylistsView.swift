@@ -125,7 +125,7 @@ private struct PlaylistDetailView: View {
                 List {
                     ForEach(tracks) { track in
                         NavigationLink {
-                            TrackDetailView(track: track)
+                            TrackDetailView(track: track, queue: tracks)
                         } label: {
                             Text(track.title)
                         }

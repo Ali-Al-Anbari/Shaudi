@@ -19,7 +19,7 @@ struct LibraryView: View {
             List {
                 ForEach(tracks) { track in
                     NavigationLink {
-                        TrackDetailView(track: track)
+                        TrackDetailView(track: track, queue: tracks)
                     } label: {
                         Text(track.title)
                     }
@@ -335,6 +335,7 @@ struct TrackDetailView: View {
     @EnvironmentObject private var playbackManager: PlaybackManager
 
     let track: Track
+    let queue: [Track]
 
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
@@ -476,16 +477,10 @@ struct TrackDetailView: View {
 
             case .playing:
                 Label("Playing", systemImage: "speaker.wave.2.fill")
-                Button("Pause") {
-                    playbackManager.pause()
-                }
                 stopButton
 
             case .paused:
                 Label("Paused", systemImage: "pause.fill")
-                Button("Resume") {
-                    playbackManager.resume()
-                }
                 stopButton
 
             case .failed(let message):
@@ -502,12 +497,64 @@ struct TrackDetailView: View {
                     .foregroundStyle(.secondary)
             }
         }
+
+        if playbackManager.currentTrack != nil {
+            queueControls
+        }
     }
 
     private func playButton(_ title: String) -> some View {
         Button(title) {
-            playbackManager.play(track)
+            playbackManager.play(track, in: queue)
         }
+    }
+
+    private var queueControls: some View {
+        HStack {
+            Button {
+                playbackManager.previousTrack()
+            } label: {
+                Label("Previous", systemImage: "backward.fill")
+                    .labelStyle(.iconOnly)
+            }
+            .disabled(!playbackManager.hasPreviousTrack)
+
+            Spacer()
+
+            switch playbackManager.state {
+            case .playing:
+                Button {
+                    playbackManager.pause()
+                } label: {
+                    Label("Pause", systemImage: "pause.fill")
+                        .labelStyle(.iconOnly)
+                }
+
+            case .paused:
+                Button {
+                    playbackManager.resume()
+                } label: {
+                    Label("Play", systemImage: "play.fill")
+                        .labelStyle(.iconOnly)
+                }
+
+            case .idle, .resolving, .loading, .failed:
+                Image(systemName: "play.fill")
+                    .foregroundStyle(.tertiary)
+                    .accessibilityLabel("Play unavailable")
+            }
+
+            Spacer()
+
+            Button {
+                playbackManager.nextTrack()
+            } label: {
+                Label("Next", systemImage: "forward.fill")
+                    .labelStyle(.iconOnly)
+            }
+            .disabled(!playbackManager.hasNextTrack)
+        }
+        .buttonStyle(.borderless)
     }
 
     private var stopButton: some View {
