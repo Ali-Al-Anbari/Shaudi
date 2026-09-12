@@ -270,6 +270,12 @@ struct SearchView: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(spacing: 12) {
+                    Text("Search")
+                        .font(ShaudiTheme.scriptFont(size: 34, relativeTo: .title))
+                        .foregroundStyle(ShaudiTheme.accent)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityAddTraits(.isHeader)
+
                     searchField
 
                     if let noticeMessage {
@@ -287,7 +293,7 @@ struct SearchView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .background(ShaudiTheme.canvas)
-            .navigationTitle("Search")
+            .navigationBarTitleDisplayMode(.inline)
         }
         .tint(ShaudiTheme.accent)
         .onChange(of: viewModel.query) {

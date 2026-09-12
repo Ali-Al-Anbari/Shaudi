@@ -19,14 +19,7 @@ struct PlaylistsView: View {
     var body: some View {
         NavigationStack {
             playlistList
-            .navigationTitle("Playlists")
-            .toolbar {
-                Button {
-                    isShowingNewPlaylist = true
-                } label: {
-                    Label("New Playlist", systemImage: "plus")
-                }
-            }
+            .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $isShowingNewPlaylist) {
                 PlaylistNameEditor(
                     title: "New Playlist",
@@ -39,34 +32,55 @@ struct PlaylistsView: View {
     }
 
     private var playlistList: some View {
-        List {
-            ForEach(playlists) { playlist in
-                NavigationLink {
-                    PlaylistDetailView(playlist: playlist)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center) {
+                Text("Playlists")
+                    .font(ShaudiTheme.scriptFont(size: 34, relativeTo: .title))
+                    .foregroundStyle(ShaudiTheme.accent)
+                    .accessibilityAddTraits(.isHeader)
+
+                Spacer(minLength: 12)
+
+                Button {
+                    isShowingNewPlaylist = true
                 } label: {
-                    playlistRow(playlist)
+                    Image(systemName: "plus")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(ShaudiTheme.accent)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
                 }
-                .listRowBackground(ShaudiTheme.card)
-                .listRowSeparator(.hidden)
+                .buttonStyle(.plain)
+                .accessibilityLabel("New Playlist")
             }
-            .onDelete(perform: deletePlaylists)
+                .padding(.horizontal)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+
+            List {
+                ForEach(playlists) { playlist in
+                    NavigationLink {
+                        PlaylistDetailView(playlist: playlist)
+                    } label: {
+                        playlistRow(playlist)
+                    }
+                    .listRowBackground(ShaudiTheme.card)
+                    .listRowSeparator(.hidden)
+                }
+                .onDelete(perform: deletePlaylists)
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
         }
-        .listStyle(.insetGrouped)
-        .scrollContentBackground(.hidden)
         .background(ShaudiTheme.canvas)
     }
 
     private func playlistRow(_ playlist: Playlist) -> some View {
         HStack(spacing: 13) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(ShaudiTheme.accent.opacity(0.14))
-
-                Image(systemName: "rectangle.stack.fill")
-                    .font(.headline)
-                    .foregroundStyle(ShaudiTheme.accent)
-            }
-            .frame(width: 42, height: 42)
+            PlaylistArtworkView(playlist: playlist)
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Text(playlist.name)
                 .font(.headline)
@@ -177,6 +191,24 @@ struct PlaylistDetailView: View {
         return false
     }
 
+    private var isActivePlaylist: Bool {
+        playbackManager.hasActivePlaylistQueue(
+            for: playlist.persistentModelID
+        )
+    }
+
+    private var isPlaylistPlaying: Bool {
+        guard isActivePlaylist else {
+            return false
+        }
+
+        if case .playing = playbackManager.state {
+            return true
+        }
+
+        return false
+    }
+
     private var trackOrderSignature: [String] {
         tracks.map {
             let videoID = $0.youtubeVideoID
@@ -263,7 +295,7 @@ struct PlaylistDetailView: View {
         }
         .background(ShaudiTheme.canvas)
         .tint(ShaudiTheme.accent)
-        .navigationTitle(playlist.name)
+        .navigationBarTitleDisplayMode(.inline)
         .onAppear {
             isPlaylistVisible = true
             updatePlaylistWarmup()
@@ -355,9 +387,9 @@ struct PlaylistDetailView: View {
     private var playbackModeControls: some View {
         HStack(spacing: 14) {
             Button {
-                playPlaylist()
+                handlePlaylistPlayButton()
             } label: {
-                Image(systemName: "play.fill")
+                Image(systemName: isPlaylistPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(.white)
                     .frame(width: 40, height: 40)
@@ -366,7 +398,7 @@ struct PlaylistDetailView: View {
             .buttonStyle(.plain)
             .disabled(!hasPlayableTrack)
             .opacity(hasPlayableTrack ? 1 : 0.45)
-            .accessibilityLabel("Play Playlist")
+            .accessibilityLabel(isPlaylistPlaying ? "Pause Playlist" : "Play Playlist")
 
             Spacer()
 
@@ -446,6 +478,25 @@ struct PlaylistDetailView: View {
             in: orderedTracks,
             origin: .playlist(targetPlaylistID)
         )
+    }
+
+    private func handlePlaylistPlayButton() {
+        if isActivePlaylist {
+            switch playbackManager.state {
+            case .playing:
+                playbackManager.pause()
+                return
+            case .paused:
+                playbackManager.resume()
+                return
+            case .resolving, .loading:
+                return
+            case .idle, .failed:
+                break
+            }
+        }
+
+        playPlaylist()
     }
 
     private func updatePlaylistWarmup() {

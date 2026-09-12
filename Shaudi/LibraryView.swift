@@ -381,46 +381,7 @@ struct LibraryView: View {
     }
 
     private func playlistArtwork(_ playlist: Playlist) -> some View {
-        GeometryReader { geometry in
-            ZStack {
-                ShaudiTheme.dashboardCard
-
-                if
-                    let artworkID = playlist.artworkID,
-                    let image = ArtworkStorage.playlistImage(for: artworkID)
-                {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                        .clipped()
-                } else if let thumbnailURL = playlist.tracksInPlaybackOrder
-                    .first?.thumbnailURL
-                {
-                    AsyncImage(url: thumbnailURL) { phase in
-                        if case .success(let image) = phase {
-                            image
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: geometry.size.width, height: geometry.size.height)
-                                .clipped()
-                        } else {
-                            playlistArtworkPlaceholder
-                        }
-                    }
-                } else {
-                    playlistArtworkPlaceholder
-                }
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height)
-            .clipped()
-        }
-    }
-
-    private var playlistArtworkPlaceholder: some View {
-        Image(systemName: "rectangle.stack.fill")
-            .font(.title2)
-            .foregroundStyle(ShaudiTheme.accent)
+        PlaylistArtworkView(playlist: playlist)
     }
 
     private func updateDashboardWarmup() {
@@ -598,6 +559,53 @@ struct LibraryView: View {
             Spacer(minLength: 4)
         }
         .padding(.vertical, 5)
+    }
+}
+
+struct PlaylistArtworkView: View {
+    let playlist: Playlist
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack {
+                ShaudiTheme.dashboardCard
+
+                if
+                    let artworkID = playlist.artworkID,
+                    let image = ArtworkStorage.playlistImage(for: artworkID)
+                {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                } else if let thumbnailURL = playlist.tracksInPlaybackOrder
+                    .first?.thumbnailURL
+                {
+                    AsyncImage(url: thumbnailURL) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                                .clipped()
+                        } else {
+                            placeholder
+                        }
+                    }
+                } else {
+                    placeholder
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+        }
+    }
+
+    private var placeholder: some View {
+        Image(systemName: "rectangle.stack.fill")
+            .font(.title2)
+            .foregroundStyle(ShaudiTheme.accent)
     }
 }
 
