@@ -29,6 +29,25 @@ struct LibraryView: View {
 
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
 
+    private var dashboardPlaylists: [Playlist] {
+        playlists.enumerated().sorted { first, second in
+            switch (first.element.lastPlayedAt, second.element.lastPlayedAt) {
+            case let (firstDate?, secondDate?):
+                if firstDate != secondDate {
+                    return firstDate > secondDate
+                }
+                return first.offset < second.offset
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                return first.offset < second.offset
+            }
+        }
+        .map(\.element)
+    }
+
     var body: some View {
         NavigationStack {
             dashboard
@@ -147,14 +166,14 @@ struct LibraryView: View {
     }
 
     private var playlistPager: some View {
-        let pageCount = max(1, (playlists.count + 5) / 6)
+        let pageCount = max(1, (dashboardPlaylists.count + 5) / 6)
         return TabView {
             ForEach(0..<pageCount, id: \.self) { page in
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
                     ForEach(0..<6, id: \.self) { slot in
                         let playlistIndex = page * 6 + slot
-                        if playlistIndex < playlists.count {
-                            let playlist = playlists[playlistIndex]
+                        if playlistIndex < dashboardPlaylists.count {
+                            let playlist = dashboardPlaylists[playlistIndex]
                             NavigationLink {
                                 PlaylistDetailView(playlist: playlist)
                             } label: {
@@ -183,7 +202,11 @@ struct LibraryView: View {
                 LazyVStack(spacing: 10) {
                     ForEach(tracks) { track in
                         NavigationLink {
-                            TrackDetailView(track: track, queue: tracks)
+                            TrackDetailView(
+                                track: track,
+                                queue: tracks,
+                                playbackOrigin: .library
+                            )
                         } label: {
                             trackRow(track)
                         }
@@ -283,7 +306,11 @@ struct LibraryView: View {
             Section {
                 ForEach(tracks) { track in
                     NavigationLink {
-                        TrackDetailView(track: track, queue: tracks)
+                        TrackDetailView(
+                            track: track,
+                            queue: tracks,
+                            playbackOrigin: .library
+                        )
                     } label: {
                         trackRow(track)
                     }
@@ -703,6 +730,7 @@ struct TrackDetailView: View {
 
     let track: Track
     let queue: [Track]
+    let playbackOrigin: PlaybackOrigin
 
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
@@ -879,7 +907,7 @@ struct TrackDetailView: View {
 
     private func playButton(_ title: String) -> some View {
         Button(title) {
-            playbackManager.play(track, in: queue)
+            playbackManager.play(track, in: queue, origin: playbackOrigin)
         }
         .buttonStyle(.borderedProminent)
         .tint(ShaudiTheme.accent)

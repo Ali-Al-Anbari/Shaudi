@@ -158,7 +158,11 @@ struct PlaylistDetailView: View {
                 List {
                     ForEach(tracks) { track in
                         NavigationLink {
-                            TrackDetailView(track: track, queue: tracks)
+                            TrackDetailView(
+                                track: track,
+                                queue: tracks,
+                                playbackOrigin: .playlist(playlist.persistentModelID)
+                            )
                         } label: {
                             HStack(spacing: 13) {
                                 Image(systemName: "music.note")

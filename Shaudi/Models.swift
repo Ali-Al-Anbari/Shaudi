@@ -45,6 +45,7 @@ final class Track {
 final class Playlist {
     var name: String
     var dateCreated: Date
+    var lastPlayedAt: Date? = nil
 
     @Relationship(inverse: \Track.playlists)
     var tracks: [Track]
@@ -52,10 +53,12 @@ final class Playlist {
     init(
         name: String,
         dateCreated: Date = .now,
+        lastPlayedAt: Date? = nil,
         tracks: [Track] = []
     ) {
         self.name = name
         self.dateCreated = dateCreated
+        self.lastPlayedAt = lastPlayedAt
         self.tracks = tracks
     }
 }

@@ -6,11 +6,18 @@
 import AVFoundation
 import Combine
 import Foundation
+import SwiftData
 #if os(iOS)
 import MediaPlayer
 import UIKit
 #endif
 import YouTubeKit
+
+enum PlaybackOrigin: Equatable {
+    case playlist(PersistentIdentifier)
+    case library
+    case search
+}
 
 private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
     weak var value: Value?
@@ -77,6 +84,12 @@ final class PlaybackManager: ObservableObject {
         var totalStartTime: TimeInterval? = nil
     }
 
+    struct PlaybackStartEvent: Equatable {
+        let id: UUID
+        let origin: PlaybackOrigin
+        let trackID: String
+    }
+
     private enum StreamResolutionError: Error {
         case noPlayableStream
     }
@@ -112,6 +125,7 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var startupMetrics: StartupMetrics?
     @Published private(set) var queue: [Track] = []
     @Published private(set) var currentIndex: Int?
+    @Published private(set) var playbackStartEvent: PlaybackStartEvent?
 
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
@@ -124,6 +138,8 @@ final class PlaybackManager: ObservableObject {
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackBoundaryObserver: Any?
     private var activeRequestID: UUID?
+    private var lastReportedPlaybackRequestID: UUID?
+    private var playbackOrigin: PlaybackOrigin?
     private var activePreResolutionID: UUID?
     private var activeLookaheadID: UUID?
     private var preparedNextVideoID: String?
@@ -160,8 +176,13 @@ final class PlaybackManager: ObservableObject {
         return queue.indices.contains(currentIndex + 1)
     }
 
-    func play(_ track: Track, in orderedQueue: [Track]) {
+    func play(
+        _ track: Track,
+        in orderedQueue: [Track],
+        origin: PlaybackOrigin
+    ) {
         cancelUpcomingPreResolutionObservation()
+        playbackOrigin = origin
 
         if let selectedIndex = orderedQueue.firstIndex(where: { $0 === track }) {
             queue = orderedQueue
@@ -178,11 +199,12 @@ final class PlaybackManager: ObservableObject {
     }
 
     func play(_ track: Track) {
-        play(track, in: [track])
+        play(track, in: [track], origin: .library)
     }
 
     func play(_ track: PlayableTrack) {
         cancelUpcomingPreResolutionObservation()
+        playbackOrigin = .search
         queue = []
         currentIndex = nil
 #if os(iOS)
@@ -403,6 +425,7 @@ final class PlaybackManager: ObservableObject {
         currentIndex = nil
         currentTrack = nil
         currentPlayableTrack = nil
+        playbackOrigin = nil
         state = .idle
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -1174,6 +1197,10 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 self.state = .playing
+                self.reportPlaybackStartedIfNeeded(
+                    requestID: requestID,
+                    videoID: videoID
+                )
                 self.recordPlaybackStarted(
                     videoID: videoID,
                     requestStartedAt: requestStartedAt,
@@ -1684,6 +1711,28 @@ final class PlaybackManager: ObservableObject {
                     + "(source: \(streamSource))"
             )
         }
+    }
+
+    private func reportPlaybackStartedIfNeeded(requestID: UUID, videoID: String) {
+        guard
+            lastReportedPlaybackRequestID != requestID,
+            let playbackOrigin
+        else {
+            return
+        }
+
+        lastReportedPlaybackRequestID = requestID
+        playbackStartEvent = PlaybackStartEvent(
+            id: requestID,
+            origin: playbackOrigin,
+            trackID: videoID
+        )
+
+#if DEBUG
+        if case .playlist(let playlistID) = playbackOrigin {
+            print("[PlaybackContext] playlist=\(playlistID)")
+        }
+#endif
     }
 
     private func activateAudioSession() throws {
