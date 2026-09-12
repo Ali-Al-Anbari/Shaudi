@@ -406,7 +406,7 @@
 			repositoryURL = "https://github.com/Ali-Al-Anbari/YouTubeKit";
 			requirement = {
 				kind = revision;
-				revision = 0494f6ae740c3d21da36d9e567534da6e5328de4;
+				revision = 13a90ce2b9c1815147bec9e74c1472c7269ddd0c;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

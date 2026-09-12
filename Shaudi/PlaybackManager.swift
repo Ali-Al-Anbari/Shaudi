@@ -501,7 +501,8 @@ final class PlaybackManager: ObservableObject {
 
             let streams = try await YouTube(
                 videoID: videoID,
-                methods: [.local]
+                methods: [.local],
+                audioOnlyM4AIsSufficient: true
             ).streams
 
             try Task.checkCancellation()
