@@ -163,11 +163,33 @@ struct PlaylistDetailView: View {
         playlist.tracksInPlaybackOrder
     }
 
-    private var warmupVideoIDs: [String] {
+    private var firstPlayableTrack: Track? {
+        tracks.first {
+            !$0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        }
+    }
+
+    private var hasPlayableTrack: Bool {
+        if let firstPlayableTrack {
+            return true
+        }
+        return false
+    }
+
+    private var trackOrderSignature: [String] {
+        tracks.map {
+            let videoID = $0.youtubeVideoID
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return videoID.isEmpty ? String(describing: $0.persistentModelID) : videoID
+        }
+    }
+
+    private func warmupVideoIDs(from orderedTracks: [Track]) -> [String] {
         var seenVideoIDs: Set<String> = []
         var videoIDs: [String] = []
 
-        for track in tracks {
+        for track in orderedTracks {
             let videoID = track.youtubeVideoID
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
@@ -184,46 +206,51 @@ struct PlaylistDetailView: View {
     }
 
     var body: some View {
-        Group {
-            if tracks.isEmpty {
-                ContentUnavailableView(
-                    "No Tracks",
-                    systemImage: "music.note",
-                    description: Text("Add tracks from your Library.")
-                )
-            } else {
-                List {
-                    ForEach(tracks) { track in
-                        NavigationLink {
-                            TrackDetailView(
-                                track: track,
-                                queue: tracks,
-                                playbackOrigin: .playlist(playlist.persistentModelID)
-                            )
-                        } label: {
-                            HStack(spacing: 13) {
-                                Image(systemName: "music.note")
-                                    .foregroundStyle(ShaudiTheme.lavender)
-                                    .frame(width: 28, height: 28)
-                                    .background(ShaudiTheme.lavender.opacity(0.14), in: Circle())
+        VStack(spacing: 0) {
+            playbackModeControls
 
-                                Text(track.title)
-                                    .font(.headline)
-                                    .foregroundStyle(.primary)
-                                    .lineLimit(2)
+            Group {
+                if tracks.isEmpty {
+                    ContentUnavailableView(
+                        "No Tracks",
+                        systemImage: "music.note",
+                        description: Text("Add tracks from your Library.")
+                    )
+                } else {
+                    List {
+                        ForEach(tracks) { track in
+                            NavigationLink {
+                                TrackDetailView(
+                                    track: track,
+                                    queue: tracks,
+                                    playbackOrigin: .playlist(playlist.persistentModelID)
+                                )
+                            } label: {
+                                HStack(spacing: 13) {
+                                    Image(systemName: "music.note")
+                                        .foregroundStyle(ShaudiTheme.lavender)
+                                        .frame(width: 28, height: 28)
+                                        .background(ShaudiTheme.lavender.opacity(0.14), in: Circle())
+
+                                    Text(track.title)
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(2)
+                                }
+                                .padding(.vertical, 5)
                             }
-                            .padding(.vertical, 5)
+                            .listRowBackground(ShaudiTheme.card)
+                            .listRowSeparator(.hidden)
                         }
-                        .listRowBackground(ShaudiTheme.card)
-                        .listRowSeparator(.hidden)
+                        .onDelete(perform: removeTracks)
                     }
-                    .onDelete(perform: removeTracks)
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                    .background(ShaudiTheme.canvas)
                 }
-                .listStyle(.insetGrouped)
-                .scrollContentBackground(.hidden)
-                .background(ShaudiTheme.canvas)
             }
         }
+        .background(ShaudiTheme.canvas)
         .tint(ShaudiTheme.accent)
         .navigationTitle(playlist.name)
         .onAppear {
@@ -234,7 +261,10 @@ struct PlaylistDetailView: View {
             isPlaylistVisible = false
             playbackManager.cancelPlaylistWarmup()
         }
-        .onChange(of: warmupVideoIDs) {
+        .onChange(of: trackOrderSignature) {
+            updatePlaylistWarmup()
+        }
+        .onChange(of: playbackManager.isShuffleEnabled) {
             updatePlaylistWarmup()
         }
         .onChange(of: scenePhase) { _, phase in
@@ -311,6 +341,65 @@ struct PlaylistDetailView: View {
         }
     }
 
+    private var playbackModeControls: some View {
+        HStack(spacing: 14) {
+            Button {
+                playPlaylist()
+            } label: {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 40)
+                    .background(ShaudiTheme.accent, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasPlayableTrack)
+            .opacity(hasPlayableTrack ? 1 : 0.45)
+            .accessibilityLabel("Play Playlist")
+
+            Spacer()
+
+            playbackModeButton(
+                title: "Shuffle",
+                systemImage: "shuffle",
+                isActive: playbackManager.isShuffleEnabled
+            ) {
+                playbackManager.toggleShuffle()
+            }
+
+            playbackModeButton(
+                title: "Repeat Playlist",
+                systemImage: "repeat",
+                isActive: playbackManager.repeatMode == .playlist
+            ) {
+                playbackManager.toggleRepeatMode()
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
+    }
+
+    private func playbackModeButton(
+        title: String,
+        systemImage: String,
+        isActive: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(isActive ? ShaudiTheme.accent : Color.secondary)
+                .frame(width: 38, height: 38)
+                .background(
+                    isActive ? ShaudiTheme.accent.opacity(0.16) : Color.clear,
+                    in: Circle()
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityValue(isActive ? "On" : "Off")
+    }
+
     private func removeTracks(at offsets: IndexSet) {
         for index in offsets {
             let track = tracks[index]
@@ -318,13 +407,35 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private func updatePlaylistWarmup() {
-        guard isPlaylistVisible, scenePhase == .active else {
+    private func playPlaylist() {
+        guard let firstPlayableTrack else {
             return
         }
 
+        playbackManager.play(
+            firstPlayableTrack,
+            in: tracks,
+            origin: .playlist(playlist.persistentModelID)
+        )
+    }
+
+    private func updatePlaylistWarmup() {
+        guard
+            isPlaylistVisible,
+            scenePhase == .active,
+            !playbackManager.hasActivePlaylistQueue(
+                for: playlist.persistentModelID
+            )
+        else {
+            return
+        }
+
+        let effectiveOrder = playbackManager.effectivePlaylistOrder(
+            tracks,
+            playlistID: playlist.persistentModelID
+        )
         playbackManager.warmPlaylist(
-            warmupVideoIDs,
+            warmupVideoIDs(from: effectiveOrder),
             playlistID: playlist.persistentModelID
         )
     }

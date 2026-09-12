@@ -76,6 +76,16 @@ final class PlaybackManager: ObservableObject {
         case failed(String)
     }
 
+    enum RepeatMode: String {
+        case off
+        case playlist
+    }
+
+    private enum QueueTrackIdentity: Hashable {
+        case videoID(String)
+        case object(ObjectIdentifier)
+    }
+
     struct StartupMetrics {
         let videoID: String
         var streamSource: String
@@ -138,6 +148,8 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var queue: [Track] = []
     @Published private(set) var currentIndex: Int?
     @Published private(set) var playbackStartEvent: PlaybackStartEvent?
+    @Published private(set) var isShuffleEnabled = false
+    @Published private(set) var repeatMode: RepeatMode = .off
 
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
@@ -154,6 +166,9 @@ final class PlaybackManager: ObservableObject {
     private var activeRequestID: UUID?
     private var lastReportedPlaybackRequestID: UUID?
     private var playbackOrigin: PlaybackOrigin?
+    private var playlistQueueInNormalOrder: [Track] = []
+    private var shuffledPlaylistID: PersistentIdentifier?
+    private var shuffledPlaylistOrder: [Track] = []
     private var activePreResolutionID: UUID?
     private var activeLookaheadID: UUID?
     private var preparedNextVideoID: String?
@@ -186,7 +201,7 @@ final class PlaybackManager: ObservableObject {
             return false
         }
 
-        return currentIndex > queue.startIndex
+        return previousQueueIndex(before: currentIndex) != nil
     }
 
     var hasNextTrack: Bool {
@@ -194,7 +209,7 @@ final class PlaybackManager: ObservableObject {
             return false
         }
 
-        return queue.indices.contains(currentIndex + 1)
+        return nextQueueIndex(after: currentIndex) != nil
     }
 
     func play(
@@ -208,12 +223,47 @@ final class PlaybackManager: ObservableObject {
         cancelUpcomingPreResolutionObservation()
         playbackOrigin = origin
 
-        if let selectedIndex = orderedQueue.firstIndex(where: { $0 === track }) {
-            queue = orderedQueue
-            currentIndex = selectedIndex
+        if case .playlist = origin {
+            playlistQueueInNormalOrder = uniquePlaylistQueue(
+                orderedQueue,
+                prioritizing: track
+            )
+
+            if isShuffleEnabled {
+                let playlistID: PersistentIdentifier?
+                if case let .playlist(originPlaylistID) = origin {
+                    playlistID = originPlaylistID
+                } else {
+                    playlistID = nil
+                }
+                let stableOrder = playlistID.map {
+                    effectivePlaylistOrder(
+                        playlistQueueInNormalOrder,
+                        playlistID: $0
+                    )
+                } ?? playlistQueueInNormalOrder
+                queue = queueStartingWithSelectedTrack(track, in: stableOrder)
+                shuffledPlaylistOrder = queue
+                currentIndex = queue.startIndex
+                queueLog("shuffled order rebuilt count=\(queue.count)")
+            } else if let selectedIndex = playlistQueueInNormalOrder.firstIndex(
+                where: { $0 === track }
+            ) {
+                queue = playlistQueueInNormalOrder
+                currentIndex = selectedIndex
+            } else {
+                queue = [track]
+                currentIndex = queue.startIndex
+            }
         } else {
-            queue = [track]
-            currentIndex = queue.startIndex
+            playlistQueueInNormalOrder = []
+            if let selectedIndex = orderedQueue.firstIndex(where: { $0 === track }) {
+                queue = orderedQueue
+                currentIndex = selectedIndex
+            } else {
+                queue = [track]
+                currentIndex = queue.startIndex
+            }
         }
 
 #if os(iOS)
@@ -232,6 +282,7 @@ final class PlaybackManager: ObservableObject {
         )
         cancelUpcomingPreResolutionObservation()
         playbackOrigin = .search
+        playlistQueueInNormalOrder = []
         queue = []
         currentIndex = nil
 #if os(iOS)
@@ -403,17 +454,120 @@ final class PlaybackManager: ObservableObject {
         cancelPlaylistWarmupWork()
     }
 
+    func effectivePlaylistOrder(
+        _ normalOrder: [Track],
+        playlistID: PersistentIdentifier
+    ) -> [Track] {
+        let uniqueNormalOrder = uniqueQueue(normalOrder)
+        guard isShuffleEnabled else {
+            return uniqueNormalOrder
+        }
+
+        let normalIdentities = Set(uniqueNormalOrder.map { queueIdentity(for: $0) })
+        if shuffledPlaylistID == playlistID {
+            let retainedOrder = shuffledPlaylistOrder.filter {
+                normalIdentities.contains(queueIdentity(for: $0))
+            }
+            let retainedIdentities = Set(retainedOrder.map { queueIdentity(for: $0) })
+            let additions = uniqueNormalOrder.filter {
+                !retainedIdentities.contains(queueIdentity(for: $0))
+            }
+            shuffledPlaylistOrder = retainedOrder + additions.shuffled()
+        } else {
+            shuffledPlaylistID = playlistID
+            shuffledPlaylistOrder = uniqueNormalOrder.shuffled()
+            queueLog("shuffled order rebuilt count=\(shuffledPlaylistOrder.count)")
+        }
+
+        return shuffledPlaylistOrder
+    }
+
+    func hasActivePlaylistQueue(for playlistID: PersistentIdentifier) -> Bool {
+        guard
+            case let .playlist(activePlaylistID) = playbackOrigin,
+            activePlaylistID == playlistID,
+            let currentIndex,
+            queue.indices.contains(currentIndex)
+        else {
+            return false
+        }
+
+        return currentPlayableTrack != nil
+    }
+
     func nextTrack() {
         advanceToNextTrack(reason: "Next")
     }
 
+    func toggleShuffle() {
+        isShuffleEnabled.toggle()
+
+        guard
+            case .playlist = playbackOrigin,
+            let currentIndex,
+            queue.indices.contains(currentIndex)
+        else {
+            shuffledPlaylistID = nil
+            shuffledPlaylistOrder = []
+            queueLog(isShuffleEnabled ? "shuffle enabled" : "shuffle disabled")
+            return
+        }
+
+        let currentTrack = queue[currentIndex]
+        if isShuffleEnabled {
+            let history = Array(queue[queue.startIndex...currentIndex])
+            let consumedIdentities = Set(history.map { queueIdentity(for: $0) })
+            let remainingTracks = playlistQueueInNormalOrder.filter {
+                !consumedIdentities.contains(queueIdentity(for: $0))
+            }
+            queue = history + remainingTracks.shuffled()
+            self.currentIndex = history.count - 1
+            if case let .playlist(playlistID) = playbackOrigin {
+                shuffledPlaylistID = playlistID
+                shuffledPlaylistOrder = queue
+            }
+            queueLog("shuffle enabled count=\(queue.count)")
+            queueLog("shuffled order rebuilt")
+        } else {
+            queue = playlistQueueInNormalOrder
+            if let restoredIndex = queue.firstIndex(where: { $0 === currentTrack })
+                ?? queue.firstIndex(where: {
+                    queueIdentity(for: $0) == queueIdentity(for: currentTrack)
+                })
+            {
+                self.currentIndex = restoredIndex
+            } else {
+                queue.append(currentTrack)
+                self.currentIndex = queue.count - 1
+            }
+            shuffledPlaylistID = nil
+            shuffledPlaylistOrder = []
+            queueLog("shuffle disabled")
+        }
+
+        refreshQueuePredictionsAfterMutation()
+    }
+
+    func toggleRepeatMode() {
+        repeatMode = repeatMode == .off ? .playlist : .off
+        queueLog("repeatMode=\(repeatMode.rawValue)")
+
+        guard case .playlist = playbackOrigin else {
+            return
+        }
+
+        refreshQueuePredictionsAfterMutation()
+    }
+
     func previousTrack() {
-        guard let currentIndex, currentIndex > queue.startIndex else {
+        guard
+            let currentIndex,
+            let previousIndex = previousQueueIndex(before: currentIndex)
+        else {
             return
         }
 
         let requestedAt = currentTime
-        let previousIndex = currentIndex - 1
         let videoID = queue[previousIndex].youtubeVideoID
             .trimmingCharacters(in: .whitespacesAndNewlines)
         log("Previous requested for \(videoID)")
@@ -426,14 +580,19 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func advanceToNextTrack(reason: String) {
-        guard let currentIndex, queue.indices.contains(currentIndex + 1) else {
+        guard
+            let currentIndex,
+            let nextIndex = nextQueueIndex(after: currentIndex)
+        else {
             return
         }
 
         let requestedAt = currentTime
-        let nextIndex = currentIndex + 1
         let nextTrack = queue[nextIndex]
         let videoID = nextTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if nextIndex == queue.startIndex, currentIndex == queue.index(before: queue.endIndex) {
+            queueLog("wrapped to start")
+        }
         log("\(reason) advance requested for \(videoID)")
 
         let preparedPlayback = takePreparedNextPlayback(
@@ -450,6 +609,136 @@ final class PlaybackManager: ObservableObject {
             preparedPlayback: preparedPlayback,
             requestStartedAt: requestedAt
         )
+    }
+
+    private func nextQueueIndex(after index: Int) -> Int? {
+        guard queue.indices.contains(index) else {
+            return nil
+        }
+
+        let nextIndex = index + 1
+        if queue.indices.contains(nextIndex) {
+            return nextIndex
+        }
+
+        guard
+            repeatMode == .playlist,
+            case .playlist = playbackOrigin,
+            !queue.isEmpty
+        else {
+            return nil
+        }
+
+        return queue.startIndex
+    }
+
+    private func previousQueueIndex(before index: Int) -> Int? {
+        guard queue.indices.contains(index) else {
+            return nil
+        }
+
+        if index > queue.startIndex {
+            return index - 1
+        }
+
+        guard
+            repeatMode == .playlist,
+            case .playlist = playbackOrigin,
+            !queue.isEmpty
+        else {
+            return nil
+        }
+
+        return queue.index(before: queue.endIndex)
+    }
+
+    private func upcomingQueueIndices(after index: Int, limit: Int) -> [Int] {
+        guard limit > 0, queue.indices.contains(index) else {
+            return []
+        }
+
+        var indices: [Int] = []
+        var visitedIndices: Set<Int> = [index]
+        var cursor = index
+
+        while indices.count < limit {
+            guard
+                let nextIndex = nextQueueIndex(after: cursor),
+                visitedIndices.insert(nextIndex).inserted
+            else {
+                break
+            }
+
+            indices.append(nextIndex)
+            cursor = nextIndex
+        }
+
+        return indices
+    }
+
+    private func uniquePlaylistQueue(
+        _ orderedQueue: [Track],
+        prioritizing selectedTrack: Track
+    ) -> [Track] {
+        let selectedIdentity = queueIdentity(for: selectedTrack)
+        var seenIdentities: Set<QueueTrackIdentity> = []
+        var uniqueTracks: [Track] = []
+
+        for track in orderedQueue {
+            let identity = queueIdentity(for: track)
+            guard seenIdentities.insert(identity).inserted else {
+                continue
+            }
+
+            uniqueTracks.append(identity == selectedIdentity ? selectedTrack : track)
+        }
+
+        if seenIdentities.insert(selectedIdentity).inserted {
+            uniqueTracks.append(selectedTrack)
+        }
+
+        return uniqueTracks
+    }
+
+    private func uniqueQueue(_ orderedQueue: [Track]) -> [Track] {
+        var seenIdentities: Set<QueueTrackIdentity> = []
+        return orderedQueue.filter {
+            seenIdentities.insert(queueIdentity(for: $0)).inserted
+        }
+    }
+
+    private func queueStartingWithSelectedTrack(
+        _ selectedTrack: Track,
+        in stableOrder: [Track]
+    ) -> [Track] {
+        let selectedIdentity = queueIdentity(for: selectedTrack)
+        let remainingTracks = stableOrder.filter {
+            queueIdentity(for: $0) != selectedIdentity
+        }
+        return [selectedTrack] + remainingTracks
+    }
+
+    private func queueIdentity(for track: Track) -> QueueTrackIdentity {
+        let videoID = normalizedVideoID(track.youtubeVideoID)
+        if !videoID.isEmpty {
+            return .videoID(videoID)
+        }
+
+        return .object(ObjectIdentifier(track))
+    }
+
+    private func refreshQueuePredictionsAfterMutation() {
+        cancelUpcomingPreResolutionObservation()
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+
+        switch state {
+        case .playing, .paused, .loading:
+            beginPreResolvingNextTrack()
+        case .idle, .resolving, .failed:
+            break
+        }
     }
 
     private func startCurrentQueueTrack(
@@ -614,6 +903,7 @@ final class PlaybackManager: ObservableObject {
         clearPlayer()
         queue = []
         currentIndex = nil
+        playlistQueueInNormalOrder = []
         currentTrack = nil
         currentPlayableTrack = nil
         playbackOrigin = nil
@@ -964,9 +1254,12 @@ final class PlaybackManager: ObservableObject {
             return false
         }
 
-        let finalIndex = min(currentIndex + streamLookaheadCount, queue.count - 1)
-        return queue[currentIndex...finalIndex].contains {
-            normalizedVideoID($0.youtubeVideoID) == videoID
+        let protectedIndices = [currentIndex] + upcomingQueueIndices(
+            after: currentIndex,
+            limit: streamLookaheadCount
+        )
+        return protectedIndices.contains {
+            normalizedVideoID(queue[$0].youtubeVideoID) == videoID
         }
     }
 
@@ -1065,12 +1358,11 @@ final class PlaybackManager: ObservableObject {
     private func beginPreResolvingNextTrack() {
         guard
             let currentIndex,
-            queue.indices.contains(currentIndex + 1)
+            let nextIndex = nextQueueIndex(after: currentIndex)
         else {
             return
         }
 
-        let nextIndex = currentIndex + 1
         let nextTrack = queue[nextIndex]
         let videoID = nextTrack.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard preparedNextVideoID != videoID else {
@@ -1157,7 +1449,7 @@ final class PlaybackManager: ObservableObject {
                 )
                 activePreResolutionID = nil
                 preResolutionTask = nil
-                beginLookaheadFill(from: nextIndex - 1)
+                beginLookaheadFill(from: currentIndex)
             }
         }
     }
@@ -1230,7 +1522,9 @@ final class PlaybackManager: ObservableObject {
             }
         }
 
-        beginLookaheadFill(from: queueIndex - 1)
+        if let currentIndex {
+            beginLookaheadFill(from: currentIndex)
+        }
     }
 
     private func beginLookaheadFill(from anchorIndex: Int) {
@@ -1241,27 +1535,35 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        let firstLookaheadIndex = anchorIndex + 2
-        let finalLookaheadIndex = min(
-            anchorIndex + streamLookaheadCount,
-            queue.count - 1
+        cancelLookaheadFill()
+
+        let upcomingIndices = upcomingQueueIndices(
+            after: anchorIndex,
+            limit: streamLookaheadCount
         )
-        guard firstLookaheadIndex <= finalLookaheadIndex else {
+        var candidates: [(queueIndex: Int, track: Track, videoID: String)] = []
+        var seenVideoIDs: Set<String> = []
+
+        for (position, candidateIndex) in upcomingIndices.enumerated() {
+            let track = queue[candidateIndex]
+            let videoID = normalizedVideoID(track.youtubeVideoID)
+
+            // Position one is handled by prepared-next. Later positions are URL-only lookahead.
+            guard position > 0, !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                continue
+            }
+
+            candidates.append(
+                (queueIndex: candidateIndex, track: track, videoID: videoID)
+            )
+        }
+
+        guard !candidates.isEmpty else {
             return
         }
 
-        cancelLookaheadFill()
-
         let lookaheadID = UUID()
         activeLookaheadID = lookaheadID
-        let candidates = (firstLookaheadIndex...finalLookaheadIndex).map { queueIndex in
-            let track = queue[queueIndex]
-            return (
-                queueIndex: queueIndex,
-                track: track,
-                videoID: track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-        }
         log("Lookahead fill started from index \(anchorIndex)")
 
         lookaheadTask = Task { [weak self] in
@@ -1272,7 +1574,7 @@ final class PlaybackManager: ObservableObject {
                 }
             }
 
-            for candidate in candidates {
+            for (candidateOffset, candidate) in candidates.enumerated() {
                 guard
                     let self,
                     !Task.isCancelled,
@@ -1286,11 +1588,7 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 let videoID = candidate.videoID
-                let offset = candidate.queueIndex - anchorIndex
-                guard !videoID.isEmpty else {
-                    log("Lookahead resolution failed for unavailable video ID at +\(offset)")
-                    continue
-                }
+                let offset = candidateOffset + 2
 
                 if resolvedStreamCache[videoID] != nil {
                     markStreamAsNonSpeculative(videoID)
@@ -1501,7 +1799,7 @@ final class PlaybackManager: ObservableObject {
     ) -> Bool {
         guard
             let currentIndex,
-            queueIndex == currentIndex + 1,
+            nextQueueIndex(after: currentIndex) == queueIndex,
             queue.indices.contains(queueIndex)
         else {
             return false
@@ -2306,6 +2604,12 @@ final class PlaybackManager: ObservableObject {
     private func playlistLog(_ message: String) {
 #if DEBUG
         print("[PlaylistWarmup] \(message)")
+#endif
+    }
+
+    private func queueLog(_ message: String) {
+#if DEBUG
+        print("[Queue] \(message)")
 #endif
     }
 
