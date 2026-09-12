@@ -144,6 +144,8 @@ private struct PlaylistNameEditor: View {
 
 struct PlaylistDetailView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var playbackManager: PlaybackManager
 
     let playlist: Playlist
 
@@ -153,9 +155,32 @@ struct PlaylistDetailView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingArtworkImage: UIImage?
     @State private var isShowingArtworkCropper = false
+    @State private var isPlaylistVisible = false
+
+    private let warmupTrackLimit = 10
 
     private var tracks: [Track] {
-        playlist.tracks.sorted { $0.dateAdded > $1.dateAdded }
+        playlist.tracksInPlaybackOrder
+    }
+
+    private var warmupVideoIDs: [String] {
+        var seenVideoIDs: Set<String> = []
+        var videoIDs: [String] = []
+
+        for track in tracks {
+            let videoID = track.youtubeVideoID
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                continue
+            }
+
+            videoIDs.append(videoID)
+            if videoIDs.count == warmupTrackLimit {
+                break
+            }
+        }
+
+        return videoIDs
     }
 
     var body: some View {
@@ -201,6 +226,24 @@ struct PlaylistDetailView: View {
         }
         .tint(ShaudiTheme.accent)
         .navigationTitle(playlist.name)
+        .onAppear {
+            isPlaylistVisible = true
+            updatePlaylistWarmup()
+        }
+        .onDisappear {
+            isPlaylistVisible = false
+            playbackManager.cancelPlaylistWarmup()
+        }
+        .onChange(of: warmupVideoIDs) {
+            updatePlaylistWarmup()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                updatePlaylistWarmup()
+            } else if isPlaylistVisible {
+                playbackManager.cancelPlaylistWarmup()
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .principal) {
                 Text(playlist.name)
@@ -273,6 +316,17 @@ struct PlaylistDetailView: View {
             let track = tracks[index]
             playlist.tracks.removeAll { $0 === track }
         }
+    }
+
+    private func updatePlaylistWarmup() {
+        guard isPlaylistVisible, scenePhase == .active else {
+            return
+        }
+
+        playbackManager.warmPlaylist(
+            warmupVideoIDs,
+            playlistID: playlist.persistentModelID
+        )
     }
 
     private func prepareSelectedArtwork(_ selectedPhoto: PhotosPickerItem?) {

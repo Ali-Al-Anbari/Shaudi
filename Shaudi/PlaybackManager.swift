@@ -90,6 +90,11 @@ final class PlaybackManager: ObservableObject {
         let trackID: String
     }
 
+    struct DashboardWarmupCandidate: Equatable {
+        let playlistID: PersistentIdentifier
+        let videoID: String
+    }
+
     private enum StreamResolutionError: Error {
         case noPlayableStream
     }
@@ -98,12 +103,19 @@ final class PlaybackManager: ObservableObject {
         case foreground = "normal foreground extraction"
         case preResolution = "pre-resolution"
         case lookahead = "lookahead"
+        case dashboardWarmup = "dashboard warmup"
+        case playlistWarmup = "playlist warmup"
         case memoryCache = "in-memory cache"
     }
 
     private struct StreamDiagnostics {
         let fileExtension: String
         let audioBitrate: Int?
+    }
+
+    private struct InFlightResolution {
+        let id: UUID
+        let task: Task<URL, Error>
     }
 
     // The auxiliary player drives loading/preroll and becomes the current player on handoff.
@@ -131,6 +143,8 @@ final class PlaybackManager: ObservableObject {
     private var playbackTask: Task<Void, Never>?
     private var preResolutionTask: Task<Void, Never>?
     private var lookaheadTask: Task<Void, Never>?
+    private var dashboardWarmupTask: Task<Void, Never>?
+    private var playlistWarmupTask: Task<Void, Never>?
     private var nextItemPrerollTask: Task<Void, Never>?
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
@@ -146,7 +160,14 @@ final class PlaybackManager: ObservableObject {
     private var preparedNextPlayback: PreparedNextPlayback?
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
-    private var inFlightResolutions: [String: Task<URL, Error>] = [:]
+    private var inFlightResolutions: [String: InFlightResolution] = [:]
+    private var nonSpeculativeStreamIDs: Set<String> = []
+    private var dashboardSpeculativeStreamIDs: Set<String> = []
+    private var playlistSpeculativeStreamIDs: Set<String> = []
+    private var activeDashboardWarmupID: UUID?
+    private var activeDashboardResolutionVideoID: String?
+    private var activePlaylistWarmupID: UUID?
+    private var activePlaylistResolutionVideoID: String?
 #if os(iOS)
     private var remoteCommandTargets: [Any] = []
     private var artworkTask: Task<Void, Never>?
@@ -181,6 +202,9 @@ final class PlaybackManager: ObservableObject {
         in orderedQueue: [Track],
         origin: PlaybackOrigin
     ) {
+        pauseSpeculativeWarmupsForPlayback(
+            requestedVideoID: normalizedVideoID(track.youtubeVideoID)
+        )
         cancelUpcomingPreResolutionObservation()
         playbackOrigin = origin
 
@@ -203,6 +227,9 @@ final class PlaybackManager: ObservableObject {
     }
 
     func play(_ track: PlayableTrack) {
+        pauseSpeculativeWarmupsForPlayback(
+            requestedVideoID: normalizedVideoID(track.youtubeVideoID)
+        )
         cancelUpcomingPreResolutionObservation()
         playbackOrigin = .search
         queue = []
@@ -211,6 +238,169 @@ final class PlaybackManager: ObservableObject {
         updateRemoteQueueCommands()
 #endif
         startPlaybackContext(track, persistentTrack: nil)
+    }
+
+    func warmDashboardPage(
+        _ candidates: [DashboardWarmupCandidate],
+        page: Int
+    ) {
+        let uniqueCandidates = deduplicatedDashboardCandidates(candidates)
+        let candidateVideoIDs = Set(uniqueCandidates.map(\.videoID))
+
+        releasePlaylistWarmup(forDashboardCandidates: candidateVideoIDs)
+        replaceDashboardWarmup(with: candidateVideoIDs)
+
+        dashboardLog("page=\(page) candidates=\(uniqueCandidates.count)")
+        guard !uniqueCandidates.isEmpty else {
+            return
+        }
+
+        let warmupID = UUID()
+        activeDashboardWarmupID = warmupID
+        dashboardWarmupTask = Task(priority: .utility) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            defer {
+                if activeDashboardWarmupID == warmupID {
+                    activeDashboardWarmupID = nil
+                    activeDashboardResolutionVideoID = nil
+                    dashboardWarmupTask = nil
+                }
+            }
+
+            for candidate in uniqueCandidates {
+                guard
+                    !Task.isCancelled,
+                    activeDashboardWarmupID == warmupID
+                else {
+                    return
+                }
+
+                let videoID = candidate.videoID
+                if resolvedStreamCache[videoID] != nil {
+                    dashboardLog("cache hit track=\(videoID)")
+                    continue
+                }
+
+                activeDashboardResolutionVideoID = videoID
+                dashboardLog(
+                    "resolving track=\(videoID) playlist=\(candidate.playlistID)"
+                )
+                let task = resolutionTask(for: videoID, source: .dashboardWarmup)
+
+                do {
+                    _ = try await task.value
+                    try Task.checkCancellation()
+
+                    guard activeDashboardWarmupID == warmupID else {
+                        return
+                    }
+
+                    dashboardLog("resolved track=\(videoID)")
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard activeDashboardWarmupID == warmupID else {
+                        return
+                    }
+
+                    dashboardLog("failed track=\(videoID)")
+                }
+
+                if activeDashboardWarmupID == warmupID {
+                    activeDashboardResolutionVideoID = nil
+                }
+            }
+        }
+    }
+
+    func cancelDashboardWarmup() {
+        cancelDashboardWarmupWork()
+    }
+
+    func warmPlaylist(
+        _ orderedVideoIDs: [String],
+        playlistID: PersistentIdentifier
+    ) {
+        let videoIDs = deduplicatedVideoIDs(orderedVideoIDs)
+        let candidateVideoIDs = Set(videoIDs)
+
+        replacePlaylistWarmup(with: candidateVideoIDs)
+        releaseDashboardWarmup(forPlaylistCandidates: candidateVideoIDs)
+
+        playlistLog("playlist=\(playlistID) candidates=\(videoIDs.count)")
+        guard !videoIDs.isEmpty else {
+            return
+        }
+
+        let warmupID = UUID()
+        activePlaylistWarmupID = warmupID
+        playlistWarmupTask = Task(priority: .utility) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            defer {
+                if activePlaylistWarmupID == warmupID {
+                    activePlaylistWarmupID = nil
+                    activePlaylistResolutionVideoID = nil
+                    playlistWarmupTask = nil
+                }
+            }
+
+            for videoID in videoIDs {
+                guard
+                    !Task.isCancelled,
+                    activePlaylistWarmupID == warmupID
+                else {
+                    return
+                }
+
+                if resolvedStreamCache[videoID] != nil {
+                    playlistLog("cache hit track=\(videoID)")
+                    continue
+                }
+
+                activePlaylistResolutionVideoID = videoID
+                let joinedExistingResolution = inFlightResolutions[videoID] != nil
+                if joinedExistingResolution {
+                    playlistLog("joined in-flight track=\(videoID)")
+                } else {
+                    playlistLog("resolving track=\(videoID)")
+                }
+
+                let task = resolutionTask(for: videoID, source: .playlistWarmup)
+
+                do {
+                    _ = try await task.value
+                    try Task.checkCancellation()
+
+                    guard activePlaylistWarmupID == warmupID else {
+                        return
+                    }
+
+                    playlistLog("resolved track=\(videoID)")
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard activePlaylistWarmupID == warmupID else {
+                        return
+                    }
+
+                    playlistLog("failed track=\(videoID)")
+                }
+
+                if activePlaylistWarmupID == warmupID {
+                    activePlaylistResolutionVideoID = nil
+                }
+            }
+        }
+    }
+
+    func cancelPlaylistWarmup() {
+        cancelPlaylistWarmupWork()
     }
 
     func nextTrack() {
@@ -351,6 +541,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         if let cachedURL = resolvedStreamCache[videoID] {
+            markStreamAsNonSpeculative(videoID)
             startupMetrics = StartupMetrics(
                 videoID: videoID,
                 streamSource: "In-memory cache"
@@ -380,7 +571,7 @@ final class PlaybackManager: ObservableObject {
                     : "Fresh YouTubeKit resolution"
             )
             if isJoiningInFlightResolution {
-                log("Waiting for pre-resolution; next item is not prepared for \(videoID)")
+                log("Joining in-flight resolution for \(videoID)")
             } else {
                 log("Using normal foreground extraction for \(videoID)")
             }
@@ -485,9 +676,35 @@ final class PlaybackManager: ObservableObject {
                     usedCachedStream: isJoiningInFlightResolution
                 )
             } catch is CancellationError {
-                return
+                guard
+                    let self,
+                    isJoiningInFlightResolution,
+                    isActive(requestID),
+                    !Task.isCancelled
+                else {
+                    return
+                }
+
+                playbackTask = nil
+                log("Joined resolution was cancelled for \(videoID); retrying foreground once")
+                resolveAndStartPlayback(
+                    videoID: videoID,
+                    requestID: requestID,
+                    requestStartedAt: requestStartedAt
+                )
             } catch {
                 guard let self, isActive(requestID), !Task.isCancelled else {
+                    return
+                }
+
+                if isJoiningInFlightResolution {
+                    playbackTask = nil
+                    log("Joined resolution failed for \(videoID); retrying foreground once")
+                    resolveAndStartPlayback(
+                        videoID: videoID,
+                        requestID: requestID,
+                        requestStartedAt: requestStartedAt
+                    )
                     return
                 }
 
@@ -505,21 +722,307 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
+    private func deduplicatedDashboardCandidates(
+        _ candidates: [DashboardWarmupCandidate]
+    ) -> [DashboardWarmupCandidate] {
+        var seenVideoIDs: Set<String> = []
+
+        return candidates.compactMap { candidate in
+            let videoID = normalizedVideoID(candidate.videoID)
+            guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                return nil
+            }
+
+            return DashboardWarmupCandidate(
+                playlistID: candidate.playlistID,
+                videoID: videoID
+            )
+        }
+    }
+
+    private func deduplicatedVideoIDs(_ videoIDs: [String]) -> [String] {
+        var seenVideoIDs: Set<String> = []
+
+        return videoIDs.compactMap { rawVideoID in
+            let videoID = normalizedVideoID(rawVideoID)
+            guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                return nil
+            }
+
+            return videoID
+        }
+    }
+
+    private func replaceDashboardWarmup(with candidateVideoIDs: Set<String>) {
+        let hadActiveWarmup = cancelDashboardWarmupWork(
+            preserving: candidateVideoIDs,
+            cancelObsoleteResolution: true
+        )
+
+        let obsoleteVideoIDs = dashboardSpeculativeStreamIDs
+            .subtracting(candidateVideoIDs)
+
+        for videoID in obsoleteVideoIDs {
+            if nonSpeculativeStreamIDs.contains(videoID) || isNeededByActivePlayback(videoID) {
+                markStreamAsNonSpeculative(videoID)
+                continue
+            }
+
+            removeCachedStream(for: videoID)
+            dashboardLog("evicted speculative track=\(videoID)")
+        }
+
+        dashboardSpeculativeStreamIDs.formIntersection(candidateVideoIDs)
+
+        if hadActiveWarmup {
+            dashboardLog("cancelled old page")
+        }
+    }
+
+    @discardableResult
+    private func cancelDashboardWarmupWork(
+        preserving preservedVideoIDs: Set<String> = [],
+        cancelObsoleteResolution: Bool = false
+    ) -> Bool {
+        let hadActiveWarmup = activeDashboardWarmupID != nil
+        activeDashboardWarmupID = nil
+        dashboardWarmupTask?.cancel()
+        dashboardWarmupTask = nil
+
+        if cancelObsoleteResolution {
+            if
+                let videoID = activeDashboardResolutionVideoID,
+                !preservedVideoIDs.contains(videoID),
+                !nonSpeculativeStreamIDs.contains(videoID),
+                !isNeededByActivePlayback(videoID)
+            {
+                inFlightResolutions[videoID]?.task.cancel()
+            }
+
+            activeDashboardResolutionVideoID = nil
+        }
+
+        return hadActiveWarmup
+    }
+
+    private func replacePlaylistWarmup(with candidateVideoIDs: Set<String>) {
+        let hadActiveWarmup = cancelPlaylistWarmupWork(
+            preserving: candidateVideoIDs,
+            cancelObsoleteResolution: true
+        )
+
+        let obsoleteVideoIDs = playlistSpeculativeStreamIDs
+            .subtracting(candidateVideoIDs)
+
+        for videoID in obsoleteVideoIDs {
+            if nonSpeculativeStreamIDs.contains(videoID) || isNeededByActivePlayback(videoID) {
+                markStreamAsNonSpeculative(videoID)
+                continue
+            }
+
+            removeCachedStream(for: videoID)
+            playlistLog("evicted speculative track=\(videoID)")
+        }
+
+        playlistSpeculativeStreamIDs.formIntersection(candidateVideoIDs)
+
+        if hadActiveWarmup {
+            playlistLog("cancelled")
+        }
+    }
+
+    @discardableResult
+    private func cancelPlaylistWarmupWork(
+        preserving preservedVideoIDs: Set<String> = [],
+        cancelObsoleteResolution: Bool = false
+    ) -> Bool {
+        let hadActiveWarmup = activePlaylistWarmupID != nil
+        activePlaylistWarmupID = nil
+        playlistWarmupTask?.cancel()
+        playlistWarmupTask = nil
+
+        if cancelObsoleteResolution {
+            if
+                let videoID = activePlaylistResolutionVideoID,
+                !preservedVideoIDs.contains(videoID),
+                !nonSpeculativeStreamIDs.contains(videoID),
+                !isNeededByActivePlayback(videoID)
+            {
+                inFlightResolutions[videoID]?.task.cancel()
+            }
+
+            activePlaylistResolutionVideoID = nil
+        }
+
+        return hadActiveWarmup
+    }
+
+    private func releaseDashboardWarmup(
+        forPlaylistCandidates candidateVideoIDs: Set<String>
+    ) {
+        _ = cancelDashboardWarmupWork(
+            preserving: candidateVideoIDs,
+            cancelObsoleteResolution: true
+        )
+
+        let retainedVideoIDs = dashboardSpeculativeStreamIDs
+            .intersection(candidateVideoIDs)
+        let obsoleteVideoIDs = dashboardSpeculativeStreamIDs
+            .subtracting(candidateVideoIDs)
+
+        for videoID in obsoleteVideoIDs {
+            if nonSpeculativeStreamIDs.contains(videoID) || isNeededByActivePlayback(videoID) {
+                markStreamAsNonSpeculative(videoID)
+            } else {
+                removeCachedStream(for: videoID)
+                dashboardLog("evicted speculative track=\(videoID)")
+            }
+        }
+
+        dashboardSpeculativeStreamIDs.subtract(candidateVideoIDs)
+        playlistSpeculativeStreamIDs.formUnion(retainedVideoIDs)
+    }
+
+    private func releasePlaylistWarmup(
+        forDashboardCandidates candidateVideoIDs: Set<String>
+    ) {
+        _ = cancelPlaylistWarmupWork(
+            preserving: candidateVideoIDs,
+            cancelObsoleteResolution: true
+        )
+
+        let retainedVideoIDs = playlistSpeculativeStreamIDs
+            .intersection(candidateVideoIDs)
+        let obsoleteVideoIDs = playlistSpeculativeStreamIDs
+            .subtracting(candidateVideoIDs)
+
+        for videoID in obsoleteVideoIDs {
+            if nonSpeculativeStreamIDs.contains(videoID) || isNeededByActivePlayback(videoID) {
+                markStreamAsNonSpeculative(videoID)
+            } else {
+                removeCachedStream(for: videoID)
+                playlistLog("evicted speculative track=\(videoID)")
+            }
+        }
+
+        playlistSpeculativeStreamIDs.subtract(candidateVideoIDs)
+        dashboardSpeculativeStreamIDs.formUnion(retainedVideoIDs)
+    }
+
+    private func pauseSpeculativeWarmupsForPlayback(requestedVideoID: String) {
+        markStreamAsNonSpeculative(requestedVideoID)
+
+        let hadActiveWarmup = activeDashboardWarmupID != nil
+        activeDashboardWarmupID = nil
+        dashboardWarmupTask?.cancel()
+        dashboardWarmupTask = nil
+
+        if
+            let activeVideoID = activeDashboardResolutionVideoID,
+            activeVideoID != requestedVideoID,
+            !nonSpeculativeStreamIDs.contains(activeVideoID),
+            !isNeededByActivePlayback(activeVideoID)
+        {
+            inFlightResolutions[activeVideoID]?.task.cancel()
+        }
+        activeDashboardResolutionVideoID = nil
+
+        let hadActivePlaylistWarmup = activePlaylistWarmupID != nil
+        activePlaylistWarmupID = nil
+        playlistWarmupTask?.cancel()
+        playlistWarmupTask = nil
+
+        if
+            let activeVideoID = activePlaylistResolutionVideoID,
+            activeVideoID != requestedVideoID,
+            !nonSpeculativeStreamIDs.contains(activeVideoID),
+            !isNeededByActivePlayback(activeVideoID)
+        {
+            inFlightResolutions[activeVideoID]?.task.cancel()
+        }
+        activePlaylistResolutionVideoID = nil
+
+        if hadActiveWarmup {
+            dashboardLog("cancelled for foreground playback")
+        }
+
+        if hadActivePlaylistWarmup {
+            playlistLog("cancelled for foreground playback")
+        }
+    }
+
+    private func isNeededByActivePlayback(_ videoID: String) -> Bool {
+        if normalizedVideoID(currentPlayableTrack?.youtubeVideoID ?? "") == videoID {
+            return true
+        }
+
+        if preparedNextPlayback?.videoID == videoID || preparedNextVideoID == videoID {
+            return true
+        }
+
+        guard let currentIndex, queue.indices.contains(currentIndex) else {
+            return false
+        }
+
+        let finalIndex = min(currentIndex + streamLookaheadCount, queue.count - 1)
+        return queue[currentIndex...finalIndex].contains {
+            normalizedVideoID($0.youtubeVideoID) == videoID
+        }
+    }
+
+    private func markStreamAsNonSpeculative(_ videoID: String) {
+        guard !videoID.isEmpty else {
+            return
+        }
+
+        nonSpeculativeStreamIDs.insert(videoID)
+        dashboardSpeculativeStreamIDs.remove(videoID)
+        playlistSpeculativeStreamIDs.remove(videoID)
+    }
+
+    private func removeCachedStream(for videoID: String) {
+        resolvedStreamCache.removeValue(forKey: videoID)
+        resolvedStreamDiagnostics.removeValue(forKey: videoID)
+        dashboardSpeculativeStreamIDs.remove(videoID)
+        playlistSpeculativeStreamIDs.remove(videoID)
+        nonSpeculativeStreamIDs.remove(videoID)
+    }
+
+    private func normalizedVideoID(_ videoID: String) -> String {
+        videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func resolutionTask(
         for videoID: String,
         source: StreamResolutionSource
     ) -> Task<URL, Error> {
-        if let existingTask = inFlightResolutions[videoID] {
-            return existingTask
+        switch source {
+        case .dashboardWarmup:
+            if !nonSpeculativeStreamIDs.contains(videoID) {
+                dashboardSpeculativeStreamIDs.insert(videoID)
+            }
+        case .playlistWarmup:
+            if !nonSpeculativeStreamIDs.contains(videoID) {
+                playlistSpeculativeStreamIDs.insert(videoID)
+            }
+        case .foreground, .preResolution, .lookahead, .memoryCache:
+            markStreamAsNonSpeculative(videoID)
         }
 
+        if let existingResolution = inFlightResolutions[videoID] {
+            return existingResolution.task
+        }
+
+        let resolutionID = UUID()
         let task = Task { @MainActor [weak self] () throws -> URL in
             guard let self else {
                 throw CancellationError()
             }
 
             defer {
-                inFlightResolutions[videoID] = nil
+                if inFlightResolutions[videoID]?.id == resolutionID {
+                    inFlightResolutions[videoID] = nil
+                }
             }
 
             let streams = try await YouTube(
@@ -552,7 +1055,10 @@ final class PlaybackManager: ObservableObject {
             return stream.url
         }
 
-        inFlightResolutions[videoID] = task
+        inFlightResolutions[videoID] = InFlightResolution(
+            id: resolutionID,
+            task: task
+        )
         return task
     }
 
@@ -583,6 +1089,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         if let cachedURL = resolvedStreamCache[videoID] {
+            markStreamAsNonSpeculative(videoID)
             log("Pre-resolution cache already available for \(videoID) (\(nextTrack.title))")
             beginPreparingNextItem(
                 with: cachedURL,
@@ -786,6 +1293,7 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 if resolvedStreamCache[videoID] != nil {
+                    markStreamAsNonSpeculative(videoID)
                     log("Lookahead cache hit for \(videoID) at +\(offset)")
                     continue
                 }
@@ -975,8 +1483,7 @@ final class PlaybackManager: ObservableObject {
         logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
 
         if resolvedStreamCache[videoID] == preparedNextPlayback.streamURL {
-            resolvedStreamCache.removeValue(forKey: videoID)
-            resolvedStreamDiagnostics.removeValue(forKey: videoID)
+            removeCachedStream(for: videoID)
             log("Next-item preparation failed for \(videoID); cached URL evicted")
         } else {
             log("Next-item preparation failed for \(videoID); stale item discarded")
@@ -1231,8 +1738,7 @@ final class PlaybackManager: ObservableObject {
         logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
 
         let failedDuringPreparation = startupMetrics?.totalStartTime == nil
-        resolvedStreamCache.removeValue(forKey: videoID)
-        resolvedStreamDiagnostics.removeValue(forKey: videoID)
+        removeCachedStream(for: videoID)
         cancelUpcomingPreResolutionObservation()
         clearPlayer()
 
@@ -1789,6 +2295,18 @@ final class PlaybackManager: ObservableObject {
 
     private func log(_ message: String) {
         print("[Playback] \(message)")
+    }
+
+    private func dashboardLog(_ message: String) {
+#if DEBUG
+        print("[DashboardWarmup] \(message)")
+#endif
+    }
+
+    private func playlistLog(_ message: String) {
+#if DEBUG
+        print("[PlaylistWarmup] \(message)")
+#endif
     }
 
     private static func errorMessage(for error: Error) -> String {

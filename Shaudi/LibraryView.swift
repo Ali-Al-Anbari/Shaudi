@@ -10,6 +10,8 @@ import UIKit
 
 struct LibraryView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var playbackManager: PlaybackManager
 
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var tracks: [Track]
@@ -23,12 +25,21 @@ struct LibraryView: View {
     @State private var editingHeroImage: UIImage?
     @State private var isShowingCropEditor = false
     @State private var heroImage: UIImage?
+    @State private var selectedPlaylistPage = 0
+    @State private var dashboardContentWidth: CGFloat = 360
+    @State private var isLibraryVisible = false
     @AppStorage("shaudi.library.heroImage") private var legacyHeroImageData = ""
     @AppStorage("shaudi.library.heroOffsetX") private var legacyHeroOffsetX = 0.0
     @AppStorage("shaudi.library.heroOffsetY") private var legacyHeroOffsetY = 0.0
     @AppStorage("shaudi.library.heroScale") private var legacyHeroScale = 1.0
 
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
+    private let playlistPageSize = 6
+    private let playlistColumnSpacing: CGFloat = 12
+    private let playlistRowSpacing: CGFloat = 12
+    private let playlistArtworkTitleSpacing: CGFloat = 7
+    private let playlistTitleHeight: CGFloat = 20
+    private let playlistPageVerticalPadding: CGFloat = 2
 
     private var dashboardPlaylists: [Playlist] {
         playlists.enumerated().sorted { first, second in
@@ -47,6 +58,49 @@ struct LibraryView: View {
             }
         }
         .map(\.element)
+    }
+
+    private var dashboardPageCount: Int {
+        max(1, (dashboardPlaylists.count + playlistPageSize - 1) / playlistPageSize)
+    }
+
+    private var dashboardPlaylistIDs: [PersistentIdentifier] {
+        dashboardPlaylists.map(\.persistentModelID)
+    }
+
+    private var visibleDashboardWarmupCandidates: [PlaybackManager.DashboardWarmupCandidate] {
+        let startIndex = selectedPlaylistPage * playlistPageSize
+        guard startIndex < dashboardPlaylists.count else {
+            return []
+        }
+
+        let endIndex = min(startIndex + playlistPageSize, dashboardPlaylists.count)
+        return dashboardPlaylists[startIndex..<endIndex].compactMap { playlist in
+            let candidate = playlist.tracksInPlaybackOrder
+                .first { !$0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+            guard let candidate else {
+                return nil
+            }
+
+            return PlaybackManager.DashboardWarmupCandidate(
+                playlistID: playlist.persistentModelID,
+                videoID: candidate.youtubeVideoID
+            )
+        }
+    }
+
+    private var playlistPagerHeight: CGFloat {
+        let totalColumnSpacing = playlistColumnSpacing * 2
+        let artworkWidth = max(0, (dashboardContentWidth - totalColumnSpacing) / 3)
+        let cardHeight = artworkWidth
+            + playlistArtworkTitleSpacing
+            + playlistTitleHeight
+        let gridHeight = cardHeight * 2
+            + playlistRowSpacing
+            + playlistPageVerticalPadding * 2
+        let pageControlHeight: CGFloat = dashboardPageCount > 1 ? 24 : 0
+        return gridHeight + pageControlHeight
     }
 
     var body: some View {
@@ -127,6 +181,33 @@ struct LibraryView: View {
             .scrollIndicators(.hidden)
         .background(ShaudiTheme.dashboardBackground)
         .safeAreaPadding(.bottom, 84)
+        .onAppear {
+            isLibraryVisible = true
+            updateDashboardWarmup()
+        }
+        .onDisappear {
+            isLibraryVisible = false
+            playbackManager.cancelDashboardWarmup()
+        }
+        .onChange(of: selectedPlaylistPage) {
+            updateDashboardWarmup()
+        }
+        .onChange(of: dashboardPlaylistIDs) {
+            let lastPage = max(0, dashboardPageCount - 1)
+            let validPage = min(selectedPlaylistPage, lastPage)
+            if validPage == selectedPlaylistPage {
+                updateDashboardWarmup()
+            } else {
+                selectedPlaylistPage = validPage
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                updateDashboardWarmup()
+            } else if isLibraryVisible {
+                playbackManager.cancelDashboardWarmup()
+            }
+        }
     }
 
     private var heroBanner: some View {
@@ -163,18 +244,21 @@ struct LibraryView: View {
     }
 
     private var playlistPager: some View {
-        let pageCount = max(1, (dashboardPlaylists.count + 5) / 6)
-        return TabView {
-            ForEach(0..<pageCount, id: \.self) { page in
+        TabView(selection: $selectedPlaylistPage) {
+            ForEach(0..<dashboardPageCount, id: \.self) { page in
                 LazyVGrid(
                     columns: Array(
-                        repeating: GridItem(.flexible(), spacing: 12, alignment: .top),
+                        repeating: GridItem(
+                            .flexible(),
+                            spacing: playlistColumnSpacing,
+                            alignment: .top
+                        ),
                         count: 3
                     ),
-                    spacing: 12
+                    spacing: playlistRowSpacing
                 ) {
-                    ForEach(0..<6, id: \.self) { slot in
-                        let playlistIndex = page * 6 + slot
+                    ForEach(0..<playlistPageSize, id: \.self) { slot in
+                        let playlistIndex = page * playlistPageSize + slot
                         if playlistIndex < dashboardPlaylists.count {
                             let playlist = dashboardPlaylists[playlistIndex]
                             NavigationLink {
@@ -188,11 +272,25 @@ struct LibraryView: View {
                         }
                     }
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, playlistPageVerticalPadding)
+                .tag(page)
             }
         }
-        .frame(height: 270)
-        .tabViewStyle(.page(indexDisplayMode: pageCount > 1 ? .automatic : .never))
+        .frame(height: playlistPagerHeight)
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear {
+                        dashboardContentWidth = geometry.size.width
+                    }
+                    .onChange(of: geometry.size.width) { _, width in
+                        dashboardContentWidth = width
+                    }
+            }
+        }
+        .tabViewStyle(
+            .page(indexDisplayMode: dashboardPageCount > 1 ? .automatic : .never)
+        )
     }
 
     private var collection: some View {
@@ -237,7 +335,7 @@ struct LibraryView: View {
     }
 
     private func playlistCard(_ playlist: Playlist) -> some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: playlistArtworkTitleSpacing) {
             playlistArtwork(playlist)
                 .aspectRatio(1, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -247,7 +345,12 @@ struct LibraryView: View {
                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: playlistTitleHeight,
+                    maxHeight: playlistTitleHeight,
+                    alignment: .topLeading
+                )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
@@ -267,8 +370,7 @@ struct LibraryView: View {
                         .scaledToFill()
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
-                } else if let thumbnailURL = playlist.tracks
-                    .sorted(by: { $0.dateAdded > $1.dateAdded })
+                } else if let thumbnailURL = playlist.tracksInPlaybackOrder
                     .first?.thumbnailURL
                 {
                     AsyncImage(url: thumbnailURL) { phase in
@@ -295,6 +397,17 @@ struct LibraryView: View {
         Image(systemName: "rectangle.stack.fill")
             .font(.title2)
             .foregroundStyle(ShaudiTheme.accent)
+    }
+
+    private func updateDashboardWarmup() {
+        guard isLibraryVisible, scenePhase == .active else {
+            return
+        }
+
+        playbackManager.warmDashboardPage(
+            visibleDashboardWarmupCandidates,
+            page: selectedPlaylistPage
+        )
     }
 
     private func loveCard(at index: Int) -> some View {

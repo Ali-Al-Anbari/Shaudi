@@ -65,3 +65,19 @@ final class Playlist {
         self.tracks = tracks
     }
 }
+
+extension Playlist {
+    var tracksInPlaybackOrder: [Track] {
+        tracks.sorted { first, second in
+            if first.dateAdded != second.dateAdded {
+                return first.dateAdded > second.dateAdded
+            }
+
+            if first.youtubeVideoID != second.youtubeVideoID {
+                return first.youtubeVideoID < second.youtubeVideoID
+            }
+
+            return first.title.localizedStandardCompare(second.title) == .orderedAscending
+        }
+    }
+}
