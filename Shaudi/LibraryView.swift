@@ -25,7 +25,6 @@ struct LibraryView: View {
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
-    @State private var isShowingNewTrack = false
     @State private var isShowingPhotoPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingHeroImage: UIImage?
@@ -134,13 +133,6 @@ struct LibraryView: View {
             dashboard
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                Button {
-                    isShowingNewTrack = true
-                } label: {
-                    Label("New Track", systemImage: "plus")
-                }
-            }
             .photosPicker(isPresented: $isShowingPhotoPicker, selection: $selectedPhoto, matching: .images)
             .onChange(of: selectedPhoto) { _, photo in
                 prepareSelectedBannerPhoto(photo)
@@ -161,34 +153,6 @@ struct LibraryView: View {
             .onAppear {
                 loadBannerImage()
             }
-            .sheet(isPresented: $isShowingNewTrack) {
-                TrackEditorView(
-                    title: "New Track",
-                    actionTitle: "Create"
-                ) { request in
-                    guard !tracks.contains(where: { $0.youtubeVideoID == request.youtubeVideo.id }) else {
-                        return "This YouTube video is already in Library."
-                    }
-
-                    guard let metadata = request.metadata else {
-                        return "Fetch the YouTube metadata before creating this track."
-                    }
-
-                    modelContext.insert(
-                        Track(
-                            title: metadata.title,
-                            youtubeURL: request.youtubeVideo.url,
-                            youtubeVideoID: request.youtubeVideo.id,
-                            channelTitle: metadata.channelTitle,
-                            thumbnailURL: metadata.thumbnailURL,
-                            duration: metadata.duration,
-                            metadataLastRefreshed: .now
-                        )
-                    )
-
-                    return nil
-                }
-            }
         }
     }
 
@@ -206,7 +170,6 @@ struct LibraryView: View {
         }
             .scrollIndicators(.hidden)
         .background(ShaudiTheme.dashboardBackground)
-        .safeAreaPadding(.bottom, 84)
         .onAppear {
             isLibraryVisible = true
             updateDashboardWarmup()
@@ -559,6 +522,42 @@ struct LibraryView: View {
             Spacer(minLength: 4)
         }
         .padding(.vertical, 5)
+    }
+}
+
+struct ManualTrackAdditionView: View {
+    @Environment(\.modelContext) private var modelContext
+
+    @Query(sort: \Track.dateAdded, order: .reverse)
+    private var tracks: [Track]
+
+    var body: some View {
+        TrackEditorView(
+            title: "New Track",
+            actionTitle: "Create"
+        ) { request in
+            guard !tracks.contains(where: { $0.youtubeVideoID == request.youtubeVideo.id }) else {
+                return "This YouTube video is already in Library."
+            }
+
+            guard let metadata = request.metadata else {
+                return "Fetch the YouTube metadata before creating this track."
+            }
+
+            modelContext.insert(
+                Track(
+                    title: metadata.title,
+                    youtubeURL: request.youtubeVideo.url,
+                    youtubeVideoID: request.youtubeVideo.id,
+                    channelTitle: metadata.channelTitle,
+                    thumbnailURL: metadata.thumbnailURL,
+                    duration: metadata.duration,
+                    metadataLastRefreshed: .now
+                )
+            )
+
+            return nil
+        }
     }
 }
 

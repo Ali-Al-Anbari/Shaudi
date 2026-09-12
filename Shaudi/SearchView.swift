@@ -265,6 +265,7 @@ struct SearchView: View {
     @State private var playRequestID: UUID?
     @State private var noticeMessage: String?
     @State private var errorMessage: String?
+    @State private var isShowingManualTrackAdd = false
 
     var body: some View {
         NavigationStack {
@@ -277,6 +278,18 @@ struct SearchView: View {
                         .accessibilityAddTraits(.isHeader)
 
                     searchField
+
+                    Button {
+                        isShowingManualTrackAdd = true
+                    } label: {
+                        Label("Add by URL", systemImage: "link")
+                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .subheadline))
+                            .foregroundStyle(ShaudiTheme.accent)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(ShaudiTheme.accent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     if let noticeMessage {
                         Label(noticeMessage, systemImage: "checkmark.circle.fill")
@@ -296,6 +309,9 @@ struct SearchView: View {
             .navigationBarTitleDisplayMode(.inline)
         }
         .tint(ShaudiTheme.accent)
+        .sheet(isPresented: $isShowingManualTrackAdd) {
+            ManualTrackAdditionView()
+        }
         .onChange(of: viewModel.query) {
             noticeMessage = nil
             viewModel.queryDidChange()

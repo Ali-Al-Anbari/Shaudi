@@ -191,6 +191,10 @@ struct PlaylistDetailView: View {
         return false
     }
 
+    private var trackCountDescription: String {
+        "\(tracks.count) \(tracks.count == 1 ? "track" : "tracks")"
+    }
+
     private var isActivePlaylist: Bool {
         playbackManager.hasActivePlaylistQueue(
             for: playlist.persistentModelID
@@ -239,6 +243,7 @@ struct PlaylistDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            playlistHeader
             playbackModeControls
 
             Group {
@@ -262,28 +267,32 @@ struct PlaylistDetailView: View {
                                 )
                             } label: {
                                 HStack(spacing: 13) {
-                                    Image(systemName: "music.note")
-                                        .foregroundStyle(ShaudiTheme.lavender)
-                                        .frame(width: 28, height: 28)
-                                        .background(ShaudiTheme.lavender.opacity(0.14), in: Circle())
+                                    trackArtwork(track)
 
                                     Text(track.title)
                                         .font(
                                             isCurrentlyPlaying
-                                                ? .headline.weight(.semibold)
-                                                : .headline
+                                                ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
+                                                : ShaudiTheme.bodyFont(size: 17, relativeTo: .headline)
                                         )
                                         .foregroundStyle(.primary)
                                         .lineLimit(2)
                                 }
-                                .padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 9)
+                                .contentShape(Rectangle())
                             }
                             .listRowBackground(
                                 isCurrentlyPlaying
                                     ? ShaudiTheme.accent.opacity(0.14)
                                     : ShaudiTheme.card
                             )
-                            .listRowSeparator(.hidden)
+                            .listRowInsets(
+                                EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
+                            )
+                            .listRowSeparator(.visible)
+                            .listRowSeparatorTint(ShaudiTheme.accent.opacity(0.14))
                         }
                         .onDelete(perform: removeTracks)
                     }
@@ -315,15 +324,6 @@ struct PlaylistDetailView: View {
                 updatePlaylistWarmup()
             } else if isPlaylistVisible {
                 playbackManager.cancelPlaylistWarmup()
-            }
-        }
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Text(playlist.name)
-                    .font(ShaudiTheme.scriptFont(size: 25, relativeTo: .title2))
-                    .foregroundStyle(ShaudiTheme.accent)
-                    .lineLimit(1)
-                    .accessibilityAddTraits(.isHeader)
             }
         }
         .toolbar {
@@ -382,6 +382,32 @@ struct PlaylistDetailView: View {
                 }
             }
         }
+    }
+
+    private var playlistHeader: some View {
+        VStack(spacing: 10) {
+            PlaylistArtworkView(playlist: playlist)
+                .frame(width: 150, height: 150)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 10, y: 5)
+
+            VStack(spacing: 3) {
+                Text(playlist.name)
+                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
+                    .foregroundStyle(ShaudiTheme.accent)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+
+                Text(trackCountDescription)
+                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
     }
 
     private var playbackModeControls: some View {
@@ -461,6 +487,34 @@ struct PlaylistDetailView: View {
             let track = tracks[index]
             playlist.tracks.removeAll { $0 === track }
         }
+    }
+
+    private func trackArtwork(_ track: Track) -> some View {
+        Group {
+            if let thumbnailURL = track.thumbnailURL {
+                AsyncImage(url: thumbnailURL) { phase in
+                    if case .success(let image) = phase {
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        trackArtworkPlaceholder
+                    }
+                }
+            } else {
+                trackArtworkPlaceholder
+            }
+        }
+        .frame(width: 44, height: 44)
+        .background(ShaudiTheme.lavender.opacity(0.14))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var trackArtworkPlaceholder: some View {
+        Image(systemName: "music.note")
+            .font(.headline)
+            .foregroundStyle(ShaudiTheme.lavender)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func playPlaylist() {
