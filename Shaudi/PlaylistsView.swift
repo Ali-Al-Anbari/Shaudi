@@ -219,6 +219,9 @@ struct PlaylistDetailView: View {
                 } else {
                     List {
                         ForEach(tracks) { track in
+                            let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
+                                || playbackManager.isCurrentPlayable(track.youtubeVideoID)
+
                             NavigationLink {
                                 TrackDetailView(
                                     track: track,
@@ -233,13 +236,21 @@ struct PlaylistDetailView: View {
                                         .background(ShaudiTheme.lavender.opacity(0.14), in: Circle())
 
                                     Text(track.title)
-                                        .font(.headline)
+                                        .font(
+                                            isCurrentlyPlaying
+                                                ? .headline.weight(.semibold)
+                                                : .headline
+                                        )
                                         .foregroundStyle(.primary)
                                         .lineLimit(2)
                                 }
                                 .padding(.vertical, 5)
                             }
-                            .listRowBackground(ShaudiTheme.card)
+                            .listRowBackground(
+                                isCurrentlyPlaying
+                                    ? ShaudiTheme.accent.opacity(0.14)
+                                    : ShaudiTheme.card
+                            )
                             .listRowSeparator(.hidden)
                         }
                         .onDelete(perform: removeTracks)
@@ -368,9 +379,10 @@ struct PlaylistDetailView: View {
             }
 
             playbackModeButton(
-                title: "Repeat Playlist",
-                systemImage: "repeat",
-                isActive: playbackManager.repeatMode == .playlist
+                title: "Repeat",
+                systemImage: playbackManager.repeatMode == .one ? "repeat.1" : "repeat",
+                isActive: playbackManager.repeatMode != .off,
+                stateDescription: repeatModeDescription
             ) {
                 playbackManager.toggleRepeatMode()
             }
@@ -383,6 +395,7 @@ struct PlaylistDetailView: View {
         title: String,
         systemImage: String,
         isActive: Bool,
+        stateDescription: String? = nil,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -397,7 +410,18 @@ struct PlaylistDetailView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
-        .accessibilityValue(isActive ? "On" : "Off")
+        .accessibilityValue(stateDescription ?? (isActive ? "On" : "Off"))
+    }
+
+    private var repeatModeDescription: String {
+        switch playbackManager.repeatMode {
+        case .off:
+            return "Off"
+        case .playlist:
+            return "Playlist"
+        case .one:
+            return "One song"
+        }
     }
 
     private func removeTracks(at offsets: IndexSet) {
@@ -408,14 +432,19 @@ struct PlaylistDetailView: View {
     }
 
     private func playPlaylist() {
-        guard let firstPlayableTrack else {
+        let targetPlaylistID = playlist.persistentModelID
+        let orderedTracks = playlist.tracksInPlaybackOrder
+        guard let firstPlayableTrack = orderedTracks.first(where: {
+            !$0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        }) else {
             return
         }
 
         playbackManager.play(
             firstPlayableTrack,
-            in: tracks,
-            origin: .playlist(playlist.persistentModelID)
+            in: orderedTracks,
+            origin: .playlist(targetPlaylistID)
         )
     }
 

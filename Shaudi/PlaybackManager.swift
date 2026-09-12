@@ -79,6 +79,7 @@ final class PlaybackManager: ObservableObject {
     enum RepeatMode: String {
         case off
         case playlist
+        case one
     }
 
     private enum QueueTrackIdentity: Hashable {
@@ -549,7 +550,14 @@ final class PlaybackManager: ObservableObject {
     }
 
     func toggleRepeatMode() {
-        repeatMode = repeatMode == .off ? .playlist : .off
+        switch repeatMode {
+        case .off:
+            repeatMode = .playlist
+        case .playlist:
+            repeatMode = .one
+        case .one:
+            repeatMode = .off
+        }
         queueLog("repeatMode=\(repeatMode.rawValue)")
 
         guard case .playlist = playbackOrigin else {
@@ -732,6 +740,10 @@ final class PlaybackManager: ObservableObject {
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
+
+        guard repeatMode != .one else {
+            return
+        }
 
         switch state {
         case .playing, .paused, .loading:
@@ -1356,6 +1368,10 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func beginPreResolvingNextTrack() {
+        guard repeatMode != .one else {
+            return
+        }
+
         guard
             let currentIndex,
             let nextIndex = nextQueueIndex(after: currentIndex)
@@ -1528,6 +1544,10 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func beginLookaheadFill(from anchorIndex: Int) {
+        guard repeatMode != .one else {
+            return
+        }
+
         guard
             currentIndex == anchorIndex,
             queue.indices.contains(anchorIndex)
@@ -2347,6 +2367,12 @@ final class PlaybackManager: ObservableObject {
 
     private func handlePlaybackCompletion(for item: AVPlayerItem, requestID: UUID) {
         guard isActive(requestID), player?.currentItem === item else {
+            return
+        }
+
+        if repeatMode == .one {
+            queueLog("repeating current track")
+            restartCurrentPlayback()
             return
         }
 

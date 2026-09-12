@@ -9,6 +9,12 @@ import SwiftUI
 import UIKit
 
 struct LibraryView: View {
+    private struct PlaylistPageSlot: Identifiable {
+        let id: String
+        let playlist: Playlist?
+        let fillerIndex: Int
+    }
+
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var playbackManager: PlaybackManager
@@ -101,6 +107,26 @@ struct LibraryView: View {
             + playlistPageVerticalPadding * 2
         let pageControlHeight: CGFloat = dashboardPageCount > 1 ? 24 : 0
         return gridHeight + pageControlHeight
+    }
+
+    private func playlistPageSlots(for page: Int) -> [PlaylistPageSlot] {
+        (0..<playlistPageSize).map { slot in
+            let playlistIndex = page * playlistPageSize + slot
+            guard playlistIndex < dashboardPlaylists.count else {
+                return PlaylistPageSlot(
+                    id: "filler-\(playlistIndex)",
+                    playlist: nil,
+                    fillerIndex: playlistIndex
+                )
+            }
+
+            let playlist = dashboardPlaylists[playlistIndex]
+            return PlaylistPageSlot(
+                id: "playlist-\(String(describing: playlist.persistentModelID))",
+                playlist: playlist,
+                fillerIndex: playlistIndex
+            )
+        }
     }
 
     var body: some View {
@@ -257,10 +283,8 @@ struct LibraryView: View {
                     ),
                     spacing: playlistRowSpacing
                 ) {
-                    ForEach(0..<playlistPageSize, id: \.self) { slot in
-                        let playlistIndex = page * playlistPageSize + slot
-                        if playlistIndex < dashboardPlaylists.count {
-                            let playlist = dashboardPlaylists[playlistIndex]
+                    ForEach(playlistPageSlots(for: page)) { slot in
+                        if let playlist = slot.playlist {
                             NavigationLink {
                                 PlaylistDetailView(playlist: playlist)
                             } label: {
@@ -268,7 +292,7 @@ struct LibraryView: View {
                             }
                             .buttonStyle(.plain)
                         } else {
-                            loveCard(at: playlistIndex)
+                            loveCard(at: slot.fillerIndex)
                         }
                     }
                 }
