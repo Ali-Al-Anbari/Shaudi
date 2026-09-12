@@ -3,8 +3,10 @@
 //  Shaudi
 //
 
+import PhotosUI
 import SwiftData
 import SwiftUI
+import UIKit
 
 struct PlaylistsView: View {
     @Environment(\.modelContext) private var modelContext
@@ -77,7 +79,11 @@ struct PlaylistsView: View {
 
     private func deletePlaylists(at offsets: IndexSet) {
         for index in offsets {
-            modelContext.delete(playlists[index])
+            let playlist = playlists[index]
+            if let artworkID = playlist.artworkID {
+                ArtworkStorage.deletePlaylistImage(for: artworkID)
+            }
+            modelContext.delete(playlist)
         }
     }
 }
@@ -137,10 +143,16 @@ private struct PlaylistNameEditor: View {
 }
 
 struct PlaylistDetailView: View {
+    @Environment(\.modelContext) private var modelContext
+
     let playlist: Playlist
 
     @State private var isShowingRename = false
     @State private var isShowingAddTracks = false
+    @State private var isShowingPhotoPicker = false
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var editingArtworkImage: UIImage?
+    @State private var isShowingArtworkCropper = false
 
     private var tracks: [Track] {
         playlist.tracks.sorted { $0.dateAdded > $1.dateAdded }
@@ -211,9 +223,23 @@ struct PlaylistDetailView: View {
                 } label: {
                     Label("Rename", systemImage: "pencil")
                 }
+
+                Button {
+                    isShowingPhotoPicker = true
+                } label: {
+                    Label("Change Playlist Photo", systemImage: "photo")
+                }
             } label: {
                 Label("Playlist Actions", systemImage: "ellipsis.circle")
             }
+        }
+        .photosPicker(
+            isPresented: $isShowingPhotoPicker,
+            selection: $selectedPhoto,
+            matching: .images
+        )
+        .onChange(of: selectedPhoto) { _, photo in
+            prepareSelectedArtwork(photo)
         }
         .sheet(isPresented: $isShowingRename) {
             PlaylistNameEditor(
@@ -227,12 +253,70 @@ struct PlaylistDetailView: View {
         .sheet(isPresented: $isShowingAddTracks) {
             AddTracksView(playlist: playlist)
         }
+        .sheet(isPresented: $isShowingArtworkCropper) {
+            if let editingArtworkImage {
+                ImageCropEditor(
+                    image: editingArtworkImage,
+                    title: "Adjust Playlist Photo",
+                    cropAspectRatio: 1,
+                    outputSize: ArtworkStorage.playlistOutputSize,
+                    cornerRadius: 18
+                ) { croppedImage in
+                    savePlaylistArtwork(croppedImage)
+                }
+            }
+        }
     }
 
     private func removeTracks(at offsets: IndexSet) {
         for index in offsets {
             let track = tracks[index]
             playlist.tracks.removeAll { $0 === track }
+        }
+    }
+
+    private func prepareSelectedArtwork(_ selectedPhoto: PhotosPickerItem?) {
+        guard let selectedPhoto else {
+            return
+        }
+
+        Task { @MainActor in
+            defer { self.selectedPhoto = nil }
+            guard
+                let data = try? await selectedPhoto.loadTransferable(type: Data.self),
+                let image = UIImage(data: data)
+            else {
+                return
+            }
+
+            editingArtworkImage = image
+            isShowingArtworkCropper = true
+        }
+    }
+
+    private func savePlaylistArtwork(_ image: UIImage) {
+        let previousArtworkID = playlist.artworkID
+        let newArtworkID = UUID()
+
+        do {
+            try ArtworkStorage.savePlaylistImage(image, for: newArtworkID)
+            playlist.artworkID = newArtworkID
+
+            do {
+                try modelContext.save()
+            } catch {
+                playlist.artworkID = previousArtworkID
+                ArtworkStorage.deletePlaylistImage(for: newArtworkID)
+                throw error
+            }
+
+            if let previousArtworkID {
+                ArtworkStorage.deletePlaylistImage(for: previousArtworkID)
+            }
+        } catch {
+#if DEBUG
+            print("[Artwork] Playlist save failed: \(error.localizedDescription)")
+#endif
         }
     }
 }

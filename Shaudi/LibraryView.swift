@@ -22,10 +22,11 @@ struct LibraryView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingHeroImage: UIImage?
     @State private var isShowingCropEditor = false
-    @AppStorage("shaudi.library.heroImage") private var heroImageData = ""
-    @AppStorage("shaudi.library.heroOffsetX") private var heroOffsetX = 0.0
-    @AppStorage("shaudi.library.heroOffsetY") private var heroOffsetY = 0.0
-    @AppStorage("shaudi.library.heroScale") private var heroScale = 1.0
+    @State private var heroImage: UIImage?
+    @AppStorage("shaudi.library.heroImage") private var legacyHeroImageData = ""
+    @AppStorage("shaudi.library.heroOffsetX") private var legacyHeroOffsetX = 0.0
+    @AppStorage("shaudi.library.heroOffsetY") private var legacyHeroOffsetY = 0.0
+    @AppStorage("shaudi.library.heroScale") private var legacyHeroScale = 1.0
 
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
 
@@ -61,22 +62,24 @@ struct LibraryView: View {
                 }
             }
             .photosPicker(isPresented: $isShowingPhotoPicker, selection: $selectedPhoto, matching: .images)
-            .onChange(of: selectedPhoto) {
-                saveSelectedPhoto()
+            .onChange(of: selectedPhoto) { _, photo in
+                prepareSelectedBannerPhoto(photo)
             }
             .sheet(isPresented: $isShowingCropEditor) {
                 if let editingHeroImage {
-                    BannerCropEditor(
+                    ImageCropEditor(
                         image: editingHeroImage,
-                        initialOffset: .zero,
-                        initialScale: 1
-                    ) { offset, scale in
-                        heroImageData = editingHeroImage.jpegData(compressionQuality: 0.82)?.base64EncodedString() ?? heroImageData
-                        heroOffsetX = offset.width
-                        heroOffsetY = offset.height
-                        heroScale = scale
+                        title: "Adjust Banner",
+                        cropAspectRatio: ArtworkStorage.bannerAspectRatio,
+                        outputSize: ArtworkStorage.bannerOutputSize,
+                        cornerRadius: 18
+                    ) { croppedImage in
+                        saveBannerImage(croppedImage)
                     }
                 }
+            }
+            .onAppear {
+                loadBannerImage()
             }
             .sheet(isPresented: $isShowingNewTrack) {
                 TrackEditorView(
@@ -131,13 +134,13 @@ struct LibraryView: View {
             isShowingPhotoPicker = true
         } label: {
             GeometryReader { geometry in
-                ZStack(alignment: .topTrailing) {
-                    if let image = storedHeroImage {
-                        Image(uiImage: image)
+                ZStack {
+                    if let heroImage {
+                        Image(uiImage: heroImage)
                             .resizable()
                             .scaledToFill()
-                            .scaleEffect(heroScale)
-                            .offset(x: heroOffsetX * geometry.size.width, y: heroOffsetY * geometry.size.height)
+                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .clipped()
                     } else {
                         LinearGradient(colors: [ShaudiTheme.lavender.opacity(0.8), ShaudiTheme.accent.opacity(0.85)], startPoint: .topLeading, endPoint: .bottomTrailing)
                         Image(systemName: "photo.badge.plus")
@@ -145,12 +148,6 @@ struct LibraryView: View {
                             .foregroundStyle(.white.opacity(0.82))
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-
-                    Image(systemName: "pencil.circle.fill")
-                        .font(.title3)
-                        .symbolRenderingMode(.palette)
-                        .foregroundStyle(.white, ShaudiTheme.accent)
-                        .padding(12)
                 }
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .clipped()
@@ -162,14 +159,20 @@ struct LibraryView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Library poster")
-        .accessibilityHint("Choose or reposition a photo")
+        .accessibilityHint("Choose and crop a photo")
     }
 
     private var playlistPager: some View {
         let pageCount = max(1, (dashboardPlaylists.count + 5) / 6)
         return TabView {
             ForEach(0..<pageCount, id: \.self) { page in
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+                LazyVGrid(
+                    columns: Array(
+                        repeating: GridItem(.flexible(), spacing: 12, alignment: .top),
+                        count: 3
+                    ),
+                    spacing: 12
+                ) {
                     ForEach(0..<6, id: \.self) { slot in
                         let playlistIndex = page * 6 + slot
                         if playlistIndex < dashboardPlaylists.count {
@@ -209,11 +212,16 @@ struct LibraryView: View {
                             )
                         } label: {
                             trackRow(track)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(
+                                    ShaudiTheme.dashboardCard,
+                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                )
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(ShaudiTheme.dashboardCard, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
                     .onDelete(perform: deleteTracks)
                 }
@@ -230,27 +238,63 @@ struct LibraryView: View {
 
     private func playlistCard(_ playlist: Playlist) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous).fill(ShaudiTheme.dashboardCard)
-                if let thumbnailURL = playlist.tracks.sorted(by: { $0.dateAdded > $1.dateAdded }).first?.thumbnailURL {
-                    AsyncImage(url: thumbnailURL) { phase in
-                        if case .success(let image) = phase {
-                            image.resizable().scaledToFill().clipped()
-                        } else {
-                            Image(systemName: "rectangle.stack.fill").font(.title2).foregroundStyle(ShaudiTheme.accent)
-                        }
-                    }
-                } else {
-                    Image(systemName: "rectangle.stack.fill").font(.title2).foregroundStyle(ShaudiTheme.accent)
-                }
-            }
-            .aspectRatio(1, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            playlistArtwork(playlist)
+                .aspectRatio(1, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
             Text(playlist.name)
                 .font(ShaudiTheme.bodyFont(size: 15))
                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                 .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
+    }
+
+    private func playlistArtwork(_ playlist: Playlist) -> some View {
+        GeometryReader { geometry in
+            ZStack {
+                ShaudiTheme.dashboardCard
+
+                if
+                    let artworkID = playlist.artworkID,
+                    let image = ArtworkStorage.playlistImage(for: artworkID)
+                {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                } else if let thumbnailURL = playlist.tracks
+                    .sorted(by: { $0.dateAdded > $1.dateAdded })
+                    .first?.thumbnailURL
+                {
+                    AsyncImage(url: thumbnailURL) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: geometry.size.width, height: geometry.size.height)
+                                .clipped()
+                        } else {
+                            playlistArtworkPlaceholder
+                        }
+                    }
+                } else {
+                    playlistArtworkPlaceholder
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
+        }
+    }
+
+    private var playlistArtworkPlaceholder: some View {
+        Image(systemName: "rectangle.stack.fill")
+            .font(.title2)
+            .foregroundStyle(ShaudiTheme.accent)
     }
 
     private func loveCard(at index: Int) -> some View {
@@ -269,19 +313,75 @@ struct LibraryView: View {
         .background(ShaudiTheme.dashboardPlaceholder, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private var storedHeroImage: UIImage? {
-        guard let data = Data(base64Encoded: heroImageData) else { return nil }
-        return UIImage(data: data)
-    }
+    private func prepareSelectedBannerPhoto(_ selectedPhoto: PhotosPickerItem?) {
+        guard let selectedPhoto else {
+            return
+        }
 
-    private func saveSelectedPhoto() {
-        guard let selectedPhoto else { return }
         Task { @MainActor in
-            guard let data = try? await selectedPhoto.loadTransferable(type: Data.self) else { return }
-            guard let image = UIImage(data: data), let jpegData = image.jpegData(compressionQuality: 0.82) else { return }
-            editingHeroImage = UIImage(data: jpegData)
+            defer { self.selectedPhoto = nil }
+            guard
+                let data = try? await selectedPhoto.loadTransferable(type: Data.self),
+                let image = UIImage(data: data)
+            else {
+                return
+            }
+
+            editingHeroImage = image
             isShowingCropEditor = true
         }
+    }
+
+    private func loadBannerImage() {
+        if let storedImage = ArtworkStorage.bannerImage() {
+            heroImage = storedImage
+            return
+        }
+
+        guard
+            let data = Data(base64Encoded: legacyHeroImageData),
+            let legacyImage = UIImage(data: data)
+        else {
+            return
+        }
+
+        let migratedImage = ArtworkStorage.migratedBannerImage(
+            legacyImage,
+            scale: legacyHeroScale,
+            normalizedOffset: CGSize(
+                width: legacyHeroOffsetX,
+                height: legacyHeroOffsetY
+            )
+        )
+        do {
+            try ArtworkStorage.saveBannerImage(migratedImage)
+            heroImage = migratedImage
+            clearLegacyBannerStorage()
+        } catch {
+#if DEBUG
+            print("[Artwork] Banner migration failed: \(error.localizedDescription)")
+#endif
+            heroImage = legacyImage
+        }
+    }
+
+    private func saveBannerImage(_ image: UIImage) {
+        do {
+            try ArtworkStorage.saveBannerImage(image)
+            heroImage = image
+            clearLegacyBannerStorage()
+        } catch {
+#if DEBUG
+            print("[Artwork] Banner save failed: \(error.localizedDescription)")
+#endif
+        }
+    }
+
+    private func clearLegacyBannerStorage() {
+        legacyHeroImageData = ""
+        legacyHeroOffsetX = 0
+        legacyHeroOffsetY = 0
+        legacyHeroScale = 1
     }
 
     private var libraryList: some View {
@@ -361,104 +461,6 @@ struct LibraryView: View {
             Spacer(minLength: 4)
         }
         .padding(.vertical, 5)
-    }
-}
-
-private struct BannerCropEditor: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let image: UIImage
-    let initialOffset: CGSize
-    let initialScale: CGFloat
-    let onSave: (CGSize, CGFloat) -> Void
-
-    @State private var offset: CGSize = .zero
-    @State private var scale: CGFloat
-    @State private var didSetInitialOffset = false
-    @State private var cropWidth: CGFloat = 1
-    @GestureState private var dragTranslation: CGSize = .zero
-    @GestureState private var magnification: CGFloat = 1
-
-    private let bannerHeight: CGFloat = 148
-
-    init(image: UIImage, initialOffset: CGSize, initialScale: CGFloat, onSave: @escaping (CGSize, CGFloat) -> Void) {
-        self.image = image
-        self.initialOffset = initialOffset
-        self.initialScale = initialScale
-        self.onSave = onSave
-        _scale = State(initialValue: max(1, initialScale))
-    }
-
-    var body: some View {
-        NavigationStack {
-            GeometryReader { geometry in
-                VStack(spacing: 20) {
-                    ZStack {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFill()
-                            .scaleEffect(scale * magnification)
-                            .offset(x: offset.width * geometry.size.width + dragTranslation.width,
-                                    y: offset.height * bannerHeight + dragTranslation.height)
-                    }
-                    .frame(width: geometry.size.width, height: bannerHeight)
-                    .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .contentShape(Rectangle())
-                    .gesture(dragGesture.simultaneously(with: magnificationGesture))
-
-                    Text("Drag and pinch to frame your banner")
-                        .font(ShaudiTheme.bodyFont(size: 16))
-                        .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
-
-                    Spacer()
-                }
-                .padding(.top, 24)
-                .onAppear {
-                    guard !didSetInitialOffset else { return }
-                    cropWidth = geometry.size.width
-                    offset = initialOffset
-                    scale = max(1, initialScale)
-                    didSetInitialOffset = true
-                }
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Cancel") { dismiss() }
-                    }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Save") {
-                            onSave(offset, scale)
-                            dismiss()
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Adjust Banner")
-            .navigationBarTitleDisplayMode(.inline)
-            .background(ShaudiTheme.dashboardBackground)
-        }
-        .presentationDragIndicator(.visible)
-    }
-
-    private var dragGesture: some Gesture {
-        DragGesture()
-            .updating($dragTranslation) { value, state, _ in
-                state = value.translation
-            }
-            .onEnded { value in
-                offset.width += value.translation.width / max(1, cropWidth)
-                offset.height += value.translation.height / bannerHeight
-            }
-    }
-
-    private var magnificationGesture: some Gesture {
-        MagnificationGesture()
-            .updating($magnification) { value, state, _ in
-                state = value
-            }
-            .onEnded { value in
-                scale = min(max(scale * value, 1), 4)
-            }
     }
 }
 
