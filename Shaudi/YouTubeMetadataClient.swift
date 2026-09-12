@@ -12,6 +12,22 @@ struct YouTubeMetadata {
     let duration: TimeInterval?
 }
 
+struct YouTubeSearchResult: Identifiable, Hashable {
+    let youtubeVideoID: String
+    let title: String
+    let channelTitle: String
+    let thumbnailURL: URL?
+
+    var id: String {
+        youtubeVideoID
+    }
+}
+
+struct YouTubeSearchPage {
+    let results: [YouTubeSearchResult]
+    let nextPageToken: String?
+}
+
 struct YouTubeMetadataClient {
     enum ClientError: LocalizedError {
         case missingAPIKey
@@ -48,48 +64,78 @@ struct YouTubeMetadataClient {
         self.session = session
     }
 
-    func metadata(for videoID: String) async throws -> YouTubeMetadata {
-        let apiKey = try apiKey()
+    func search(query: String, pageToken: String? = nil) async throws -> YouTubeSearchPage {
+        var queryItems = [
+            URLQueryItem(name: "part", value: "snippet"),
+            URLQueryItem(name: "q", value: query),
+            URLQueryItem(name: "type", value: "video"),
+            URLQueryItem(name: "maxResults", value: "15"),
+            URLQueryItem(
+                name: "fields",
+                value: "nextPageToken,items(id/videoId,snippet(title,channelTitle,thumbnails(default(url),medium(url),high(url))))"
+            )
+        ]
 
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier, !bundleIdentifier.isEmpty else {
-            throw ClientError.missingBundleIdentifier
+        if let pageToken, !pageToken.isEmpty {
+            queryItems.append(URLQueryItem(name: "pageToken", value: pageToken))
         }
 
-        var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/videos")
-        components?.queryItems = [
+        let data = try await request(endpoint: "search", queryItems: queryItems)
+        let decodedResponse: SearchResponse
+
+        do {
+            decodedResponse = try JSONDecoder().decode(SearchResponse.self, from: data)
+        } catch {
+            throw ClientError.malformedResponse
+        }
+
+        var seenVideoIDs = Set<String>()
+        let results = decodedResponse.items.compactMap { item -> YouTubeSearchResult? in
+            let videoID = item.id?.videoId?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ) ?? ""
+            let title = item.snippet?.title?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ) ?? ""
+            let channelTitle = item.snippet?.channelTitle?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ) ?? ""
+
+            guard
+                videoID.range(
+                    of: #"^[A-Za-z0-9_-]{11}$"#,
+                    options: .regularExpression
+                ) != nil,
+                !title.isEmpty,
+                !channelTitle.isEmpty,
+                seenVideoIDs.insert(videoID).inserted
+            else {
+                return nil
+            }
+
+            return YouTubeSearchResult(
+                youtubeVideoID: videoID,
+                title: title,
+                channelTitle: channelTitle,
+                thumbnailURL: item.snippet?.thumbnails?.preferredURL
+            )
+        }
+
+        return YouTubeSearchPage(
+            results: results,
+            nextPageToken: decodedResponse.nextPageToken
+        )
+    }
+
+    func metadata(for videoID: String) async throws -> YouTubeMetadata {
+        let data = try await request(endpoint: "videos", queryItems: [
             URLQueryItem(name: "part", value: "snippet,contentDetails"),
             URLQueryItem(name: "id", value: videoID),
-            URLQueryItem(name: "key", value: apiKey),
             URLQueryItem(
                 name: "fields",
                 value: "items(id,snippet(title,channelTitle,thumbnails(default(url),medium(url),high(url),standard(url),maxres(url))),contentDetails(duration))"
             )
-        ]
-
-        guard let url = components?.url else {
-            throw ClientError.invalidResponse
-        }
-
-        var request = URLRequest(url: url)
-        request.setValue(bundleIdentifier, forHTTPHeaderField: "X-Ios-Bundle-Identifier")
-
-        let data: Data
-        let response: URLResponse
-
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw ClientError.network(error.localizedDescription)
-        }
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw ClientError.invalidResponse
-        }
-
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            let apiMessage = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data).error.message
-            throw ClientError.api(apiMessage ?? "HTTP \(httpResponse.statusCode)")
-        }
+        ])
 
         let decodedResponse: VideosResponse
 
@@ -120,6 +166,48 @@ struct YouTubeMetadataClient {
             thumbnailURL: item.snippet?.thumbnails?.preferredURL,
             duration: item.contentDetails?.duration.flatMap(YouTubeDuration.seconds(from:))
         )
+    }
+
+    private func request(endpoint: String, queryItems: [URLQueryItem]) async throws -> Data {
+        let apiKey = try apiKey()
+
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier, !bundleIdentifier.isEmpty else {
+            throw ClientError.missingBundleIdentifier
+        }
+
+        var components = URLComponents(
+            string: "https://www.googleapis.com/youtube/v3/\(endpoint)"
+        )
+        components?.queryItems = queryItems + [URLQueryItem(name: "key", value: apiKey)]
+
+        guard let url = components?.url else {
+            throw ClientError.invalidResponse
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue(bundleIdentifier, forHTTPHeaderField: "X-Ios-Bundle-Identifier")
+
+        let data: Data
+        let response: URLResponse
+
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ClientError.network(error.localizedDescription)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ClientError.invalidResponse
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let apiMessage = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data).error.message
+            throw ClientError.api(apiMessage ?? "HTTP \(httpResponse.statusCode)")
+        }
+
+        return data
     }
 
     private func apiKey() throws -> String {
@@ -190,6 +278,26 @@ enum YouTubeDuration {
 
 private struct VideosResponse: Decodable {
     let items: [VideoItem]
+}
+
+private struct SearchResponse: Decodable {
+    let nextPageToken: String?
+    let items: [SearchItem]
+}
+
+private struct SearchItem: Decodable {
+    let id: SearchItemID?
+    let snippet: SearchSnippet?
+}
+
+private struct SearchItemID: Decodable {
+    let videoId: String?
+}
+
+private struct SearchSnippet: Decodable {
+    let title: String?
+    let channelTitle: String?
+    let thumbnails: Thumbnails?
 }
 
 private struct VideoItem: Decodable {

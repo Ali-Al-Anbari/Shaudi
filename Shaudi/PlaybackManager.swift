@@ -20,6 +20,42 @@ private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
     }
 }
 
+struct PlayableTrack: Identifiable, Hashable {
+    let youtubeVideoID: String
+    let title: String
+    let channelTitle: String?
+    let thumbnailURL: URL?
+    let duration: TimeInterval?
+
+    var id: String {
+        youtubeVideoID
+    }
+
+    init(
+        youtubeVideoID: String,
+        title: String,
+        channelTitle: String?,
+        thumbnailURL: URL?,
+        duration: TimeInterval?
+    ) {
+        self.youtubeVideoID = youtubeVideoID
+        self.title = title
+        self.channelTitle = channelTitle
+        self.thumbnailURL = thumbnailURL
+        self.duration = duration
+    }
+
+    init(track: Track) {
+        self.init(
+            youtubeVideoID: track.youtubeVideoID,
+            title: track.title,
+            channelTitle: track.channelTitle,
+            thumbnailURL: track.thumbnailURL,
+            duration: track.duration
+        )
+    }
+}
+
 @MainActor
 final class PlaybackManager: ObservableObject {
     private let streamLookaheadCount = 10
@@ -71,6 +107,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     @Published private(set) var currentTrack: Track?
+    @Published private(set) var currentPlayableTrack: PlayableTrack?
     @Published private(set) var state: PlaybackState = .idle
     @Published private(set) var startupMetrics: StartupMetrics?
     @Published private(set) var queue: [Track] = []
@@ -144,6 +181,16 @@ final class PlaybackManager: ObservableObject {
         play(track, in: [track])
     }
 
+    func play(_ track: PlayableTrack) {
+        cancelUpcomingPreResolutionObservation()
+        queue = []
+        currentIndex = nil
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        startPlaybackContext(track, persistentTrack: nil)
+    }
+
     func nextTrack() {
         advanceToNextTrack(reason: "Next")
     }
@@ -203,17 +250,33 @@ final class PlaybackManager: ObservableObject {
         }
 
         let track = queue[currentIndex]
+        startPlaybackContext(
+            PlayableTrack(track: track),
+            persistentTrack: track,
+            preparedPlayback: preparedPlayback,
+            requestStartedAt: requestStartedAt
+        )
+    }
+
+    private func startPlaybackContext(
+        _ playableTrack: PlayableTrack,
+        persistentTrack: Track?,
+        preparedPlayback: PreparedNextPlayback? = nil,
+        requestStartedAt: TimeInterval? = nil
+    ) {
         invalidateCurrentRequest()
         clearPlayer()
 
         let requestID = UUID()
         let requestStartedAt = requestStartedAt ?? currentTime
-        let videoID = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let videoID = playableTrack.youtubeVideoID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         activeRequestID = requestID
-        currentTrack = track
+        currentTrack = persistentTrack
+        currentPlayableTrack = playableTrack
 #if os(iOS)
-        publishNowPlaying(track, requestID: requestID)
+        publishNowPlaying(playableTrack, requestID: requestID)
 #endif
 
         guard !videoID.isEmpty else {
@@ -231,7 +294,7 @@ final class PlaybackManager: ObservableObject {
         if
             let preparedPlayback,
             preparedPlayback.queueIndex == currentIndex,
-            preparedPlayback.track === track,
+            preparedPlayback.track === persistentTrack,
             preparedPlayback.videoID == videoID
         {
             let wasFullyPrepared = preparedPlayback.readyAt != nil
@@ -339,6 +402,7 @@ final class PlaybackManager: ObservableObject {
         queue = []
         currentIndex = nil
         currentTrack = nil
+        currentPlayableTrack = nil
         state = .idle
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -350,6 +414,10 @@ final class PlaybackManager: ObservableObject {
 
     func isCurrentTrack(_ track: Track) -> Bool {
         currentTrack === track
+    }
+
+    func isCurrentPlayable(_ youtubeVideoID: String) -> Bool {
+        currentPlayableTrack?.youtubeVideoID == youtubeVideoID
     }
 
     private func resolveAndStartPlayback(
@@ -1001,7 +1069,7 @@ final class PlaybackManager: ObservableObject {
 
         let managerReference = WeakReference(self)
         let itemReference = WeakReference(item)
-        let trackDuration = currentTrack?.duration
+        let trackDuration = currentPlayableTrack?.duration
         let authoritativeDuration = validDuration(trackDuration)
 
         applyAuthoritativeEndTime(to: item, trackDuration: trackDuration)
@@ -1166,7 +1234,7 @@ final class PlaybackManager: ObservableObject {
     }
 
 #if os(iOS)
-    private func publishNowPlaying(_ track: Track, requestID: UUID) {
+    private func publishNowPlaying(_ track: PlayableTrack, requestID: UUID) {
         artworkTask?.cancel()
         artworkTask = nil
 
@@ -1233,7 +1301,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func synchronizeNowPlayingPlaybackState() {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return
         }
 
@@ -1246,7 +1314,7 @@ final class PlaybackManager: ObservableObject {
                 information[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
             }
 
-            if let intendedDuration = intendedPlaybackDuration(for: currentTrack) {
+            if let intendedDuration = intendedPlaybackDuration(for: currentPlayableTrack) {
                 information[MPMediaItemPropertyPlaybackDuration] = intendedDuration
             } else if let playerDuration = validDuration(player.currentItem?.duration.seconds) {
                 information[MPMediaItemPropertyPlaybackDuration] = playerDuration
@@ -1332,7 +1400,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePlayCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -1340,7 +1408,7 @@ final class PlaybackManager: ObservableObject {
         case .paused:
             resume()
         case .failed, .idle:
-            startCurrentQueueTrack()
+            restartCurrentPlayback()
         case .resolving, .loading, .playing:
             break
         }
@@ -1349,7 +1417,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePauseCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -1365,7 +1433,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemoteTogglePlayPauseCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -1375,7 +1443,7 @@ final class PlaybackManager: ObservableObject {
         case .paused:
             resume()
         case .failed, .idle:
-            startCurrentQueueTrack()
+            restartCurrentPlayback()
         case .resolving, .loading:
             return .commandFailed
         }
@@ -1384,7 +1452,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemoteNextCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -1397,7 +1465,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePreviousCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentTrack != nil else {
+        guard currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -1411,7 +1479,15 @@ final class PlaybackManager: ObservableObject {
 
 #endif
 
-    private func intendedPlaybackDuration(for track: Track?) -> TimeInterval? {
+    private func restartCurrentPlayback() {
+        if currentTrack != nil {
+            startCurrentQueueTrack()
+        } else if let currentPlayableTrack {
+            startPlaybackContext(currentPlayableTrack, persistentTrack: nil)
+        }
+    }
+
+    private func intendedPlaybackDuration(for track: PlayableTrack?) -> TimeInterval? {
         validDuration(track?.duration)
     }
 

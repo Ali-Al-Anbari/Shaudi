@@ -16,6 +16,11 @@ struct ContentView: View {
                 Label("Library", systemImage: "music.note.house")
             }
 
+            SearchView()
+            .tabItem {
+                Label("Search", systemImage: "magnifyingglass")
+            }
+
             PlaylistsView()
             .tabItem {
                 Label("Playlists", systemImage: "music.note.list")
