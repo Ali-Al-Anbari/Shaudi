@@ -4,7 +4,9 @@
 //
 
 import SwiftData
+import PhotosUI
 import SwiftUI
+import UIKit
 
 struct LibraryView: View {
     @Environment(\.modelContext) private var modelContext
@@ -12,17 +14,49 @@ struct LibraryView: View {
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var tracks: [Track]
 
+    @Query(sort: \Playlist.dateCreated, order: .reverse)
+    private var playlists: [Playlist]
+
     @State private var isShowingNewTrack = false
+    @State private var isShowingPhotoPicker = false
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var editingHeroImage: UIImage?
+    @State private var isShowingCropEditor = false
+    @AppStorage("shaudi.library.heroImage") private var heroImageData = ""
+    @AppStorage("shaudi.library.heroOffsetX") private var heroOffsetX = 0.0
+    @AppStorage("shaudi.library.heroOffsetY") private var heroOffsetY = 0.0
+    @AppStorage("shaudi.library.heroScale") private var heroScale = 1.0
+
+    private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
 
     var body: some View {
         NavigationStack {
-            libraryList
-            .navigationTitle("Library")
+            dashboard
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 Button {
                     isShowingNewTrack = true
                 } label: {
                     Label("New Track", systemImage: "plus")
+                }
+            }
+            .photosPicker(isPresented: $isShowingPhotoPicker, selection: $selectedPhoto, matching: .images)
+            .onChange(of: selectedPhoto) {
+                saveSelectedPhoto()
+            }
+            .sheet(isPresented: $isShowingCropEditor) {
+                if let editingHeroImage {
+                    BannerCropEditor(
+                        image: editingHeroImage,
+                        initialOffset: .zero,
+                        initialScale: 1
+                    ) { offset, scale in
+                        heroImageData = editingHeroImage.jpegData(compressionQuality: 0.82)?.base64EncodedString() ?? heroImageData
+                        heroOffsetX = offset.width
+                        heroOffsetY = offset.height
+                        heroScale = scale
+                    }
                 }
             }
             .sheet(isPresented: $isShowingNewTrack) {
@@ -53,6 +87,177 @@ struct LibraryView: View {
                     return nil
                 }
             }
+        }
+    }
+
+    private var dashboard: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                heroBanner
+                sectionHeader("Library")
+                playlistPager
+                sectionHeader("My Collection")
+                collection
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
+        }
+            .scrollIndicators(.hidden)
+        .background(ShaudiTheme.dashboardBackground)
+        .safeAreaPadding(.bottom, 84)
+    }
+
+    private var heroBanner: some View {
+        Button {
+            isShowingPhotoPicker = true
+        } label: {
+            GeometryReader { geometry in
+                ZStack(alignment: .topTrailing) {
+                    if let image = storedHeroImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .scaleEffect(heroScale)
+                            .offset(x: heroOffsetX * geometry.size.width, y: heroOffsetY * geometry.size.height)
+                    } else {
+                        LinearGradient(colors: [ShaudiTheme.lavender.opacity(0.8), ShaudiTheme.accent.opacity(0.85)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        Image(systemName: "photo.badge.plus")
+                            .font(.system(size: 34, weight: .light))
+                            .foregroundStyle(.white.opacity(0.82))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+
+                    Image(systemName: "pencil.circle.fill")
+                        .font(.title3)
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, ShaudiTheme.accent)
+                        .padding(12)
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .clipped()
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 148)
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 12, y: 6)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Library poster")
+        .accessibilityHint("Choose or reposition a photo")
+    }
+
+    private var playlistPager: some View {
+        let pageCount = max(1, (playlists.count + 5) / 6)
+        return TabView {
+            ForEach(0..<pageCount, id: \.self) { page in
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+                    ForEach(0..<6, id: \.self) { slot in
+                        let playlistIndex = page * 6 + slot
+                        if playlistIndex < playlists.count {
+                            let playlist = playlists[playlistIndex]
+                            NavigationLink {
+                                PlaylistDetailView(playlist: playlist)
+                            } label: {
+                                playlistCard(playlist)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            loveCard(at: playlistIndex)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .frame(height: 270)
+        .tabViewStyle(.page(indexDisplayMode: pageCount > 1 ? .automatic : .never))
+    }
+
+    private var collection: some View {
+        Group {
+            if tracks.isEmpty {
+                ContentUnavailableView("Your Library Is Quiet", systemImage: "music.note.list", description: Text("Add a track to start your collection."))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+            } else {
+                LazyVStack(spacing: 10) {
+                    ForEach(tracks) { track in
+                        NavigationLink {
+                            TrackDetailView(track: track, queue: tracks)
+                        } label: {
+                            trackRow(track)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(ShaudiTheme.dashboardCard, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    .onDelete(perform: deleteTracks)
+                }
+            }
+        }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(ShaudiTheme.scriptFont(size: 34, relativeTo: .title))
+            .foregroundStyle(ShaudiTheme.accent)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private func playlistCard(_ playlist: Playlist) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous).fill(ShaudiTheme.dashboardCard)
+                if let thumbnailURL = playlist.tracks.sorted(by: { $0.dateAdded > $1.dateAdded }).first?.thumbnailURL {
+                    AsyncImage(url: thumbnailURL) { phase in
+                        if case .success(let image) = phase {
+                            image.resizable().scaledToFill().clipped()
+                        } else {
+                            Image(systemName: "rectangle.stack.fill").font(.title2).foregroundStyle(ShaudiTheme.accent)
+                        }
+                    }
+                } else {
+                    Image(systemName: "rectangle.stack.fill").font(.title2).foregroundStyle(ShaudiTheme.accent)
+                }
+            }
+            .aspectRatio(1, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            Text(playlist.name)
+                .font(ShaudiTheme.bodyFont(size: 15))
+                .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                .lineLimit(1)
+        }
+    }
+
+    private func loveCard(at index: Int) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: index.isMultiple(of: 2) ? "heart.fill" : "sparkles")
+                .font(.title3)
+                .foregroundStyle(ShaudiTheme.accent.opacity(0.72))
+            Text(loveMessages[index % loveMessages.count])
+                .font(ShaudiTheme.bodyFont(size: 14))
+                .foregroundStyle(ShaudiTheme.accent)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .aspectRatio(1, contentMode: .fit)
+        .background(ShaudiTheme.dashboardPlaceholder, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var storedHeroImage: UIImage? {
+        guard let data = Data(base64Encoded: heroImageData) else { return nil }
+        return UIImage(data: data)
+    }
+
+    private func saveSelectedPhoto() {
+        guard let selectedPhoto else { return }
+        Task { @MainActor in
+            guard let data = try? await selectedPhoto.loadTransferable(type: Data.self) else { return }
+            guard let image = UIImage(data: data), let jpegData = image.jpegData(compressionQuality: 0.82) else { return }
+            editingHeroImage = UIImage(data: jpegData)
+            isShowingCropEditor = true
         }
     }
 
@@ -114,14 +319,14 @@ struct LibraryView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(track.title)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
+                    .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .headline))
+                    .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                     .lineLimit(2)
 
                 if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
                     Text(channelTitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                        .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
                         .lineLimit(1)
                 }
             }
@@ -129,6 +334,104 @@ struct LibraryView: View {
             Spacer(minLength: 4)
         }
         .padding(.vertical, 5)
+    }
+}
+
+private struct BannerCropEditor: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let image: UIImage
+    let initialOffset: CGSize
+    let initialScale: CGFloat
+    let onSave: (CGSize, CGFloat) -> Void
+
+    @State private var offset: CGSize = .zero
+    @State private var scale: CGFloat
+    @State private var didSetInitialOffset = false
+    @State private var cropWidth: CGFloat = 1
+    @GestureState private var dragTranslation: CGSize = .zero
+    @GestureState private var magnification: CGFloat = 1
+
+    private let bannerHeight: CGFloat = 148
+
+    init(image: UIImage, initialOffset: CGSize, initialScale: CGFloat, onSave: @escaping (CGSize, CGFloat) -> Void) {
+        self.image = image
+        self.initialOffset = initialOffset
+        self.initialScale = initialScale
+        self.onSave = onSave
+        _scale = State(initialValue: max(1, initialScale))
+    }
+
+    var body: some View {
+        NavigationStack {
+            GeometryReader { geometry in
+                VStack(spacing: 20) {
+                    ZStack {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .scaleEffect(scale * magnification)
+                            .offset(x: offset.width * geometry.size.width + dragTranslation.width,
+                                    y: offset.height * bannerHeight + dragTranslation.height)
+                    }
+                    .frame(width: geometry.size.width, height: bannerHeight)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .contentShape(Rectangle())
+                    .gesture(dragGesture.simultaneously(with: magnificationGesture))
+
+                    Text("Drag and pinch to frame your banner")
+                        .font(ShaudiTheme.bodyFont(size: 16))
+                        .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+
+                    Spacer()
+                }
+                .padding(.top, 24)
+                .onAppear {
+                    guard !didSetInitialOffset else { return }
+                    cropWidth = geometry.size.width
+                    offset = initialOffset
+                    scale = max(1, initialScale)
+                    didSetInitialOffset = true
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { dismiss() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            onSave(offset, scale)
+                            dismiss()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Adjust Banner")
+            .navigationBarTitleDisplayMode(.inline)
+            .background(ShaudiTheme.dashboardBackground)
+        }
+        .presentationDragIndicator(.visible)
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture()
+            .updating($dragTranslation) { value, state, _ in
+                state = value.translation
+            }
+            .onEnded { value in
+                offset.width += value.translation.width / max(1, cropWidth)
+                offset.height += value.translation.height / bannerHeight
+            }
+    }
+
+    private var magnificationGesture: some Gesture {
+        MagnificationGesture()
+            .updating($magnification) { value, state, _ in
+                state = value
+            }
+            .onEnded { value in
+                scale = min(max(scale * value, 1), 4)
+            }
     }
 }
 

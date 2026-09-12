@@ -136,7 +136,7 @@ private struct PlaylistNameEditor: View {
     }
 }
 
-private struct PlaylistDetailView: View {
+struct PlaylistDetailView: View {
     let playlist: Playlist
 
     @State private var isShowingRename = false
