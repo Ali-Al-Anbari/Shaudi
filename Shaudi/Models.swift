@@ -19,6 +19,8 @@ final class Track {
     var playCount: Int = 0
     var totalListenedDuration: TimeInterval = 0
     var lastPlayedAt: Date? = nil
+    var playbackStartTime: Double? = nil
+    var playbackEndTime: Double? = nil
     var playlists: [Playlist]
 
     init(
@@ -33,6 +35,8 @@ final class Track {
         playCount: Int = 0,
         totalListenedDuration: TimeInterval = 0,
         lastPlayedAt: Date? = nil,
+        playbackStartTime: Double? = nil,
+        playbackEndTime: Double? = nil,
         playlists: [Playlist] = []
     ) {
         self.title = title
@@ -46,6 +50,8 @@ final class Track {
         self.playCount = playCount
         self.totalListenedDuration = totalListenedDuration
         self.lastPlayedAt = lastPlayedAt
+        self.playbackStartTime = playbackStartTime
+        self.playbackEndTime = playbackEndTime
         self.playlists = playlists
     }
 }

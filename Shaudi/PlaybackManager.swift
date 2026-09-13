@@ -33,6 +33,8 @@ struct PlayableTrack: Identifiable, Hashable {
     let channelTitle: String?
     let thumbnailURL: URL?
     let duration: TimeInterval?
+    let playbackStartTime: TimeInterval?
+    let playbackEndTime: TimeInterval?
 
     var id: String {
         youtubeVideoID
@@ -43,13 +45,17 @@ struct PlayableTrack: Identifiable, Hashable {
         title: String,
         channelTitle: String?,
         thumbnailURL: URL?,
-        duration: TimeInterval?
+        duration: TimeInterval?,
+        playbackStartTime: TimeInterval? = nil,
+        playbackEndTime: TimeInterval? = nil
     ) {
         self.youtubeVideoID = youtubeVideoID
         self.title = title
         self.channelTitle = channelTitle
         self.thumbnailURL = thumbnailURL
         self.duration = duration
+        self.playbackStartTime = playbackStartTime
+        self.playbackEndTime = playbackEndTime
     }
 
     init(track: Track) {
@@ -58,7 +64,9 @@ struct PlayableTrack: Identifiable, Hashable {
             title: track.title,
             channelTitle: track.channelTitle,
             thumbnailURL: track.thumbnailURL,
-            duration: track.duration
+            duration: track.duration,
+            playbackStartTime: track.playbackStartTime,
+            playbackEndTime: track.playbackEndTime
         )
     }
 }
@@ -129,6 +137,11 @@ final class PlaybackManager: ObservableObject {
         let task: Task<URL, Error>
     }
 
+    private struct EffectivePlaybackRange {
+        let startTime: TimeInterval
+        let endTime: TimeInterval?
+    }
+
     // The auxiliary player drives loading/preroll and becomes the current player on handoff.
     private struct PreparedNextPlayback {
         let preparationID: UUID
@@ -138,6 +151,7 @@ final class PlaybackManager: ObservableObject {
         let streamURL: URL
         let item: AVPlayerItem
         let player: AVPlayer
+        let playbackRange: EffectivePlaybackRange
         let preparationStartedAt: TimeInterval
         var readyAt: TimeInterval?
     }
@@ -149,6 +163,11 @@ final class PlaybackManager: ObservableObject {
         let startedAt: TimeInterval
     }
 
+    private struct SuspendedPlaybackContext {
+        let currentTrack: Track?
+        let currentPlayableTrack: PlayableTrack?
+    }
+
     @Published private(set) var currentTrack: Track?
     @Published private(set) var currentPlayableTrack: PlayableTrack?
     @Published private(set) var state: PlaybackState = .idle
@@ -158,6 +177,8 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var playbackStartEvent: PlaybackStartEvent?
     @Published private(set) var isShuffleEnabled = false
     @Published private(set) var repeatMode: RepeatMode = .off
+    @Published private(set) var isTrimPreviewActive = false
+    @Published private(set) var trimPreviewTime: TimeInterval?
 
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
@@ -171,6 +192,7 @@ final class PlaybackManager: ObservableObject {
     private var nextItemStatusObservation: NSKeyValueObservation?
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackBoundaryObserver: Any?
+    private var trimPreviewTimeObserver: (player: AVPlayer, token: Any)?
     private var activeRequestID: UUID?
     private var lastReportedPlaybackRequestID: UUID?
     private var playbackOrigin: PlaybackOrigin?
@@ -183,6 +205,9 @@ final class PlaybackManager: ObservableObject {
     private var activeListeningPeriod: ActiveListeningPeriod?
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
+    private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
+    private var pendingTrimPreviewStartTime: (track: Track, time: TimeInterval)?
+    private var suspendedPlaybackContext: SuspendedPlaybackContext?
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
     private var inFlightResolutions: [String: InFlightResolution] = [:]
@@ -227,6 +252,8 @@ final class PlaybackManager: ObservableObject {
         in orderedQueue: [Track],
         origin: PlaybackOrigin
     ) {
+        endActiveTrimPreviewIfNeeded()
+
         let previousPlaylistID = playlistID(from: playbackOrigin)
         pauseSpeculativeWarmupsForPlayback(
             requestedVideoID: normalizedVideoID(track.youtubeVideoID)
@@ -305,6 +332,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     func play(_ track: PlayableTrack) {
+        endActiveTrimPreviewIfNeeded()
+
         pauseSpeculativeWarmupsForPlayback(
             requestedVideoID: normalizedVideoID(track.youtubeVideoID)
         )
@@ -524,6 +553,10 @@ final class PlaybackManager: ObservableObject {
     }
 
     func nextTrack() {
+        guard !isTrimPreviewActive else {
+            return
+        }
+
         advanceToNextTrack(reason: "Next")
     }
 
@@ -595,6 +628,10 @@ final class PlaybackManager: ObservableObject {
     }
 
     func previousTrack() {
+        guard !isTrimPreviewActive else {
+            return
+        }
+
         guard
             let currentIndex,
             let previousIndex = previousQueueIndex(before: currentIndex)
@@ -816,7 +853,9 @@ final class PlaybackManager: ObservableObject {
         currentTrack = persistentTrack
         currentPlayableTrack = playableTrack
 #if os(iOS)
-        publishNowPlaying(playableTrack, requestID: requestID)
+        if !isTrimPreviewActive {
+            publishNowPlaying(playableTrack, requestID: requestID)
+        }
 #endif
 
         guard !videoID.isEmpty else {
@@ -859,7 +898,9 @@ final class PlaybackManager: ObservableObject {
                 requestID: requestID,
                 requestStartedAt: requestStartedAt,
                 playerPreparationStartedAt: requestStartedAt,
-                usedCachedStream: true
+                usedCachedStream: true,
+                playbackRange: preparedPlayback.playbackRange,
+                playbackStartTime: preparedPlayback.playbackRange.startTime
             )
             return
         }
@@ -913,6 +954,11 @@ final class PlaybackManager: ObservableObject {
     }
 
     func pause() {
+        if isTrimPreviewActive {
+            pauseActiveTrimPreview()
+            return
+        }
+
         guard case .playing = state else {
             return
         }
@@ -925,8 +971,224 @@ final class PlaybackManager: ObservableObject {
 #endif
     }
 
+    var currentPlaybackTime: TimeInterval? {
+        let time = player?.currentTime().seconds
+        guard let time, time.isFinite, time >= 0 else {
+            return nil
+        }
+
+        return time
+    }
+
+    func beginTrimPreview(
+        _ track: Track,
+        startTime: TimeInterval,
+        endTime: TimeInterval,
+        previewTime: TimeInterval
+    ) {
+        guard let playbackRange = validatedPlaybackRange(
+            startTime: startTime,
+            endTime: endTime,
+            authoritativeDuration: track.duration
+        ) else {
+            return
+        }
+
+        if isTrimPreviewActive {
+            guard trimPreviewRange?.track === track else {
+                return
+            }
+
+            updateTrimPreviewRange(
+                for: track,
+                startTime: startTime,
+                endTime: endTime
+            )
+            seekTrimPreview(for: track, to: previewTime)
+            resumeTrimPreview(for: track)
+            return
+        }
+
+        let suspendedContext = SuspendedPlaybackContext(
+            currentTrack: currentTrack,
+            currentPlayableTrack: currentPlayableTrack
+        )
+        if case .playing = state {
+            pause()
+        } else {
+            finishActiveListeningPeriod()
+            player?.pause()
+        }
+
+        cancelUpcomingPreResolutionObservation()
+        pauseSpeculativeWarmupsForPlayback(
+            requestedVideoID: normalizedVideoID(track.youtubeVideoID)
+        )
+
+        suspendedPlaybackContext = suspendedContext
+        isTrimPreviewActive = true
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        trimPreviewRange = (track, playbackRange)
+        let clampedPreviewTime = clampedPlaybackTime(previewTime, to: playbackRange)
+        trimPreviewTime = clampedPreviewTime
+        pendingTrimPreviewStartTime = (track, clampedPreviewTime)
+        startPlaybackContext(
+            PlayableTrack(track: track),
+            persistentTrack: track
+        )
+    }
+
+    func updateTrimPreviewRange(
+        for track: Track,
+        startTime: TimeInterval,
+        endTime: TimeInterval
+    ) {
+        guard
+            isTrimPreviewActive,
+            trimPreviewRange?.track === track,
+            let playbackRange = validatedPlaybackRange(
+                startTime: startTime,
+                endTime: endTime,
+                authoritativeDuration: track.duration
+            )
+        else {
+            return
+        }
+
+        trimPreviewRange = (track, playbackRange)
+        updateActivePlaybackRange(playbackRange)
+    }
+
+    func endTrimPreview(for track: Track) {
+        guard
+            isTrimPreviewActive,
+            trimPreviewRange?.track === track
+        else {
+            return
+        }
+
+        let suspendedContext = suspendedPlaybackContext
+        invalidateCurrentRequest()
+        clearPlayer()
+
+        isTrimPreviewActive = false
+        trimPreviewTime = nil
+        trimPreviewRange = nil
+        pendingTrimPreviewStartTime = nil
+        suspendedPlaybackContext = nil
+        startupMetrics = nil
+
+        currentTrack = suspendedContext?.currentTrack
+        if suspendedContext?.currentTrack === track {
+            currentPlayableTrack = PlayableTrack(track: track)
+        } else {
+            currentPlayableTrack = suspendedContext?.currentPlayableTrack
+        }
+        state = currentPlayableTrack == nil ? .idle : .paused
+
+#if os(iOS)
+        updateRemoteQueueCommands()
+        if currentPlayableTrack == nil {
+            clearNowPlaying()
+        } else {
+            synchronizeNowPlayingPlaybackState()
+        }
+#endif
+
+        try? AVAudioSession.sharedInstance().setActive(false)
+    }
+
+    func isTrimPreviewing(_ track: Track) -> Bool {
+        isTrimPreviewActive && trimPreviewRange?.track === track
+    }
+
+    func pauseTrimPreview(for track: Track) {
+        guard isTrimPreviewing(track) else {
+            return
+        }
+
+        pauseActiveTrimPreview()
+    }
+
+    func resumeTrimPreview(for track: Track) {
+        guard
+            isTrimPreviewing(track),
+            case .paused = state,
+            let player,
+            let requestID = activeRequestID,
+            let playbackRange = trimPreviewRange?.range
+        else {
+            return
+        }
+
+        state = .loading
+        let currentTime = trimPreviewTime ?? player.currentTime().seconds
+        if
+            let endTime = playbackRange.endTime,
+            currentTime.isFinite,
+            currentTime >= endTime - 0.05
+        {
+            trimPreviewTime = playbackRange.startTime
+            beginPlayback(
+                player,
+                at: playbackRange.startTime,
+                requestID: requestID
+            )
+        } else {
+            player.play()
+        }
+    }
+
+    func seekTrimPreview(for track: Track, to time: TimeInterval) {
+        guard
+            time.isFinite,
+            isTrimPreviewing(track),
+            let player,
+            let requestID = activeRequestID,
+            let playbackRange = trimPreviewRange?.range
+        else {
+            return
+        }
+
+        let targetTime = clampedPlaybackTime(time, to: playbackRange)
+        trimPreviewTime = targetTime
+
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let finished = await seekPlayer(player, to: targetTime)
+            guard
+                finished,
+                isActive(requestID),
+                self.player === player,
+                isTrimPreviewActive
+            else {
+                return
+            }
+
+            trimPreviewTime = targetTime
+        }
+    }
+
     func resume() {
-        guard case .paused = state, let player else {
+        if isTrimPreviewActive {
+            guard let track = trimPreviewRange?.track else {
+                return
+            }
+            resumeTrimPreview(for: track)
+            return
+        }
+
+        guard case .paused = state else {
+            return
+        }
+
+        guard let player else {
+            restartCurrentPlayback()
             return
         }
 
@@ -937,7 +1199,50 @@ final class PlaybackManager: ObservableObject {
 #endif
     }
 
+    func seek(to time: TimeInterval) {
+        guard
+            time.isFinite,
+            let player,
+            let requestID = activeRequestID,
+            let currentPlayableTrack
+        else {
+            return
+        }
+
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        let targetTime = clampedPlaybackTime(time, to: playbackRange)
+
+        finishActiveListeningPeriod()
+
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let finished = await seekPlayer(player, to: targetTime)
+            guard
+                finished,
+                isActive(requestID),
+                self.player === player
+            else {
+                return
+            }
+
+            if player.timeControlStatus == .playing {
+                beginActiveListeningPeriod(for: player, requestID: requestID)
+            }
+#if os(iOS)
+            synchronizeNowPlayingPlaybackState()
+#endif
+        }
+    }
+
     func stop() {
+        if isTrimPreviewActive {
+            endActiveTrimPreviewIfNeeded()
+            return
+        }
+
         cancelUpcomingPreResolutionObservation()
         invalidateCurrentRequest()
         clearPlayer()
@@ -1591,7 +1896,8 @@ final class PlaybackManager: ObservableObject {
             asset: asset,
             automaticallyLoadedAssetKeys: [.isPlayable, .duration]
         )
-        applyAuthoritativeEndTime(to: item, trackDuration: track.duration)
+        let playbackRange = effectivePlaybackRange(for: PlayableTrack(track: track))
+        applyEffectiveEndTime(to: item, playbackRange: playbackRange)
 
         let preparationPlayer = AVPlayer(playerItem: item)
         preparedNextPlayback = PreparedNextPlayback(
@@ -1602,6 +1908,7 @@ final class PlaybackManager: ObservableObject {
             streamURL: streamURL,
             item: item,
             player: preparationPlayer,
+            playbackRange: playbackRange,
             preparationStartedAt: preparationStartedAt,
             readyAt: nil
         )
@@ -1829,18 +2136,47 @@ final class PlaybackManager: ObservableObject {
         preparationID: UUID,
         videoID: String
     ) {
-        guard nextItemPrerollTask == nil else {
+        guard
+            nextItemPrerollTask == nil,
+            let preparedNextPlayback,
+            preparedNextPlayback.preparationID == preparationID,
+            preparedNextPlayback.player === preparationPlayer,
+            preparedNextPlayback.item === item
+        else {
             return
         }
 
+        let playbackRange = preparedNextPlayback.playbackRange
         nextItemPrerollTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            if playbackRange.startTime > 0 {
+                let seekFinished = await seekPlayer(
+                    preparationPlayer,
+                    to: playbackRange.startTime
+                )
+                guard seekFinished else {
+                    nextItemPrerollTask = nil
+                    log("Next-item crop seek did not finish for \(videoID)")
+                    return
+                }
+            }
+
+            guard
+                !Task.isCancelled,
+                activePreResolutionID == preparationID
+            else {
+                return
+            }
+
             let finished = await preparationPlayer.preroll(atRate: 1)
 
             guard
-                let self,
                 !Task.isCancelled,
                 activePreResolutionID == preparationID,
-                var preparedNextPlayback,
+                var preparedNextPlayback = self.preparedNextPlayback,
                 preparedNextPlayback.preparationID == preparationID,
                 preparedNextPlayback.player === preparationPlayer,
                 preparedNextPlayback.item === item
@@ -1975,6 +2311,7 @@ final class PlaybackManager: ObservableObject {
     ) {
         let item = AVPlayerItem(url: streamURL)
         let player = AVPlayer(playerItem: item)
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
         startPlayback(
             with: item,
             player: player,
@@ -1982,7 +2319,9 @@ final class PlaybackManager: ObservableObject {
             requestID: requestID,
             requestStartedAt: requestStartedAt,
             playerPreparationStartedAt: playerPreparationStartedAt,
-            usedCachedStream: usedCachedStream
+            usedCachedStream: usedCachedStream,
+            playbackRange: playbackRange,
+            playbackStartTime: pendingTrimPreviewStartTime(for: currentTrack, in: playbackRange)
         )
     }
 
@@ -1993,7 +2332,9 @@ final class PlaybackManager: ObservableObject {
         requestID: UUID,
         requestStartedAt: TimeInterval,
         playerPreparationStartedAt: TimeInterval,
-        usedCachedStream: Bool
+        usedCachedStream: Bool,
+        playbackRange: EffectivePlaybackRange,
+        playbackStartTime: TimeInterval
     ) {
         guard isActive(requestID) else {
             return
@@ -2009,29 +2350,22 @@ final class PlaybackManager: ObservableObject {
         let managerReference = WeakReference(self)
         let itemReference = WeakReference(item)
         let trackDuration = currentPlayableTrack?.duration
-        let authoritativeDuration = validDuration(trackDuration)
 
-        applyAuthoritativeEndTime(to: item, trackDuration: trackDuration)
+        applyEffectiveEndTime(to: item, playbackRange: playbackRange)
 
         self.player = player
-
-        if let authoritativeDuration {
-            let boundaryTime = CMTime(seconds: authoritativeDuration, preferredTimescale: 600)
-            playbackBoundaryObserver = player.addBoundaryTimeObserver(
-                forTimes: [NSValue(time: boundaryTime)],
-                queue: .main
-            ) { [managerReference, itemReference] in
-                Task { @MainActor in
-                    guard
-                        let self = managerReference.value,
-                        let item = itemReference.value
-                    else {
-                        return
-                    }
-
-                    self.handlePlaybackCompletion(for: item, requestID: requestID)
-                }
-            }
+        installPlaybackBoundaryObserver(
+            on: player,
+            item: item,
+            playbackRange: playbackRange,
+            requestID: requestID
+        )
+        if isTrimPreviewActive {
+            installTrimPreviewTimeObserver(
+                on: player,
+                playbackRange: playbackRange,
+                requestID: requestID
+            )
         }
 
         playbackEndObserver = NotificationCenter.default.addObserver(
@@ -2113,6 +2447,10 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 self.state = .playing
+                guard !self.isTrimPreviewActive else {
+                    return
+                }
+
                 self.reportPlaybackStartedIfNeeded(
                     requestID: requestID,
                     videoID: videoID
@@ -2131,10 +2469,69 @@ final class PlaybackManager: ObservableObject {
             }
         }
 
-        player.play()
+        beginPlayback(
+            player,
+            at: playbackStartTime,
+            requestID: requestID
+        )
+    }
+
+    private func beginPlayback(
+        _ player: AVPlayer,
+        at startTime: TimeInterval,
+        requestID: UUID
+    ) {
+        guard startTime > 0 else {
+            player.play()
 #if os(iOS)
-        synchronizeNowPlayingPlaybackState()
+            synchronizeNowPlayingPlaybackState()
 #endif
+            return
+        }
+
+        let currentTime = player.currentTime().seconds
+        if currentTime.isFinite, abs(currentTime - startTime) < 0.05 {
+            player.play()
+#if os(iOS)
+            synchronizeNowPlayingPlaybackState()
+#endif
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let finished = await seekPlayer(player, to: startTime)
+            guard
+                finished,
+                isActive(requestID),
+                self.player === player
+            else {
+                return
+            }
+
+#if os(iOS)
+            synchronizeNowPlayingPlaybackState()
+#endif
+            player.play()
+#if os(iOS)
+            synchronizeNowPlayingPlaybackState()
+#endif
+        }
+    }
+
+    private func seekPlayer(_ player: AVPlayer, to time: TimeInterval) async -> Bool {
+        await withCheckedContinuation { continuation in
+            player.seek(
+                to: CMTime(seconds: time, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { finished in
+                continuation.resume(returning: finished)
+            }
+        }
     }
 
     private func handlePlayerFailure(
@@ -2185,10 +2582,11 @@ final class PlaybackManager: ObservableObject {
     private func publishNowPlaying(_ track: PlayableTrack, requestID: UUID) {
         artworkTask?.cancel()
         artworkTask = nil
+        let playbackRange = effectivePlaybackRange(for: track)
 
         var information: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: 0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: playbackRange.startTime,
             MPNowPlayingInfoPropertyPlaybackRate: 0,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1
         ]
@@ -2249,7 +2647,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func synchronizeNowPlayingPlaybackState() {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return
         }
 
@@ -2259,7 +2657,9 @@ final class PlaybackManager: ObservableObject {
         if let player {
             let elapsedTime = player.currentTime().seconds
             if elapsedTime.isFinite, elapsedTime >= 0 {
-                information[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
+                let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+                information[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
+                    clampedPlaybackTime(elapsedTime, to: playbackRange)
             }
 
             if let intendedDuration = intendedPlaybackDuration(for: currentPlayableTrack) {
@@ -2343,12 +2743,12 @@ final class PlaybackManager: ObservableObject {
 
     private func updateRemoteQueueCommands() {
         let commandCenter = MPRemoteCommandCenter.shared()
-        commandCenter.nextTrackCommand.isEnabled = hasNextTrack
-        commandCenter.previousTrackCommand.isEnabled = hasPreviousTrack
+        commandCenter.nextTrackCommand.isEnabled = !isTrimPreviewActive && hasNextTrack
+        commandCenter.previousTrackCommand.isEnabled = !isTrimPreviewActive && hasPreviousTrack
     }
 
     private func handleRemotePlayCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -2365,7 +2765,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePauseCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -2381,7 +2781,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemoteTogglePlayPauseCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -2400,7 +2800,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemoteNextCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -2413,7 +2813,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePreviousCommand() -> MPRemoteCommandHandlerStatus {
-        guard currentPlayableTrack != nil else {
+        guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
 
@@ -2439,6 +2839,56 @@ final class PlaybackManager: ObservableObject {
         validDuration(track?.duration)
     }
 
+    private func effectivePlaybackRange(
+        for track: PlayableTrack?
+    ) -> EffectivePlaybackRange {
+        guard let track else {
+            return EffectivePlaybackRange(startTime: 0, endTime: nil)
+        }
+
+        if
+            let trimPreviewRange,
+            trimPreviewRange.track === currentTrack,
+            normalizedVideoID(track.youtubeVideoID)
+                == normalizedVideoID(trimPreviewRange.track.youtubeVideoID)
+        {
+            return trimPreviewRange.range
+        }
+
+        let authoritativeDuration = validDuration(track.duration)
+        let fullTrackRange = EffectivePlaybackRange(startTime: 0, endTime: authoritativeDuration)
+        guard let authoritativeDuration else {
+            return fullTrackRange
+        }
+
+        let startTime = track.playbackStartTime ?? 0
+        let endTime = track.playbackEndTime ?? authoritativeDuration
+        return validatedPlaybackRange(
+            startTime: startTime,
+            endTime: endTime,
+            authoritativeDuration: authoritativeDuration
+        ) ?? fullTrackRange
+    }
+
+    private func validatedPlaybackRange(
+        startTime: TimeInterval,
+        endTime: TimeInterval,
+        authoritativeDuration: TimeInterval?
+    ) -> EffectivePlaybackRange? {
+        guard
+            let authoritativeDuration = validDuration(authoritativeDuration),
+            startTime.isFinite,
+            endTime.isFinite,
+            startTime >= 0,
+            startTime < endTime,
+            endTime <= authoritativeDuration
+        else {
+            return nil
+        }
+
+        return EffectivePlaybackRange(startTime: startTime, endTime: endTime)
+    }
+
     private func validDuration(_ duration: TimeInterval?) -> TimeInterval? {
         guard let duration, duration.isFinite, duration > 0 else {
             return nil
@@ -2447,22 +2897,206 @@ final class PlaybackManager: ObservableObject {
         return duration
     }
 
-    private func applyAuthoritativeEndTime(
+    private func clampedPlaybackTime(
+        _ time: TimeInterval,
+        to playbackRange: EffectivePlaybackRange
+    ) -> TimeInterval {
+        var clampedTime = max(time, playbackRange.startTime)
+        if let endTime = playbackRange.endTime {
+            clampedTime = min(clampedTime, endTime)
+        }
+        return clampedTime
+    }
+
+    private func pendingTrimPreviewStartTime(
+        for track: Track?,
+        in playbackRange: EffectivePlaybackRange
+    ) -> TimeInterval {
+        guard
+            let track,
+            let pendingTrimPreviewStartTime,
+            pendingTrimPreviewStartTime.track === track
+        else {
+            return playbackRange.startTime
+        }
+
+        self.pendingTrimPreviewStartTime = nil
+        return clampedPlaybackTime(pendingTrimPreviewStartTime.time, to: playbackRange)
+    }
+
+    private func applyEffectiveEndTime(
         to item: AVPlayerItem,
-        trackDuration: TimeInterval?
+        playbackRange: EffectivePlaybackRange
     ) {
-        guard let authoritativeDuration = validDuration(trackDuration) else {
+        guard let endTime = playbackRange.endTime else {
             return
         }
 
         item.forwardPlaybackEndTime = CMTime(
-            seconds: authoritativeDuration,
+            seconds: endTime,
             preferredTimescale: 600
         )
     }
 
+    private func updateActivePlaybackRange(_ playbackRange: EffectivePlaybackRange) {
+        guard
+            let player,
+            let item = player.currentItem,
+            let requestID = activeRequestID
+        else {
+            return
+        }
+
+        applyEffectiveEndTime(to: item, playbackRange: playbackRange)
+        installPlaybackBoundaryObserver(
+            on: player,
+            item: item,
+            playbackRange: playbackRange,
+            requestID: requestID
+        )
+
+        if isTrimPreviewActive, let track = trimPreviewRange?.track {
+            let currentTime = currentPlaybackTime ?? trimPreviewTime ?? playbackRange.startTime
+            let clampedTime = clampedPlaybackTime(currentTime, to: playbackRange)
+            trimPreviewTime = clampedTime
+
+            if let endTime = playbackRange.endTime, currentTime > endTime {
+                pauseActiveTrimPreview()
+                seekTrimPreview(for: track, to: endTime)
+            } else if currentTime < playbackRange.startTime {
+                seekTrimPreview(for: track, to: playbackRange.startTime)
+            }
+        } else if let currentPlaybackTime {
+            let clampedTime = clampedPlaybackTime(currentPlaybackTime, to: playbackRange)
+            if abs(currentPlaybackTime - clampedTime) > 0.05 {
+                seek(to: clampedTime)
+            }
+        }
+
+#if os(iOS)
+        synchronizeNowPlayingPlaybackState()
+#endif
+    }
+
+    private func installPlaybackBoundaryObserver(
+        on player: AVPlayer,
+        item: AVPlayerItem,
+        playbackRange: EffectivePlaybackRange,
+        requestID: UUID
+    ) {
+        if let playbackBoundaryObserver {
+            player.removeTimeObserver(playbackBoundaryObserver)
+            self.playbackBoundaryObserver = nil
+        }
+
+        guard let effectiveEndTime = playbackRange.endTime else {
+            return
+        }
+
+        let managerReference = WeakReference(self)
+        let itemReference = WeakReference(item)
+        let boundaryTime = CMTime(seconds: effectiveEndTime, preferredTimescale: 600)
+        playbackBoundaryObserver = player.addBoundaryTimeObserver(
+            forTimes: [NSValue(time: boundaryTime)],
+            queue: .main
+        ) { [managerReference, itemReference] in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    let item = itemReference.value
+                else {
+                    return
+                }
+
+                self.handlePlaybackCompletion(for: item, requestID: requestID)
+            }
+        }
+    }
+
+    private func installTrimPreviewTimeObserver(
+        on player: AVPlayer,
+        playbackRange: EffectivePlaybackRange,
+        requestID: UUID
+    ) {
+        removeTrimPreviewTimeObserver()
+
+        let managerReference = WeakReference(self)
+        let playerReference = WeakReference(player)
+        let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+        let token = player.addPeriodicTimeObserver(
+            forInterval: interval,
+            queue: .main
+        ) { [managerReference, playerReference] time in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    let observedPlayer = playerReference.value,
+                    self.isTrimPreviewActive,
+                    self.isActive(requestID),
+                    self.player === observedPlayer,
+                    time.seconds.isFinite
+                else {
+                    return
+                }
+
+                let currentRange = self.trimPreviewRange?.range ?? playbackRange
+                self.trimPreviewTime = self.clampedPlaybackTime(
+                    time.seconds,
+                    to: currentRange
+                )
+            }
+        }
+
+        trimPreviewTimeObserver = (player, token)
+    }
+
+    private func removeTrimPreviewTimeObserver() {
+        guard let trimPreviewTimeObserver else {
+            return
+        }
+
+        trimPreviewTimeObserver.player.removeTimeObserver(trimPreviewTimeObserver.token)
+        self.trimPreviewTimeObserver = nil
+    }
+
+    private func pauseActiveTrimPreview(atEnd: Bool = false) {
+        guard isTrimPreviewActive else {
+            return
+        }
+
+        player?.pause()
+        if
+            atEnd,
+            let endTime = trimPreviewRange?.range.endTime
+        {
+            trimPreviewTime = endTime
+        } else if
+            let currentPlaybackTime,
+            let playbackRange = trimPreviewRange?.range
+        {
+            trimPreviewTime = clampedPlaybackTime(
+                currentPlaybackTime,
+                to: playbackRange
+            )
+        }
+        state = .paused
+    }
+
+    private func endActiveTrimPreviewIfNeeded() {
+        guard let track = trimPreviewRange?.track else {
+            return
+        }
+
+        endTrimPreview(for: track)
+    }
+
     private func handlePlaybackCompletion(for item: AVPlayerItem, requestID: UUID) {
         guard isActive(requestID), player?.currentItem === item else {
+            return
+        }
+
+        if isTrimPreviewActive {
+            pauseActiveTrimPreview(atEnd: true)
             return
         }
 
@@ -2641,6 +3275,7 @@ final class PlaybackManager: ObservableObject {
 
     private func reportPlaybackStartedIfNeeded(requestID: UUID, videoID: String) {
         guard
+            !isTrimPreviewActive,
             lastReportedPlaybackRequestID != requestID,
             let playbackOrigin
         else {
@@ -2662,7 +3297,10 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func recordTrackPlaybackStartIfNeeded(requestID: UUID) {
-        guard lastRecordedTrackPlaybackRequestID != requestID else {
+        guard
+            !isTrimPreviewActive,
+            lastRecordedTrackPlaybackRequestID != requestID
+        else {
             return
         }
 
@@ -2675,8 +3313,10 @@ final class PlaybackManager: ObservableObject {
         for player: AVPlayer,
         requestID: UUID
     ) {
-        guard activeListeningPeriod?.requestID != requestID,
-              let track = currentTrack
+        guard
+            !isTrimPreviewActive,
+            activeListeningPeriod?.requestID != requestID,
+            let track = currentTrack
         else {
             return
         }
@@ -2726,6 +3366,7 @@ final class PlaybackManager: ObservableObject {
 
     private func clearPlayer() {
         finishActiveListeningPeriod()
+        removeTrimPreviewTimeObserver()
 
         if let playbackEndObserver {
             NotificationCenter.default.removeObserver(playbackEndObserver)

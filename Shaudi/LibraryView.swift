@@ -809,6 +809,7 @@ struct TrackDetailView: View {
     private var libraryTracks: [Track]
 
     @State private var isShowingEdit = false
+    @State private var isShowingTrimEditor = false
 
     var body: some View {
         Form {
@@ -887,8 +888,20 @@ struct TrackDetailView: View {
         .tint(ShaudiTheme.accent)
         .navigationTitle(track.title)
         .toolbar {
-            Button("Edit") {
-                isShowingEdit = true
+            Menu {
+                Button {
+                    isShowingEdit = true
+                } label: {
+                    Label("Edit Track", systemImage: "pencil")
+                }
+
+                Button {
+                    isShowingTrimEditor = true
+                } label: {
+                    Label("Trim Song", systemImage: "scissors")
+                }
+            } label: {
+                Label("Track Actions", systemImage: "ellipsis.circle")
             }
         }
         .sheet(isPresented: $isShowingEdit) {
@@ -918,11 +931,16 @@ struct TrackDetailView: View {
                     track.thumbnailURL = metadata.thumbnailURL
                     track.duration = metadata.duration
                     track.metadataLastRefreshed = .now
+                    track.playbackStartTime = nil
+                    track.playbackEndTime = nil
                 }
 
                 track.title = request.title
                 return nil
             }
+        }
+        .sheet(isPresented: $isShowingTrimEditor) {
+            TrackTrimEditorView(track: track)
         }
     }
 
