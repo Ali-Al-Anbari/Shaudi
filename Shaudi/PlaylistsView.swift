@@ -175,6 +175,16 @@ struct PlaylistDetailView: View {
 
     private let warmupTrackLimit = 10
 
+    private struct PlaylistWarmupCandidate {
+        enum Source: String {
+            case statsPriority = "stats"
+            case playbackOrder = "playback-order"
+        }
+
+        let videoID: String
+        let source: Source
+    }
+
     private var tracks: [Track] {
         playlist.tracksInPlaybackOrder
     }
@@ -223,24 +233,79 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private func warmupVideoIDs(from orderedTracks: [Track]) -> [String] {
-        var seenVideoIDs: Set<String> = []
-        var videoIDs: [String] = []
+    private func playlistWarmupCandidates(
+        for playbackOrder: [Track],
+        maxCount: Int
+    ) -> [PlaylistWarmupCandidate] {
+        let indexedTracks = Array(playbackOrder.enumerated())
+        let tracksWithHistory = indexedTracks
+            .filter {
+                $0.element.playCount > 0
+                    || $0.element.totalListenedDuration > 0
+                    || $0.element.lastPlayedAt != nil
+            }
+            .sorted { lhs, rhs in
+                let leftIndex = lhs.offset
+                let leftTrack = lhs.element
+                let rightIndex = rhs.offset
+                let rightTrack = rhs.element
 
-        for track in orderedTracks {
+                if leftTrack.playCount != rightTrack.playCount {
+                    return leftTrack.playCount > rightTrack.playCount
+                }
+
+                if leftTrack.totalListenedDuration != rightTrack.totalListenedDuration {
+                    return leftTrack.totalListenedDuration > rightTrack.totalListenedDuration
+                }
+
+                switch (leftTrack.lastPlayedAt, rightTrack.lastPlayedAt) {
+                case let (leftDate?, rightDate?) where leftDate != rightDate:
+                    return leftDate > rightDate
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                default:
+                    break
+                }
+
+                return leftIndex < rightIndex
+            }
+
+        var seenVideoIDs: Set<String> = []
+        var candidates: [PlaylistWarmupCandidate] = []
+
+        func appendCandidate(_ track: Track, source: PlaylistWarmupCandidate.Source) {
+            guard candidates.count < maxCount else {
+                return
+            }
+
             let videoID = track.youtubeVideoID
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
-                continue
+                return
             }
 
-            videoIDs.append(videoID)
-            if videoIDs.count == warmupTrackLimit {
-                break
-            }
+            candidates.append(PlaylistWarmupCandidate(videoID: videoID, source: source))
         }
 
-        return videoIDs
+        for indexedTrack in tracksWithHistory {
+            appendCandidate(indexedTrack.element, source: .statsPriority)
+        }
+
+        for indexedTrack in indexedTracks {
+            appendCandidate(indexedTrack.element, source: .playbackOrder)
+        }
+
+        return candidates
+    }
+
+    private func logPlaylistWarmupCandidates(_ candidates: [PlaylistWarmupCandidate]) {
+#if DEBUG
+        let descriptions = candidates.map { "\($0.videoID):\($0.source.rawValue)" }
+            .joined(separator: ", ")
+        print("[PlaylistWarmup] selected=[\(descriptions)]")
+#endif
     }
 
     var body: some View {
@@ -570,8 +635,13 @@ struct PlaylistDetailView: View {
             tracks,
             playlistID: playlist.persistentModelID
         )
+        let candidates = playlistWarmupCandidates(
+            for: effectiveOrder,
+            maxCount: warmupTrackLimit
+        )
+        logPlaylistWarmupCandidates(candidates)
         playbackManager.warmPlaylist(
-            warmupVideoIDs(from: effectiveOrder),
+            candidates.map(\.videoID),
             playlistID: playlist.persistentModelID
         )
     }
