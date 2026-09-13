@@ -6,7 +6,6 @@ struct SettingsView: View {
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
     @State private var isShowingResetConfirmation = false
-    @State private var isShowingFinalResetConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -66,6 +65,8 @@ struct SettingsView: View {
                             Label("Listening Stats", systemImage: "chart.bar")
                                 .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
                                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                         }
                     }
 
@@ -87,27 +88,11 @@ struct SettingsView: View {
                 isPresented: $isShowingResetConfirmation,
                 titleVisibility: .visible
             ) {
-                Button("Continue", role: .destructive) {
-                    isShowingFinalResetConfirmation = true
-                }
-            } message: {
-                Text(
-                    "This resets your primary font, secondary font, primary color, "
-                        + "secondary color, and Library banner."
-                )
-            }
-            .confirmationDialog(
-                "Are you sure?",
-                isPresented: $isShowingFinalResetConfirmation,
-                titleVisibility: .visible
-            ) {
                 Button("Restore Defaults", role: .destructive) {
                     appearanceSettings.restoreDefaults()
-                    ArtworkStorage.resetBannerImage()
-                    appearanceSettings.bannerDidChange()
                 }
             } message: {
-                Text("Your appearance choices and Library banner will be restored to Shaudi defaults.")
+                Text("This resets your primary and secondary fonts and colors to their defaults.")
             }
         }
         .tint(appearanceSettings.primaryColor)
