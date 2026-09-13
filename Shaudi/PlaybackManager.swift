@@ -142,6 +142,13 @@ final class PlaybackManager: ObservableObject {
         var readyAt: TimeInterval?
     }
 
+    private struct ActiveListeningPeriod {
+        let requestID: UUID
+        let track: Track
+        let player: AVPlayer
+        let startedAt: TimeInterval
+    }
+
     @Published private(set) var currentTrack: Track?
     @Published private(set) var currentPlayableTrack: PlayableTrack?
     @Published private(set) var state: PlaybackState = .idle
@@ -172,6 +179,8 @@ final class PlaybackManager: ObservableObject {
     private var shuffledPlaylistOrder: [Track] = []
     private var activePreResolutionID: UUID?
     private var activeLookaheadID: UUID?
+    private var lastRecordedTrackPlaybackRequestID: UUID?
+    private var activeListeningPeriod: ActiveListeningPeriod?
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
     private var resolvedStreamCache: [String: URL] = [:]
@@ -908,6 +917,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
+        finishActiveListeningPeriod()
         player?.pause()
         state = .paused
 #if os(iOS)
@@ -2098,6 +2108,7 @@ final class PlaybackManager: ObservableObject {
 #endif
 
                 guard player.timeControlStatus == .playing else {
+                    self.finishActiveListeningPeriod()
                     return
                 }
 
@@ -2105,6 +2116,11 @@ final class PlaybackManager: ObservableObject {
                 self.reportPlaybackStartedIfNeeded(
                     requestID: requestID,
                     videoID: videoID
+                )
+                self.recordTrackPlaybackStartIfNeeded(requestID: requestID)
+                self.beginActiveListeningPeriod(
+                    for: player,
+                    requestID: requestID
                 )
                 self.recordPlaybackStarted(
                     videoID: videoID,
@@ -2645,6 +2661,57 @@ final class PlaybackManager: ObservableObject {
 #endif
     }
 
+    private func recordTrackPlaybackStartIfNeeded(requestID: UUID) {
+        guard lastRecordedTrackPlaybackRequestID != requestID else {
+            return
+        }
+
+        lastRecordedTrackPlaybackRequestID = requestID
+        currentTrack?.playCount += 1
+        currentTrack?.lastPlayedAt = .now
+    }
+
+    private func beginActiveListeningPeriod(
+        for player: AVPlayer,
+        requestID: UUID
+    ) {
+        guard activeListeningPeriod?.requestID != requestID,
+              let track = currentTrack
+        else {
+            return
+        }
+
+        finishActiveListeningPeriod()
+
+        let startedAt = player.currentTime().seconds
+        guard startedAt.isFinite, startedAt >= 0 else {
+            return
+        }
+
+        activeListeningPeriod = ActiveListeningPeriod(
+            requestID: requestID,
+            track: track,
+            player: player,
+            startedAt: startedAt
+        )
+    }
+
+    private func finishActiveListeningPeriod() {
+        guard let activeListeningPeriod else {
+            return
+        }
+
+        self.activeListeningPeriod = nil
+
+        let finishedAt = activeListeningPeriod.player.currentTime().seconds
+        guard finishedAt.isFinite, finishedAt >= activeListeningPeriod.startedAt else {
+            return
+        }
+
+        activeListeningPeriod.track.totalListenedDuration +=
+            finishedAt - activeListeningPeriod.startedAt
+    }
+
     private func activateAudioSession() throws {
         let audioSession = AVAudioSession.sharedInstance()
         try audioSession.setCategory(.playback)
@@ -2658,6 +2725,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func clearPlayer() {
+        finishActiveListeningPeriod()
+
         if let playbackEndObserver {
             NotificationCenter.default.removeObserver(playbackEndObserver)
             self.playbackEndObserver = nil

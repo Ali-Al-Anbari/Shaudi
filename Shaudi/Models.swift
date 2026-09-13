@@ -16,6 +16,9 @@ final class Track {
     var thumbnailURL: URL?
     var duration: TimeInterval?
     var metadataLastRefreshed: Date?
+    var playCount: Int = 0
+    var totalListenedDuration: TimeInterval = 0
+    var lastPlayedAt: Date? = nil
     var playlists: [Playlist]
 
     init(
@@ -27,6 +30,9 @@ final class Track {
         thumbnailURL: URL? = nil,
         duration: TimeInterval? = nil,
         metadataLastRefreshed: Date? = nil,
+        playCount: Int = 0,
+        totalListenedDuration: TimeInterval = 0,
+        lastPlayedAt: Date? = nil,
         playlists: [Playlist] = []
     ) {
         self.title = title
@@ -37,6 +43,9 @@ final class Track {
         self.thumbnailURL = thumbnailURL
         self.duration = duration
         self.metadataLastRefreshed = metadataLastRefreshed
+        self.playCount = playCount
+        self.totalListenedDuration = totalListenedDuration
+        self.lastPlayedAt = lastPlayedAt
         self.playlists = playlists
     }
 }
