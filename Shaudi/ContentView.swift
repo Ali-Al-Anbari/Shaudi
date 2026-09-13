@@ -12,6 +12,7 @@ private enum RootTab: Hashable {
     case library
     case search
     case playlists
+    case settings
 }
 
 private struct ShaudiGlassSurface<SurfaceShape: Shape>: ViewModifier {
@@ -66,6 +67,7 @@ private extension View {
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var playbackManager: PlaybackManager
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
     @State private var selectedTab: RootTab = .library
     @State private var isShowingNowPlaying = false
 
@@ -80,6 +82,9 @@ struct ContentView: View {
 
                 PlaylistsView()
                     .tag(RootTab.playlists)
+
+                SettingsView()
+                    .tag(RootTab.settings)
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -99,7 +104,7 @@ struct ContentView: View {
         .sheet(isPresented: $isShowingNowPlaying) {
             NowPlayingView(playbackManager: playbackManager)
         }
-        .tint(ShaudiTheme.accent)
+        .tint(appearanceSettings.primaryColor)
         .onChange(of: playbackManager.playbackStartEvent) { _, event in
             recordRecentlyPlayedPlaylist(for: event)
         }
@@ -139,12 +144,14 @@ struct ContentView: View {
 
 private struct RootTabBar: View {
     @Binding var selectedTab: RootTab
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
     var body: some View {
         HStack(spacing: 4) {
             tabButton(.library, title: "Library", systemImage: "music.note.house")
             tabButton(.search, title: "Search", systemImage: "magnifyingglass")
             tabButton(.playlists, title: "Playlists", systemImage: "music.note.list")
+            tabButton(.settings, title: "Settings", systemImage: "gearshape.fill")
         }
         .padding(6)
         .shaudiGlassSurface(in: Capsule())
@@ -175,7 +182,7 @@ private struct RootTabBar: View {
                     Color.clear
                         .shaudiGlassSurface(
                             in: Capsule(),
-                            tint: ShaudiTheme.accent,
+                            tint: appearanceSettings.primaryColor,
                             isInteractive: true
                         )
                 }

@@ -253,6 +253,7 @@ private final class SearchViewModel: ObservableObject {
 struct SearchView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var playbackManager: PlaybackManager
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var libraryTracks: [Track]
@@ -308,7 +309,7 @@ struct SearchView: View {
             .background(ShaudiTheme.canvas)
             .navigationBarTitleDisplayMode(.inline)
         }
-        .tint(ShaudiTheme.accent)
+        .tint(appearanceSettings.primaryColor)
         .sheet(isPresented: $isShowingManualTrackAdd) {
             ManualTrackAdditionView()
         }
@@ -442,12 +443,12 @@ struct SearchView: View {
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(result.title)
-                            .font(.headline)
+                            .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .headline))
                             .foregroundStyle(.primary)
                             .lineLimit(2)
 
                         Text(result.channelTitle)
-                            .font(.subheadline)
+                            .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
 

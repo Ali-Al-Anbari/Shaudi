@@ -3,9 +3,10 @@ import SwiftUI
 import UIKit
 #endif
 
+@MainActor
 enum ShaudiTheme {
-    static let accent = Color(red: 0.62, green: 0.34, blue: 0.48)
-    static let lavender = Color(red: 0.58, green: 0.51, blue: 0.72)
+    static var accent: Color { AppearanceSettings.shared.primaryColor }
+    static var lavender: Color { AppearanceSettings.shared.secondaryColor }
     static let canvas = Color(uiColor: .systemGroupedBackground)
     static let card = Color(uiColor: .secondarySystemGroupedBackground)
     static let dashboardBackground = Color(red: 0.035, green: 0.028, blue: 0.045)
@@ -16,8 +17,9 @@ enum ShaudiTheme {
 
     static func scriptFont(size: CGFloat, relativeTo textStyle: Font.TextStyle = .title) -> Font {
 #if os(iOS)
-        if UIFont(name: "SnellRoundhand", size: size) != nil {
-            return .custom("SnellRoundhand", size: size, relativeTo: textStyle)
+        let fontName = AppearanceSettings.shared.primaryFont.fontName
+        if UIFont(name: fontName, size: size) != nil {
+            return .custom(fontName, size: size, relativeTo: textStyle)
         }
 #endif
         return .system(size: size, weight: .semibold, design: .rounded)
@@ -25,8 +27,9 @@ enum ShaudiTheme {
 
     static func bodyFont(size: CGFloat, relativeTo textStyle: Font.TextStyle = .body) -> Font {
 #if os(iOS)
-        if UIFont(name: "Times New Roman", size: size) != nil {
-            return .custom("Times New Roman", size: size, relativeTo: textStyle)
+        let fontName = AppearanceSettings.shared.secondaryFont.fontName
+        if UIFont(name: fontName, size: size) != nil {
+            return .custom(fontName, size: size, relativeTo: textStyle)
         }
 #endif
         return .system(size: size, design: .serif)

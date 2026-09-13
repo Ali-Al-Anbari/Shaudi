@@ -21,6 +21,40 @@ enum ArtworkStorage {
         try save(image, filename: bannerFilename)
     }
 
+    static func resetBannerImage() {
+        let url = directoryURL.appendingPathComponent(bannerFilename)
+        try? FileManager.default.removeItem(at: url)
+        clearLegacyBannerStorage()
+    }
+
+    static func migratedLegacyBannerImage() -> UIImage? {
+        let defaults = UserDefaults.standard
+        guard
+            let imageData = defaults.string(forKey: "shaudi.library.heroImage"),
+            let data = Data(base64Encoded: imageData),
+            let image = UIImage(data: data)
+        else {
+            return nil
+        }
+
+        return migratedBannerImage(
+            image,
+            scale: defaults.double(forKey: "shaudi.library.heroScale"),
+            normalizedOffset: CGSize(
+                width: defaults.double(forKey: "shaudi.library.heroOffsetX"),
+                height: defaults.double(forKey: "shaudi.library.heroOffsetY")
+            )
+        )
+    }
+
+    static func clearLegacyBannerStorage() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: "shaudi.library.heroImage")
+        defaults.removeObject(forKey: "shaudi.library.heroOffsetX")
+        defaults.removeObject(forKey: "shaudi.library.heroOffsetY")
+        defaults.removeObject(forKey: "shaudi.library.heroScale")
+    }
+
     static func migratedBannerImage(
         _ image: UIImage,
         scale: CGFloat,

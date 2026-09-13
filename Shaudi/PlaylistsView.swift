@@ -10,6 +10,7 @@ import UIKit
 
 struct PlaylistsView: View {
     @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
@@ -29,6 +30,7 @@ struct PlaylistsView: View {
                 }
             }
         }
+        .tint(appearanceSettings.primaryColor)
     }
 
     private var playlistList: some View {
@@ -83,7 +85,7 @@ struct PlaylistsView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             Text(playlist.name)
-                .font(.headline)
+                .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .headline))
                 .foregroundStyle(.primary)
 
             Spacer(minLength: 4)

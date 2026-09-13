@@ -4,7 +4,6 @@
 //
 
 import SwiftData
-import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -18,6 +17,7 @@ struct LibraryView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var playbackManager: PlaybackManager
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var tracks: [Track]
@@ -25,19 +25,10 @@ struct LibraryView: View {
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
-    @State private var isShowingPhotoPicker = false
-    @State private var selectedPhoto: PhotosPickerItem?
-    @State private var editingHeroImage: UIImage?
-    @State private var isShowingCropEditor = false
     @State private var heroImage: UIImage?
     @State private var selectedPlaylistPage = 0
     @State private var dashboardContentWidth: CGFloat = 360
     @State private var isLibraryVisible = false
-    @AppStorage("shaudi.library.heroImage") private var legacyHeroImageData = ""
-    @AppStorage("shaudi.library.heroOffsetX") private var legacyHeroOffsetX = 0.0
-    @AppStorage("shaudi.library.heroOffsetY") private var legacyHeroOffsetY = 0.0
-    @AppStorage("shaudi.library.heroScale") private var legacyHeroScale = 1.0
-
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
     private let playlistPageSize = 6
     private let playlistColumnSpacing: CGFloat = 12
@@ -133,27 +124,14 @@ struct LibraryView: View {
             dashboard
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .photosPicker(isPresented: $isShowingPhotoPicker, selection: $selectedPhoto, matching: .images)
-            .onChange(of: selectedPhoto) { _, photo in
-                prepareSelectedBannerPhoto(photo)
-            }
-            .sheet(isPresented: $isShowingCropEditor) {
-                if let editingHeroImage {
-                    ImageCropEditor(
-                        image: editingHeroImage,
-                        title: "Adjust Banner",
-                        cropAspectRatio: ArtworkStorage.bannerAspectRatio,
-                        outputSize: ArtworkStorage.bannerOutputSize,
-                        cornerRadius: 18
-                    ) { croppedImage in
-                        saveBannerImage(croppedImage)
-                    }
-                }
-            }
             .onAppear {
                 loadBannerImage()
             }
+            .onChange(of: appearanceSettings.bannerRevision) {
+                loadBannerImage()
+            }
         }
+        .tint(appearanceSettings.primaryColor)
     }
 
     private var dashboard: some View {
@@ -200,36 +178,30 @@ struct LibraryView: View {
     }
 
     private var heroBanner: some View {
-        Button {
-            isShowingPhotoPicker = true
-        } label: {
-            GeometryReader { geometry in
-                ZStack {
-                    if let heroImage {
-                        Image(uiImage: heroImage)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: geometry.size.width, height: geometry.size.height)
-                            .clipped()
-                    } else {
-                        LinearGradient(colors: [ShaudiTheme.lavender.opacity(0.8), ShaudiTheme.accent.opacity(0.85)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        Image(systemName: "photo.badge.plus")
-                            .font(.system(size: 34, weight: .light))
-                            .foregroundStyle(.white.opacity(0.82))
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
+        GeometryReader { geometry in
+            ZStack {
+                if let heroImage {
+                    Image(uiImage: heroImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                        .clipped()
+                } else {
+                    LinearGradient(colors: [ShaudiTheme.lavender.opacity(0.8), ShaudiTheme.accent.opacity(0.85)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    Image(systemName: "photo.badge.plus")
+                        .font(.system(size: 34, weight: .light))
+                        .foregroundStyle(.white.opacity(0.82))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .clipped()
             }
-            .frame(maxWidth: .infinity)
-            .frame(height: 148)
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 12, y: 6)
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .clipped()
         }
-        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .frame(height: 148)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 12, y: 6)
         .accessibilityLabel("Library poster")
-        .accessibilityHint("Choose and crop a photo")
     }
 
     private var playlistPager: some View {
@@ -374,75 +346,27 @@ struct LibraryView: View {
         .background(ShaudiTheme.dashboardPlaceholder, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private func prepareSelectedBannerPhoto(_ selectedPhoto: PhotosPickerItem?) {
-        guard let selectedPhoto else {
-            return
-        }
-
-        Task { @MainActor in
-            defer { self.selectedPhoto = nil }
-            guard
-                let data = try? await selectedPhoto.loadTransferable(type: Data.self),
-                let image = UIImage(data: data)
-            else {
-                return
-            }
-
-            editingHeroImage = image
-            isShowingCropEditor = true
-        }
-    }
-
     private func loadBannerImage() {
         if let storedImage = ArtworkStorage.bannerImage() {
             heroImage = storedImage
             return
         }
 
-        guard
-            let data = Data(base64Encoded: legacyHeroImageData),
-            let legacyImage = UIImage(data: data)
-        else {
+        guard let legacyImage = ArtworkStorage.migratedLegacyBannerImage() else {
+            heroImage = nil
             return
         }
 
-        let migratedImage = ArtworkStorage.migratedBannerImage(
-            legacyImage,
-            scale: legacyHeroScale,
-            normalizedOffset: CGSize(
-                width: legacyHeroOffsetX,
-                height: legacyHeroOffsetY
-            )
-        )
         do {
-            try ArtworkStorage.saveBannerImage(migratedImage)
-            heroImage = migratedImage
-            clearLegacyBannerStorage()
+            try ArtworkStorage.saveBannerImage(legacyImage)
+            heroImage = legacyImage
+            ArtworkStorage.clearLegacyBannerStorage()
         } catch {
 #if DEBUG
             print("[Artwork] Banner migration failed: \(error.localizedDescription)")
 #endif
             heroImage = legacyImage
         }
-    }
-
-    private func saveBannerImage(_ image: UIImage) {
-        do {
-            try ArtworkStorage.saveBannerImage(image)
-            heroImage = image
-            clearLegacyBannerStorage()
-        } catch {
-#if DEBUG
-            print("[Artwork] Banner save failed: \(error.localizedDescription)")
-#endif
-        }
-    }
-
-    private func clearLegacyBannerStorage() {
-        legacyHeroImageData = ""
-        legacyHeroOffsetX = 0
-        legacyHeroOffsetY = 0
-        legacyHeroScale = 1
     }
 
     private var libraryList: some View {
