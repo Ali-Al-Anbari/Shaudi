@@ -8,52 +8,101 @@
 import SwiftUI
 import SwiftData
 
+private enum RootTab: Hashable {
+    case library
+    case search
+    case playlists
+}
+
+private struct ShaudiGlassSurface<SurfaceShape: Shape>: ViewModifier {
+    let shape: SurfaceShape
+    let tint: Color?
+    let isInteractive: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            if let tint {
+                content.glassEffect(
+                    isInteractive
+                        ? .regular.tint(tint).interactive()
+                        : .regular.tint(tint),
+                    in: shape
+                )
+            } else {
+                content.glassEffect(
+                    isInteractive ? .regular.interactive() : .regular,
+                    in: shape
+                )
+            }
+        } else {
+            content
+                .background(.ultraThinMaterial, in: shape)
+                .background((tint ?? .clear).opacity(0.12), in: shape)
+                .overlay {
+                    shape.stroke(.white.opacity(0.24), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.16), radius: 12, y: 5)
+        }
+    }
+}
+
+private extension View {
+    func shaudiGlassSurface<SurfaceShape: Shape>(
+        in shape: SurfaceShape,
+        tint: Color? = nil,
+        isInteractive: Bool = false
+    ) -> some View {
+        modifier(
+            ShaudiGlassSurface(
+                shape: shape,
+                tint: tint,
+                isInteractive: isInteractive
+            )
+        )
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var playbackManager: PlaybackManager
+    @State private var selectedTab: RootTab = .library
     @State private var isShowingNowPlaying = false
 
     var body: some View {
-        TabView {
-            tabContent(LibraryView())
-            .tabItem {
-                Label("Library", systemImage: "music.note.house")
+        VStack(spacing: 0) {
+            TabView(selection: $selectedTab) {
+                LibraryView()
+                    .tag(RootTab.library)
+
+                SearchView()
+                    .tag(RootTab.search)
+
+                PlaylistsView()
+                    .tag(RootTab.playlists)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if playbackManager.currentPlayableTrack != nil {
+                MiniPlayerView(
+                    playbackManager: playbackManager,
+                    onOpen: { isShowingNowPlaying = true }
+                )
+                .padding(.horizontal, 8)
+                .padding(.top, 6)
+                .padding(.bottom, 6)
             }
 
-            tabContent(SearchView())
-            .tabItem {
-                Label("Search", systemImage: "magnifyingglass")
-            }
-
-            tabContent(PlaylistsView())
-            .tabItem {
-                Label("Playlists", systemImage: "music.note.list")
-            }
+            RootTabBar(selectedTab: $selectedTab)
         }
         .sheet(isPresented: $isShowingNowPlaying) {
             NowPlayingView(playbackManager: playbackManager)
         }
         .tint(ShaudiTheme.accent)
-        .toolbarBackground(.visible, for: .tabBar)
-        .toolbarBackground(ShaudiTheme.card, for: .tabBar)
         .onChange(of: playbackManager.playbackStartEvent) { _, event in
             recordRecentlyPlayedPlaylist(for: event)
         }
-    }
-
-    private func tabContent<Content: View>(_ content: Content) -> some View {
-        content
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                if playbackManager.currentPlayableTrack != nil {
-                    MiniPlayerView(
-                        playbackManager: playbackManager,
-                        onOpen: { isShowingNowPlaying = true }
-                    )
-                    .padding(.horizontal, 8)
-                    .padding(.top, 6)
-                    .padding(.bottom, 8)
-                }
-            }
     }
 
     private func recordRecentlyPlayedPlaylist(
@@ -88,6 +137,60 @@ struct ContentView: View {
     }
 }
 
+private struct RootTabBar: View {
+    @Binding var selectedTab: RootTab
+
+    var body: some View {
+        HStack(spacing: 4) {
+            tabButton(.library, title: "Library", systemImage: "music.note.house")
+            tabButton(.search, title: "Search", systemImage: "magnifyingglass")
+            tabButton(.playlists, title: "Playlists", systemImage: "music.note.list")
+        }
+        .padding(6)
+        .shaudiGlassSurface(in: Capsule())
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .safeAreaPadding(.bottom, 8)
+    }
+
+    private func tabButton(
+        _ tab: RootTab,
+        title: String,
+        systemImage: String
+    ) -> some View {
+        Button {
+            selectedTab = tab
+        } label: {
+            VStack(spacing: 3) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 17, weight: .semibold))
+
+                Text(title)
+                    .font(.caption2.weight(.medium))
+            }
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
+            .background {
+                if selectedTab == tab {
+                    Color.clear
+                        .shaudiGlassSurface(
+                            in: Capsule(),
+                            tint: ShaudiTheme.accent,
+                            isInteractive: true
+                        )
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(
+            selectedTab == tab
+                ? Color.black
+                : Color.white.opacity(0.72)
+        )
+        .accessibilityAddTraits(selectedTab == tab ? .isSelected : [])
+    }
+}
+
 private struct MiniPlayerView: View {
     @ObservedObject var playbackManager: PlaybackManager
     let onOpen: () -> Void
@@ -109,7 +212,7 @@ private struct MiniPlayerView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(playbackManager.currentPlayableTrack?.title ?? "")
                             .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.primary)
                             .lineLimit(1)
 
                         if let channelTitle = playbackManager.currentPlayableTrack?.channelTitle,
@@ -117,7 +220,7 @@ private struct MiniPlayerView: View {
                         {
                             Text(channelTitle)
                                 .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
-                                .foregroundStyle(.white.opacity(0.68))
+                                .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
                     }
@@ -163,9 +266,8 @@ private struct MiniPlayerView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(
-            ShaudiTheme.dashboardCard,
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        .shaudiGlassSurface(
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
         )
     }
 
