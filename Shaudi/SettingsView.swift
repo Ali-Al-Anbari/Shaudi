@@ -59,16 +59,14 @@ struct SettingsView: View {
                         )
                     }
 
-                    settingsSection("Coming Soon") {
-                        HStack {
+                    settingsSection("Your Library") {
+                        NavigationLink {
+                            ListeningStatsView()
+                        } label: {
                             Label("Listening Stats", systemImage: "chart.bar")
-                            Spacer()
-                            Text("Coming soon")
-                                .foregroundStyle(.secondary)
+                                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
+                                .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                         }
-                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
-                        .opacity(0.65)
-                        .accessibilityHint("Listening Stats will be available in a future update")
                     }
 
                     Button("Restore Default Appearance", role: .destructive) {
