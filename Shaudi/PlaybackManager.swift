@@ -218,6 +218,7 @@ final class PlaybackManager: ObservableObject {
         in orderedQueue: [Track],
         origin: PlaybackOrigin
     ) {
+        let previousPlaylistID = playlistID(from: playbackOrigin)
         pauseSpeculativeWarmupsForPlayback(
             requestedVideoID: normalizedVideoID(track.youtubeVideoID)
         )
@@ -255,6 +256,23 @@ final class PlaybackManager: ObservableObject {
             } else {
                 queue = [track]
                 currentIndex = queue.startIndex
+            }
+
+            let newPlaylistVideoIDs = Set(queue.compactMap { track in
+                let videoID = normalizedVideoID(track.youtubeVideoID)
+                return videoID.isEmpty ? nil : videoID
+            })
+
+            if
+                let previousPlaylistID,
+                case let .playlist(newPlaylistID) = origin,
+                previousPlaylistID != newPlaylistID
+            {
+                evictObsoleteSpeculativeEntries(
+                    from: previousPlaylistID,
+                    for: newPlaylistID,
+                    retaining: newPlaylistVideoIDs
+                )
             }
         } else {
             playlistQueueInNormalOrder = []
@@ -1253,6 +1271,60 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
+    private func evictObsoleteSpeculativeEntries(
+        from previousPlaylistID: PersistentIdentifier,
+        for newPlaylistID: PersistentIdentifier,
+        retaining newPlaylistVideoIDs: Set<String>
+    ) {
+        let consideredVideoIDs = playlistSpeculativeStreamIDs
+        let promotedVideoIDs = consideredVideoIDs.intersection(nonSpeculativeStreamIDs)
+        let activePlaybackVideoIDs = Set(
+            consideredVideoIDs.filter(isNeededByActivePlayback)
+        )
+        let newPlaylistProtectedVideoIDs = consideredVideoIDs
+            .intersection(newPlaylistVideoIDs)
+        let protectedVideoIDs = promotedVideoIDs
+            .union(activePlaybackVideoIDs)
+            .union(newPlaylistProtectedVideoIDs)
+        let obsoleteVideoIDs = consideredVideoIDs.subtracting(protectedVideoIDs)
+
+        playlistLog(
+            "switch previous=\(previousPlaylistID) new=\(newPlaylistID) "
+                + "considered=\(consideredVideoIDs.sorted())"
+        )
+
+        if !protectedVideoIDs.isEmpty {
+            playlistLog(
+                "switch protected promoted=\(promotedVideoIDs.sorted()) "
+                    + "active=\(activePlaybackVideoIDs.sorted()) "
+                    + "new=\(newPlaylistProtectedVideoIDs.sorted())"
+            )
+        }
+
+        var cancelledResolutionVideoIDs: [String] = []
+        var evictedCachedVideoIDs: [String] = []
+
+        for videoID in obsoleteVideoIDs {
+            if let resolution = inFlightResolutions[videoID] {
+                resolution.task.cancel()
+                cancelledResolutionVideoIDs.append(videoID)
+            }
+
+            if resolvedStreamCache[videoID] != nil {
+                evictedCachedVideoIDs.append(videoID)
+            }
+
+            removeCachedStream(for: videoID)
+        }
+
+        if !evictedCachedVideoIDs.isEmpty || !cancelledResolutionVideoIDs.isEmpty {
+            playlistLog(
+                "switch evicted=\(evictedCachedVideoIDs.sorted()) "
+                    + "cancelled=\(cancelledResolutionVideoIDs.sorted())"
+            )
+        }
+    }
+
     private func isNeededByActivePlayback(_ videoID: String) -> Bool {
         if normalizedVideoID(currentPlayableTrack?.youtubeVideoID ?? "") == videoID {
             return true
@@ -1295,6 +1367,14 @@ final class PlaybackManager: ObservableObject {
 
     private func normalizedVideoID(_ videoID: String) -> String {
         videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func playlistID(from origin: PlaybackOrigin?) -> PersistentIdentifier? {
+        guard case let .playlist(playlistID) = origin else {
+            return nil
+        }
+
+        return playlistID
     }
 
     private func resolutionTask(
