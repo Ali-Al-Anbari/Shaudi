@@ -13,6 +13,7 @@ final class Track {
     var youtubeVideoID: String
     var dateAdded: Date
     var channelTitle: String?
+    var userArtistOverride: String? = nil
     var thumbnailURL: URL?
     var duration: TimeInterval?
     var metadataLastRefreshed: Date?
@@ -30,6 +31,7 @@ final class Track {
         youtubeVideoID: String,
         dateAdded: Date = .now,
         channelTitle: String? = nil,
+        userArtistOverride: String? = nil,
         thumbnailURL: URL? = nil,
         duration: TimeInterval? = nil,
         metadataLastRefreshed: Date? = nil,
@@ -46,6 +48,7 @@ final class Track {
         self.youtubeVideoID = youtubeVideoID
         self.dateAdded = dateAdded
         self.channelTitle = channelTitle
+        self.userArtistOverride = userArtistOverride
         self.thumbnailURL = thumbnailURL
         self.duration = duration
         self.metadataLastRefreshed = metadataLastRefreshed
@@ -56,6 +59,13 @@ final class Track {
         self.playbackEndTime = playbackEndTime
         self.customCoverID = customCoverID
         self.playlists = playlists
+    }
+}
+
+extension Track {
+    var displayArtist: String? {
+        let override = userArtistOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return override?.isEmpty == false ? override : channelTitle
     }
 }
 

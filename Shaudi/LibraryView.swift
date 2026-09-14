@@ -6,6 +6,7 @@
 import SwiftData
 import SwiftUI
 import UIKit
+import PhotosUI
 
 struct LibraryView: View {
     private struct PlaylistPageSlot: Identifiable {
@@ -33,6 +34,8 @@ struct LibraryView: View {
     @State private var selectedTrackIDs: Set<PersistentIdentifier> = []
     @State private var isShowingDeleteConfirmation = false
     @State private var infoTrack: Track?
+    @State private var editingTrack: Track?
+    @State private var trimmingTrack: Track?
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
     private let playlistPageSize = 6
     private let playlistColumnSpacing: CGFloat = 12
@@ -150,6 +153,8 @@ struct LibraryView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 heroBanner
+                    .scaleEffect(1.05)
+                    .padding(.vertical, 8)
                 sectionHeader("Library")
                 playlistPager
                 collectionHeader
@@ -206,6 +211,22 @@ struct LibraryView: View {
                     queue: tracks,
                     playbackOrigin: .library
                 )
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { editingTrack != nil },
+            set: { if !$0 { editingTrack = nil } }
+        )) {
+            if let editingTrack {
+                SongEditorView(track: editingTrack)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { trimmingTrack != nil },
+            set: { if !$0 { trimmingTrack = nil } }
+        )) {
+            if let trimmingTrack {
+                TrackTrimEditorView(track: trimmingTrack)
             }
         }
         .alert(
@@ -361,6 +382,12 @@ struct LibraryView: View {
             showInfo: {
                 infoTrack = track
             },
+            trim: {
+                trimmingTrack = track
+            },
+            edit: {
+                editingTrack = track
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -512,6 +539,8 @@ private struct CollectionView: View {
     @State private var selectedTrackIDs: Set<PersistentIdentifier> = []
     @State private var isShowingDeleteConfirmation = false
     @State private var infoTrack: Track?
+    @State private var editingTrack: Track?
+    @State private var trimmingTrack: Track?
     @State private var searchText = ""
     @State private var sortOption: SortOption = .mostPlayed
     @State private var filterOption: FilterOption = .allSongs
@@ -570,6 +599,22 @@ private struct CollectionView: View {
                     queue: tracks,
                     playbackOrigin: .library
                 )
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { editingTrack != nil },
+            set: { if !$0 { editingTrack = nil } }
+        )) {
+            if let editingTrack {
+                SongEditorView(track: editingTrack)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { trimmingTrack != nil },
+            set: { if !$0 { trimmingTrack = nil } }
+        )) {
+            if let trimmingTrack {
+                TrackTrimEditorView(track: trimmingTrack)
             }
         }
         .alert(
@@ -702,6 +747,12 @@ private struct CollectionView: View {
             showInfo: {
                 infoTrack = track
             },
+            trim: {
+                trimmingTrack = track
+            },
+            edit: {
+                editingTrack = track
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -763,7 +814,7 @@ private struct CollectionView: View {
         return track.title.range(
             of: query,
             options: [.caseInsensitive, .diacriticInsensitive]
-        ) != nil || track.channelTitle?.range(
+        ) != nil || track.displayArtist?.range(
             of: query,
             options: [.caseInsensitive, .diacriticInsensitive]
         ) != nil
@@ -833,6 +884,8 @@ private struct LibraryTrackRow: View {
     let play: () -> Void
     let toggleSelection: () -> Void
     let showInfo: () -> Void
+    let trim: () -> Void
+    let edit: () -> Void
     let delete: () -> Void
 
     var body: some View {
@@ -857,8 +910,8 @@ private struct LibraryTrackRow: View {
                             .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                             .lineLimit(2)
 
-                        if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
-                            Text(channelTitle)
+                        if let artist = track.displayArtist, !artist.isEmpty {
+                            Text(artist)
                                 .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
                                 .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
                                 .lineLimit(1)
@@ -884,6 +937,14 @@ private struct LibraryTrackRow: View {
                         showInfo()
                     } label: {
                         Label("Show Info", systemImage: "info.circle")
+                    }
+
+                    Button(action: trim) {
+                        Label("Trim Song", systemImage: "scissors")
+                    }
+
+                    Button(action: edit) {
+                        Label("Edit Song", systemImage: "pencil")
                     }
 
                     Button(role: .destructive) {
@@ -1270,6 +1331,137 @@ struct TrackEditorView: View {
     }
 }
 
+struct SongEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let track: Track
+
+    @State private var title: String
+    @State private var artist: String
+    @State private var selectedCover: PhotosPickerItem?
+    @State private var pendingCoverData: Data?
+    @State private var shouldRemoveCustomCover = false
+    @State private var errorMessage: String?
+
+    init(track: Track) {
+        self.track = track
+        _title = State(initialValue: track.title)
+        _artist = State(initialValue: track.displayArtist ?? "")
+    }
+
+    private var trimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var trimmedArtist: String {
+        artist.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Song") {
+                    TextField("Title", text: $title)
+                    TextField("Artist", text: $artist)
+                }
+
+                Section("Cover") {
+                    PhotosPicker(selection: $selectedCover, matching: .images) {
+                        Label("Choose Custom Cover", systemImage: "photo.on.rectangle")
+                    }
+
+                    if pendingCoverData != nil {
+                        Label("New custom cover selected", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(ShaudiTheme.accent)
+                    } else if shouldRemoveCustomCover {
+                        Text("Custom cover will be removed when saved.")
+                            .foregroundStyle(.secondary)
+                    } else if track.customCoverID != nil {
+                        Button(role: .destructive) {
+                            shouldRemoveCustomCover = true
+                        } label: {
+                            Label("Remove Custom Cover", systemImage: "trash")
+                        }
+                    } else {
+                        Text("Using the YouTube artwork or Shaudi fallback.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
+            .tint(ShaudiTheme.accent)
+            .navigationTitle("Edit Song")
+            .navigationBarTitleDisplayMode(.inline)
+            .onChange(of: selectedCover) { _, selection in
+                loadSelectedCover(selection)
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save()
+                    }
+                    .disabled(trimmedTitle.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func loadSelectedCover(_ selection: PhotosPickerItem?) {
+        guard let selection else {
+            return
+        }
+
+        Task { @MainActor in
+            defer { selectedCover = nil }
+            guard let data = try? await selection.loadTransferable(type: Data.self) else {
+                errorMessage = "Could not load the selected cover."
+                return
+            }
+
+            pendingCoverData = data
+            shouldRemoveCustomCover = false
+            errorMessage = nil
+        }
+    }
+
+    private func save() {
+        guard !trimmedTitle.isEmpty else {
+            return
+        }
+
+        do {
+            if shouldRemoveCustomCover, let coverID = track.customCoverID {
+                ArtworkStorage.deleteTrackCover(for: coverID)
+                track.customCoverID = nil
+            } else if let pendingCoverData {
+                let coverID = track.customCoverID ?? UUID()
+                try ArtworkStorage.saveTrackCover(data: pendingCoverData, for: coverID)
+                track.customCoverID = coverID
+            }
+
+            track.title = trimmedTitle
+            track.userArtistOverride = trimmedArtist.isEmpty ? nil : trimmedArtist
+            dismiss()
+        } catch {
+            errorMessage = "Could not save the custom cover."
+        }
+    }
+}
+
 private struct YouTubeMetadataView: View {
     let title: String
     let channelTitle: String?
@@ -1300,7 +1492,7 @@ private struct YouTubeMetadataView: View {
         LabeledContent("Title", value: title)
 
         if let channelTitle {
-            LabeledContent("Channel", value: channelTitle)
+            LabeledContent("Artist", value: channelTitle)
         }
 
         if let duration {
@@ -1327,11 +1519,11 @@ struct TrackDetailView: View {
 
     var body: some View {
         Form {
-            if track.thumbnailURL != nil || track.channelTitle != nil || track.duration != nil {
+            if track.thumbnailURL != nil || track.displayArtist != nil || track.duration != nil {
                 Section("YouTube Metadata") {
                     YouTubeMetadataView(
                         title: track.title,
-                        channelTitle: track.channelTitle,
+                        channelTitle: track.displayArtist,
                         thumbnailURL: track.thumbnailURL,
                         duration: track.duration
                     )

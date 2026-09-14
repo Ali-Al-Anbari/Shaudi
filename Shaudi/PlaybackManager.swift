@@ -62,7 +62,7 @@ struct PlayableTrack: Identifiable, Hashable {
         self.init(
             youtubeVideoID: track.youtubeVideoID,
             title: track.title,
-            channelTitle: track.channelTitle,
+            channelTitle: track.displayArtist,
             thumbnailURL: track.thumbnailURL,
             duration: track.duration,
             playbackStartTime: track.playbackStartTime,
@@ -247,6 +247,31 @@ final class PlaybackManager: ObservableObject {
         return nextQueueIndex(after: currentIndex) != nil
     }
 
+    // Read-only queue neighbors for transient Now Playing previews. These use the
+    // same repeat-aware indexing as the actual transport actions and never mutate
+    // playback state.
+    var previousQueueTrack: Track? {
+        guard
+            let currentIndex,
+            let previousIndex = previousQueueIndex(before: currentIndex)
+        else {
+            return nil
+        }
+
+        return queue[previousIndex]
+    }
+
+    var nextQueueTrack: Track? {
+        guard
+            let currentIndex,
+            let nextIndex = nextQueueIndex(after: currentIndex)
+        else {
+            return nil
+        }
+
+        return queue[nextIndex]
+    }
+
     func play(
         _ track: Track,
         in orderedQueue: [Track],
@@ -329,6 +354,42 @@ final class PlaybackManager: ObservableObject {
 
     func play(_ track: Track) {
         play(track, in: [track], origin: .library)
+    }
+
+    func restartPlaylist(
+        _ orderedQueue: [Track],
+        playlistID: PersistentIdentifier
+    ) {
+        guard let firstPlayableTrack = orderedQueue.first(where: {
+            !normalizedVideoID($0.youtubeVideoID).isEmpty
+        }) else {
+            return
+        }
+
+        let normalOrder = uniquePlaylistQueue(
+            orderedQueue,
+            prioritizing: firstPlayableTrack
+        )
+
+        if isShuffleEnabled {
+            let freshShuffledOrder = normalOrder.shuffled()
+            guard let firstShuffledPlayableTrack = freshShuffledOrder.first(where: {
+                !normalizedVideoID($0.youtubeVideoID).isEmpty
+            }) else {
+                return
+            }
+
+            shuffledPlaylistID = playlistID
+            shuffledPlaylistOrder = freshShuffledOrder
+            play(
+                firstShuffledPlayableTrack,
+                in: normalOrder,
+                origin: .playlist(playlistID)
+            )
+            return
+        }
+
+        play(firstPlayableTrack, in: normalOrder, origin: .playlist(playlistID))
     }
 
     func play(_ track: PlayableTrack) {

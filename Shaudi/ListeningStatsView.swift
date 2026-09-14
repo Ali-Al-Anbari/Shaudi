@@ -231,8 +231,8 @@ private struct StatsTrackRow: View {
                     .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                     .lineLimit(1)
 
-                if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
-                    Text(channelTitle)
+                if let artist = track.displayArtist, !artist.isEmpty {
+                    Text(artist)
                         .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
                         .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
                         .lineLimit(1)
@@ -289,12 +289,12 @@ private struct RecentlyPlayedTrackRow: View {
                 .lineLimit(1)
 
             HStack(spacing: 6) {
-                if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
-                    Text(channelTitle)
+                if let artist = track.displayArtist, !artist.isEmpty {
+                    Text(artist)
                         .lineLimit(1)
                 }
 
-                if track.channelTitle?.isEmpty == false {
+                if track.displayArtist?.isEmpty == false {
                     Text("•")
                 }
 

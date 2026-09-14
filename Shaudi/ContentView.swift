@@ -108,6 +108,10 @@ struct ContentView: View {
             NowPlayingView(playbackManager: playbackManager)
                 .presentationBackground(.clear)
         }
+        // This is the surface behind every tab and its NavigationStack.  Keeping it
+        // safe-area-filling prevents transparent navigation regions from revealing
+        // the system's default black window background.
+        .background(ShaudiTheme.dashboardBackground.ignoresSafeArea())
         .tint(appearanceSettings.primaryColor)
         .onChange(of: playbackManager.playbackStartEvent) { _, event in
             recordRecentlyPlayedPlaylist(for: event)
@@ -334,6 +338,18 @@ private struct MiniPlayerView: View {
 }
 
 private struct NowPlayingView: View {
+    private enum DragAxis {
+        case horizontal
+        case vertical
+    }
+
+    private struct PageContent {
+        let title: String
+        let artist: String
+        let thumbnailURL: URL?
+        let coverMedia: TrackCoverMedia?
+    }
+
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var playbackManager: PlaybackManager
     @State private var playbackTime: TimeInterval = 0
@@ -341,13 +357,21 @@ private struct NowPlayingView: View {
     @State private var isShowingCoverPicker = false
     @State private var selectedCover: PhotosPickerItem?
     @State private var customCoverMedia: TrackCoverMedia?
+    @State private var previousPage: PageContent?
+    @State private var nextPage: PageContent?
+    @State private var dragAxis: DragAxis?
+    @State private var horizontalOffset: CGFloat = 0
     @State private var dismissOffset: CGFloat = 0
+    @State private var isGestureSettling = false
 
     private let artworkHorizontalInset: CGFloat = 48
     private let maximumArtworkSize: CGFloat = 360
     private let artworkCornerRadius: CGFloat = 24
-    private let trackSwipeDistance: CGFloat = 90
-    private let trackSwipePredictedDistance: CGFloat = 180
+    private let gestureDeadZone: CGFloat = 10
+    private let trackSwipeDistance: CGFloat = 80
+    private let trackSwipePredictedDistance: CGFloat = 160
+    private let dismissDistance: CGFloat = 120
+    private let dismissPredictedDistance: CGFloat = 260
 
     private let playbackClock = Timer.publish(
         every: 0.25,
@@ -375,12 +399,14 @@ private struct NowPlayingView: View {
 
                     Spacer(minLength: 18)
 
-                    artworkFrame(size: artworkSize)
-                        .gesture(playerSwipeGesture)
-
-                    Spacer(minLength: 28)
-
-                    metadata
+                    pagingArea(
+                        artworkSize: artworkSize,
+                        pageWidth: max(
+                            0,
+                            geometry.size.width - artworkHorizontalInset
+                        ),
+                        dismissalHeight: geometry.size.height
+                    )
 
                     Spacer(minLength: 24)
 
@@ -407,7 +433,9 @@ private struct NowPlayingView: View {
             matching: .images
         )
         .onAppear {
+            resetGestureState()
             reloadCustomCover()
+            reloadAdjacentPages()
             updatePlaybackTime()
         }
         .onReceive(playbackClock) { _ in
@@ -419,7 +447,14 @@ private struct NowPlayingView: View {
         }
         .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
             reloadCustomCover()
+            reloadAdjacentPages()
             updatePlaybackTime()
+        }
+        .onChange(of: playbackManager.isShuffleEnabled) { _, _ in
+            reloadAdjacentPages()
+        }
+        .onChange(of: playbackManager.repeatMode) { _, _ in
+            reloadAdjacentPages()
         }
         .onChange(of: selectedCover) { _, selection in
             saveSelectedCover(selection)
@@ -491,17 +526,61 @@ private struct NowPlayingView: View {
         .foregroundStyle(.white)
     }
 
-    private func artworkFrame(size: CGFloat) -> some View {
-        artwork
+    private func pagingArea(
+        artworkSize: CGFloat,
+        pageWidth: CGFloat,
+        dismissalHeight: CGFloat
+    ) -> some View {
+        ZStack {
+            if horizontalOffset > 0, let previousPage {
+                nowPlayingPage(previousPage, artworkSize: artworkSize)
+                    .offset(x: horizontalOffset - pageWidth)
+            }
+
+            if horizontalOffset < 0, let nextPage {
+                nowPlayingPage(nextPage, artworkSize: artworkSize)
+                    .offset(x: horizontalOffset + pageWidth)
+            }
+
+            if let currentPageContent {
+                nowPlayingPage(currentPageContent, artworkSize: artworkSize)
+                    .offset(x: horizontalOffset)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: artworkSize + 92)
+        .contentShape(Rectangle())
+        .clipped()
+        .gesture(
+            playerSwipeGesture(
+                pageWidth: pageWidth,
+                dismissalHeight: dismissalHeight
+            )
+        )
+    }
+
+    private func nowPlayingPage(
+        _ content: PageContent,
+        artworkSize: CGFloat
+    ) -> some View {
+        VStack(spacing: 28) {
+            artworkFrame(content: content, size: artworkSize)
+            metadata(content)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func artworkFrame(content: PageContent, size: CGFloat) -> some View {
+        artwork(content)
             .frame(width: size, height: size)
             .background(ShaudiTheme.accent.opacity(0.18))
             .clipShape(RoundedRectangle(cornerRadius: artworkCornerRadius, style: .continuous))
             .shadow(color: .black.opacity(0.42), radius: 24, y: 14)
     }
 
-    private var artwork: some View {
+    private func artwork(_ content: PageContent) -> some View {
         Group {
-            switch customCoverMedia {
+            switch content.coverMedia {
             case .image(let image):
                 Image(uiImage: image)
                     .resizable()
@@ -509,15 +588,15 @@ private struct NowPlayingView: View {
             case .animatedGIF(let image):
                 AnimatedTrackCover(image: image)
             case nil:
-                normalArtwork
+                normalArtwork(thumbnailURL: content.thumbnailURL)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var normalArtwork: some View {
+    private func normalArtwork(thumbnailURL: URL?) -> some View {
         Group {
-            if let thumbnailURL = playbackManager.currentPlayableTrack?.thumbnailURL {
+            if let thumbnailURL {
                 AsyncImage(url: thumbnailURL) { phase in
                     if case .success(let image) = phase {
                         image
@@ -533,19 +612,20 @@ private struct NowPlayingView: View {
         }
     }
 
-    private var metadata: some View {
+    private func metadata(_ content: PageContent) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text(playbackManager.currentPlayableTrack?.title ?? "")
+            Text(content.title)
                 .font(ShaudiTheme.bodyFont(size: 25, relativeTo: .title2).weight(.semibold))
                 .foregroundStyle(.white)
                 .lineLimit(2)
 
-            Text(playbackManager.currentPlayableTrack?.channelTitle ?? "Unknown artist")
+            Text(content.artist)
                 .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .body))
                 .foregroundStyle(.white.opacity(0.68))
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 64, alignment: .top)
     }
 
     private var progress: some View {
@@ -721,6 +801,41 @@ private struct NowPlayingView: View {
         playbackManager.currentTrack
     }
 
+    private var currentPageContent: PageContent? {
+        guard let track = playbackManager.currentPlayableTrack else {
+            return nil
+        }
+
+        return PageContent(
+            title: track.title,
+            artist: track.channelTitle ?? "Unknown artist",
+            thumbnailURL: track.thumbnailURL,
+            coverMedia: customCoverMedia
+        )
+    }
+
+    private func pageContent(for track: Track?) -> PageContent? {
+        guard let track else {
+            return nil
+        }
+
+        let coverMedia = track.customCoverID.flatMap {
+            ArtworkStorage.trackCover(for: $0)
+        }
+
+        return PageContent(
+            title: track.title,
+            artist: track.displayArtist ?? "Unknown artist",
+            thumbnailURL: track.thumbnailURL,
+            coverMedia: coverMedia
+        )
+    }
+
+    private func reloadAdjacentPages() {
+        previousPage = pageContent(for: playbackManager.previousQueueTrack)
+        nextPage = pageContent(for: playbackManager.nextQueueTrack)
+    }
+
     private func reloadCustomCover() {
         guard let coverID = currentTrack?.customCoverID else {
             customCoverMedia = nil
@@ -750,6 +865,7 @@ private struct NowPlayingView: View {
                 try ArtworkStorage.saveTrackCover(data: data, for: coverID)
                 track.customCoverID = coverID
                 reloadCustomCover()
+                reloadAdjacentPages()
             } catch {
 #if DEBUG
                 print("[Artwork] Track cover save failed: \(error.localizedDescription)")
@@ -766,6 +882,7 @@ private struct NowPlayingView: View {
         ArtworkStorage.deleteTrackCover(for: coverID)
         track.customCoverID = nil
         customCoverMedia = nil
+        reloadAdjacentPages()
     }
 
     private func universalArtworkSize(for geometry: GeometryProxy) -> CGFloat {
@@ -774,61 +891,162 @@ private struct NowPlayingView: View {
         return min(availableWidth, availableHeight, maximumArtworkSize)
     }
 
-    private var playerSwipeGesture: some Gesture {
+    private func playerSwipeGesture(
+        pageWidth: CGFloat,
+        dismissalHeight: CGFloat
+    ) -> some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
+                guard !isGestureSettling, !isScrubbing else {
+                    return
+                }
+
                 let horizontalDistance = abs(value.translation.width)
                 let verticalDistance = abs(value.translation.height)
 
-                if verticalDistance > horizontalDistance, value.translation.height > 0 {
-                    dismissOffset = value.translation.height
+                if dragAxis == nil {
+                    guard max(horizontalDistance, verticalDistance) >= gestureDeadZone else {
+                        return
+                    }
+
+                    dragAxis = horizontalDistance > verticalDistance
+                        ? .horizontal
+                        : .vertical
+                }
+
+                switch dragAxis {
+                case .horizontal:
+                    dismissOffset = 0
+                    let translation = value.translation.width
+                    let hasDestination = translation < 0
+                        ? nextPage != nil
+                        : previousPage != nil
+                    horizontalOffset = hasDestination
+                        ? translation
+                        : resistedHorizontalOffset(translation)
+                case .vertical:
+                    horizontalOffset = 0
+                    dismissOffset = max(0, value.translation.height)
+                case nil:
+                    break
                 }
             }
             .onEnded { value in
-                let horizontalDistance = abs(value.translation.width)
-                let verticalDistance = abs(value.translation.height)
-
-                if horizontalDistance > verticalDistance {
-                    handleTrackSwipe(value)
+                guard !isGestureSettling else {
                     return
                 }
 
-                let projectedOffset = value.predictedEndTranslation.height
-                let isVerticalDismiss = value.translation.height > 0
-                    && verticalDistance > horizontalDistance
-                let shouldDismiss = isVerticalDismiss
-                    && (value.translation.height > 140 || projectedOffset > 300)
-
-                guard shouldDismiss else {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                        dismissOffset = 0
-                    }
-                    return
-                }
-
-                withAnimation(.easeOut(duration: 0.14)) {
-                    dismissOffset = max(dismissOffset, 280)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    dismiss()
+                switch dragAxis {
+                case .horizontal:
+                    finishHorizontalDrag(value, pageWidth: pageWidth)
+                case .vertical:
+                    finishVerticalDrag(value, dismissalHeight: dismissalHeight)
+                case nil:
+                    springBackToRest()
                 }
             }
     }
 
-    private func handleTrackSwipe(_ value: DragGesture.Value) {
-        let horizontalTranslation = value.translation.width
+    private func finishHorizontalDrag(
+        _ value: DragGesture.Value,
+        pageWidth: CGFloat
+    ) {
+        let translation = value.translation.width
         let predictedTranslation = value.predictedEndTranslation.width
-        let reachedThreshold = abs(horizontalTranslation) > trackSwipeDistance
-            || abs(predictedTranslation) > trackSwipePredictedDistance
+        let direction = abs(translation) >= gestureDeadZone
+            ? translation
+            : predictedTranslation
+        let destinationExists = direction < 0
+            ? nextPage != nil
+            : previousPage != nil
+        let shouldComplete = destinationExists
+            && (abs(translation) >= trackSwipeDistance
+                || abs(predictedTranslation) >= trackSwipePredictedDistance)
 
-        guard reachedThreshold else {
+        guard shouldComplete else {
+            springBackToRest()
             return
         }
 
-        if horizontalTranslation < 0 {
-            playbackManager.nextTrack()
-        } else {
-            playbackManager.previousTrack()
+        isGestureSettling = true
+        let isMovingToNext = direction < 0
+        let destinationOffset = isMovingToNext ? -pageWidth : pageWidth
+
+        withAnimation(
+            .easeInOut(duration: 0.22),
+            completionCriteria: .logicallyComplete
+        ) {
+            horizontalOffset = destinationOffset
+        } completion: {
+            if isMovingToNext {
+                playbackManager.nextTrack()
+            } else {
+                playbackManager.previousTrack()
+            }
+
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                horizontalOffset = 0
+                dismissOffset = 0
+                dragAxis = nil
+                isGestureSettling = false
+            }
+        }
+    }
+
+    private func finishVerticalDrag(
+        _ value: DragGesture.Value,
+        dismissalHeight: CGFloat
+    ) {
+        let downwardTranslation = value.translation.height
+        let predictedTranslation = value.predictedEndTranslation.height
+        let shouldDismiss = downwardTranslation > 0
+            && (downwardTranslation >= dismissDistance
+                || predictedTranslation >= dismissPredictedDistance)
+
+        guard shouldDismiss else {
+            springBackToRest()
+            return
+        }
+
+        isGestureSettling = true
+        withAnimation(
+            .easeOut(duration: 0.22),
+            completionCriteria: .logicallyComplete
+        ) {
+            dismissOffset = max(dismissalHeight + 80, dismissOffset)
+        } completion: {
+            dismiss()
+        }
+    }
+
+    private func springBackToRest() {
+        isGestureSettling = true
+        withAnimation(
+            .spring(response: 0.36, dampingFraction: 0.84),
+            completionCriteria: .logicallyComplete
+        ) {
+            horizontalOffset = 0
+            dismissOffset = 0
+        } completion: {
+            dragAxis = nil
+            isGestureSettling = false
+        }
+    }
+
+    private func resistedHorizontalOffset(_ translation: CGFloat) -> CGFloat {
+        translation * 0.16
+    }
+
+    private func resetGestureState() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            horizontalOffset = 0
+            dismissOffset = 0
+            dragAxis = nil
+            isGestureSettling = false
         }
     }
 

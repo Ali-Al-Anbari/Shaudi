@@ -31,6 +31,8 @@ struct PlaylistsView: View {
             }
         }
         .tint(appearanceSettings.primaryColor)
+        .toolbarBackground(ShaudiTheme.canvas, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
     }
 
     private var playlistList: some View {
@@ -173,6 +175,8 @@ struct PlaylistDetailView: View {
     @State private var isShowingArtworkCropper = false
     @State private var isPlaylistVisible = false
     @State private var infoTrack: Track?
+    @State private var editingTrack: Track?
+    @State private var trimmingTrack: Track?
 
     private let warmupTrackLimit = 10
 
@@ -201,28 +205,6 @@ struct PlaylistDetailView: View {
         if let firstPlayableTrack {
             return true
         }
-        return false
-    }
-
-    private var trackCountDescription: String {
-        "\(tracks.count) \(tracks.count == 1 ? "track" : "tracks")"
-    }
-
-    private var isActivePlaylist: Bool {
-        playbackManager.hasActivePlaylistQueue(
-            for: playlist.persistentModelID
-        )
-    }
-
-    private var isPlaylistPlaying: Bool {
-        guard isActivePlaylist else {
-            return false
-        }
-
-        if case .playing = playbackManager.state {
-            return true
-        }
-
         return false
     }
 
@@ -310,48 +292,49 @@ struct PlaylistDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            playlistHeader
-            playbackModeControls
+        ZStack {
+            playlistSurface
 
-            Group {
-                if tracks.isEmpty {
-                    ContentUnavailableView(
-                        "No Tracks",
-                        systemImage: "music.note",
-                        description: Text("Add tracks from your Library.")
-                    )
-                } else {
-                    List {
-                        ForEach(tracks) { track in
-                            let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
-                                || playbackManager.isCurrentPlayable(track.youtubeVideoID)
+            VStack(spacing: 0) {
+                playlistControlStrip
 
-                            playlistTrackRow(
-                                track,
-                                isCurrentlyPlaying: isCurrentlyPlaying
-                            )
-                            .listRowBackground(
-                                isCurrentlyPlaying
-                                    ? ShaudiTheme.accent.opacity(0.14)
-                                    : ShaudiTheme.card
-                            )
-                            .listRowInsets(
-                                EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
-                            )
-                            .listRowSeparator(.visible)
-                            .listRowSeparatorTint(ShaudiTheme.accent.opacity(0.14))
+                Group {
+                    if tracks.isEmpty {
+                        ContentUnavailableView(
+                            "No Tracks",
+                            systemImage: "music.note",
+                            description: Text("Add tracks from your Library.")
+                        )
+                    } else {
+                        List {
+                            ForEach(tracks) { track in
+                                let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
+                                    || playbackManager.isCurrentPlayable(track.youtubeVideoID)
+
+                                playlistTrackRow(
+                                    track,
+                                    isCurrentlyPlaying: isCurrentlyPlaying
+                                )
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(
+                                    EdgeInsets(top: 3, leading: 12, bottom: 3, trailing: 12)
+                                )
+                                .listRowSeparator(.hidden)
+                            }
                         }
+                        .listStyle(.plain)
+                        .scrollContentBackground(.hidden)
                     }
-                    .listStyle(.insetGrouped)
-                    .scrollContentBackground(.hidden)
-                    .background(ShaudiTheme.canvas)
                 }
             }
         }
-        .background(ShaudiTheme.canvas)
         .tint(ShaudiTheme.accent)
         .navigationBarTitleDisplayMode(.inline)
+        // The navigation controller owns the status-bar/Dynamic Island area. Give
+        // it the same surface that starts the sticky playlist header so no parent
+        // navigation background shows through above the detail content.
+        .toolbarBackground(ShaudiTheme.card, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .navigationDestination(isPresented: Binding(
             get: { infoTrack != nil },
             set: { if !$0 { infoTrack = nil } }
@@ -362,6 +345,22 @@ struct PlaylistDetailView: View {
                     queue: tracks,
                     playbackOrigin: .playlist(playlist.persistentModelID)
                 )
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { editingTrack != nil },
+            set: { if !$0 { editingTrack = nil } }
+        )) {
+            if let editingTrack {
+                SongEditorView(track: editingTrack)
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { trimmingTrack != nil },
+            set: { if !$0 { trimmingTrack = nil } }
+        )) {
+            if let trimmingTrack {
+                TrackTrimEditorView(track: trimmingTrack)
             }
         }
         .onAppear {
@@ -443,38 +442,12 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private var playlistHeader: some View {
-        VStack(spacing: 10) {
-            PlaylistArtworkView(playlist: playlist)
-                .frame(width: 150, height: 150)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 10, y: 5)
-
-            VStack(spacing: 3) {
-                Text(playlist.name)
-                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
-                    .foregroundStyle(ShaudiTheme.accent)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .accessibilityAddTraits(.isHeader)
-
-                Text(trackCountDescription)
-                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
-    }
-
-    private var playbackModeControls: some View {
-        HStack(spacing: 14) {
+    private var playlistControlStrip: some View {
+        HStack(spacing: 10) {
             Button {
                 handlePlaylistPlayButton()
             } label: {
-                Image(systemName: isPlaylistPlaying ? "pause.fill" : "play.fill")
+                Image(systemName: "play.fill")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(.white)
                     .frame(width: 40, height: 40)
@@ -483,9 +456,15 @@ struct PlaylistDetailView: View {
             .buttonStyle(.plain)
             .disabled(!hasPlayableTrack)
             .opacity(hasPlayableTrack ? 1 : 0.45)
-            .accessibilityLabel(isPlaylistPlaying ? "Pause Playlist" : "Play Playlist")
+            .accessibilityLabel("Start Playlist")
 
-            Spacer()
+            Text(playlist.name)
+                .font(ShaudiTheme.scriptFont(size: 25, relativeTo: .title3))
+                .foregroundStyle(ShaudiTheme.accent)
+                .lineLimit(1)
+                .accessibilityAddTraits(.isHeader)
+
+            Spacer(minLength: 4)
 
             playbackModeButton(
                 title: "Shuffle",
@@ -504,8 +483,35 @@ struct PlaylistDetailView: View {
                 playbackManager.toggleRepeatMode()
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background {
+            LinearGradient(
+                colors: [
+                    ShaudiTheme.card,
+                    ShaudiTheme.card.opacity(0.62),
+                    ShaudiTheme.canvas.opacity(0.12)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+    }
+
+    private var playlistSurface: some View {
+        ZStack {
+            ShaudiTheme.canvas
+
+            LinearGradient(
+                colors: [
+                    ShaudiTheme.lavender.opacity(0.09),
+                    Color.clear
+                ],
+                startPoint: .top,
+                endPoint: .center
+            )
+        }
+        .ignoresSafeArea()
     }
 
     private func playbackModeButton(
@@ -579,6 +585,18 @@ struct PlaylistDetailView: View {
                     Label("Show Info", systemImage: "info.circle")
                 }
 
+                Button {
+                    trimmingTrack = track
+                } label: {
+                    Label("Trim Song", systemImage: "scissors")
+                }
+
+                Button {
+                    editingTrack = track
+                } label: {
+                    Label("Edit Song", systemImage: "pencil")
+                }
+
                 Button(role: .destructive) {
                     playlist.tracks.removeAll { $0 === track }
                 } label: {
@@ -595,6 +613,12 @@ struct PlaylistDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
         .padding(.vertical, 9)
+        .background(
+            isCurrentlyPlaying
+                ? ShaudiTheme.accent.opacity(0.16)
+                : ShaudiTheme.card.opacity(0.58),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
     }
 
     private func trackArtwork(_ track: Track) -> some View {
@@ -625,40 +649,11 @@ struct PlaylistDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func playPlaylist() {
-        let targetPlaylistID = playlist.persistentModelID
-        let orderedTracks = playlist.tracksInPlaybackOrder
-        guard let firstPlayableTrack = orderedTracks.first(where: {
-            !$0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-                .isEmpty
-        }) else {
-            return
-        }
-
-        playbackManager.play(
-            firstPlayableTrack,
-            in: orderedTracks,
-            origin: .playlist(targetPlaylistID)
-        )
-    }
-
     private func handlePlaylistPlayButton() {
-        if isActivePlaylist {
-            switch playbackManager.state {
-            case .playing:
-                playbackManager.pause()
-                return
-            case .paused:
-                playbackManager.resume()
-                return
-            case .resolving, .loading:
-                return
-            case .idle, .failed:
-                break
-            }
-        }
-
-        playPlaylist()
+        playbackManager.restartPlaylist(
+            tracks,
+            playlistID: playlist.persistentModelID
+        )
     }
 
     private func updatePlaylistWarmup() {
