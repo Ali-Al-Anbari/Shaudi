@@ -29,6 +29,10 @@ struct LibraryView: View {
     @State private var selectedPlaylistPage = 0
     @State private var dashboardContentWidth: CGFloat = 360
     @State private var isLibraryVisible = false
+    @State private var isSelectingTracks = false
+    @State private var selectedTrackIDs: Set<PersistentIdentifier> = []
+    @State private var isShowingDeleteConfirmation = false
+    @State private var infoTrack: Track?
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
     private let playlistPageSize = 6
     private let playlistColumnSpacing: CGFloat = 12
@@ -58,6 +62,14 @@ struct LibraryView: View {
 
     private var dashboardPageCount: Int {
         max(1, (dashboardPlaylists.count + playlistPageSize - 1) / playlistPageSize)
+    }
+
+    private var rankedTracks: [Track] {
+        mostPlayedTracks(from: tracks)
+    }
+
+    private var dashboardTracks: [Track] {
+        Array(rankedTracks.prefix(10))
     }
 
     private var dashboardPlaylistIDs: [PersistentIdentifier] {
@@ -140,8 +152,17 @@ struct LibraryView: View {
                 heroBanner
                 sectionHeader("Library")
                 playlistPager
-                sectionHeader("My Collection")
+                collectionHeader
                 collection
+                NavigationLink {
+                    CollectionView()
+                } label: {
+                    Label("Show All", systemImage: "arrow.right")
+                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline).weight(.semibold))
+                        .foregroundStyle(ShaudiTheme.accent)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal)
             .padding(.vertical, 12)
@@ -174,6 +195,29 @@ struct LibraryView: View {
             } else if isLibraryVisible {
                 playbackManager.cancelDashboardWarmup()
             }
+        }
+        .navigationDestination(isPresented: Binding(
+            get: { infoTrack != nil },
+            set: { if !$0 { infoTrack = nil } }
+        )) {
+            if let infoTrack {
+                TrackDetailView(
+                    track: infoTrack,
+                    queue: tracks,
+                    playbackOrigin: .library
+                )
+            }
+        }
+        .alert(
+            "Delete \(selectedTrackIDs.count) \(selectedTrackIDs.count == 1 ? "Song" : "Songs")?",
+            isPresented: $isShowingDeleteConfirmation
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteSelectedTracks()
+            }
+        } message: {
+            Text("These songs will be removed from your Library and any playlists containing them.")
         }
     }
 
@@ -254,38 +298,104 @@ struct LibraryView: View {
 
     private var collection: some View {
         Group {
-            if tracks.isEmpty {
+            if dashboardTracks.isEmpty {
                 ContentUnavailableView("Your Library Is Quiet", systemImage: "music.note.list", description: Text("Add a track to start your collection."))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 24)
             } else {
                 LazyVStack(spacing: 10) {
-                    ForEach(tracks) { track in
-                        SwipeableDashboardRow(
-                            onDelete: {
-                                deleteTrack(track)
-                            }
-                        ) {
-                            TrackDetailView(
-                                track: track,
-                                queue: tracks,
-                                playbackOrigin: .library
-                            )
-                        } label: {
-                            trackRow(track)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 10)
-                                .background(
-                                    ShaudiTheme.dashboardCard,
-                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                )
-                                .contentShape(Rectangle())
-                        }
+                    ForEach(dashboardTracks) { track in
+                        libraryTrackRow(track)
                     }
                 }
             }
         }
+    }
+
+    private var collectionHeader: some View {
+        HStack(spacing: 12) {
+            NavigationLink {
+                CollectionView()
+            } label: {
+                sectionHeader("My Collection")
+            }
+            .buttonStyle(.plain)
+
+            Spacer(minLength: 8)
+
+            if isSelectingTracks {
+                Button("Delete") {
+                    isShowingDeleteConfirmation = true
+                }
+                .disabled(selectedTrackIDs.isEmpty)
+
+                Button("Done") {
+                    endTrackSelection()
+                }
+            } else {
+                Button("Select") {
+                    isSelectingTracks = true
+                }
+            }
+        }
+        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline).weight(.semibold))
+        .foregroundStyle(ShaudiTheme.accent)
+    }
+
+    private func libraryTrackRow(_ track: Track) -> some View {
+        let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
+            || playbackManager.isCurrentPlayable(track.youtubeVideoID)
+        let isSelected = selectedTrackIDs.contains(track.persistentModelID)
+
+        return LibraryTrackRow(
+            track: track,
+            isCurrentlyPlaying: isCurrentlyPlaying,
+            isSelected: isSelected,
+            isSelectionMode: isSelectingTracks,
+            play: {
+                playbackManager.play(track, in: tracks, origin: .library)
+            },
+            toggleSelection: {
+                toggleTrackSelection(track)
+            },
+            showInfo: {
+                infoTrack = track
+            },
+            delete: {
+                deleteTrackFromLibrary(track, in: modelContext)
+            }
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            isSelected
+                ? ShaudiTheme.accent.opacity(0.26)
+                : (isCurrentlyPlaying ? ShaudiTheme.accent.opacity(0.14) : ShaudiTheme.dashboardCard),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+    }
+
+    private func toggleTrackSelection(_ track: Track) {
+        if selectedTrackIDs.contains(track.persistentModelID) {
+            selectedTrackIDs.remove(track.persistentModelID)
+        } else {
+            selectedTrackIDs.insert(track.persistentModelID)
+        }
+    }
+
+    private func endTrackSelection() {
+        isSelectingTracks = false
+        selectedTrackIDs.removeAll()
+    }
+
+    private func deleteSelectedTracks() {
+        let tracksToDelete = tracks.filter {
+            selectedTrackIDs.contains($0.persistentModelID)
+        }
+        tracksToDelete.forEach { track in
+            deleteTrackFromLibrary(track, in: modelContext)
+        }
+        endTrackSelection()
     }
 
     private func sectionHeader(_ title: String) -> some View {
@@ -371,165 +481,486 @@ struct LibraryView: View {
         }
     }
 
-    private var libraryList: some View {
-        List {
-            libraryRows
-        }
-        .listStyle(.insetGrouped)
-        .scrollContentBackground(.hidden)
-        .background(ShaudiTheme.canvas)
-    }
-
-    @ViewBuilder
-    private var libraryRows: some View {
-        if tracks.isEmpty {
-            ContentUnavailableView(
-                "Your Library Is Quiet",
-                systemImage: "music.note.list",
-                description: Text("Add a track to start your collection.")
-            )
-            .listRowBackground(Color.clear)
-        } else {
-            Section {
-                ForEach(tracks) { track in
-                    NavigationLink {
-                        TrackDetailView(
-                            track: track,
-                            queue: tracks,
-                            playbackOrigin: .library
-                        )
-                    } label: {
-                        trackRow(track)
-                    }
-                    .listRowBackground(ShaudiTheme.card)
-                    .listRowSeparator(.hidden)
-                }
-                .onDelete(perform: deleteTracks)
-            } header: {
-                Text("All Tracks")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(ShaudiTheme.lavender)
-            }
-        }
-    }
-
-    private func deleteTracks(at offsets: IndexSet) {
-        for index in offsets {
-            deleteTrack(tracks[index])
-        }
-    }
-
-    private func deleteTrack(_ track: Track) {
-        if let coverID = track.customCoverID {
-            ArtworkStorage.deleteTrackCover(for: coverID)
-        }
-        modelContext.delete(track)
-    }
-
-    private func trackRow(_ track: Track) -> some View {
-        HStack(spacing: 13) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(ShaudiTheme.lavender.opacity(0.16))
-
-                Image(systemName: "music.note")
-                    .font(.headline)
-                    .foregroundStyle(ShaudiTheme.lavender)
-            }
-            .frame(width: 42, height: 42)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(track.title)
-                    .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .headline))
-                    .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
-                    .lineLimit(2)
-
-                if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
-                    Text(channelTitle)
-                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
-                        .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer(minLength: 4)
-        }
-        .padding(.vertical, 5)
-    }
 }
 
-private struct SwipeableDashboardRow<Destination: View, RowLabel: View>: View {
-    private let actionWidth: CGFloat = 88
-    let onDelete: () -> Void
-    let destination: Destination
-    let label: RowLabel
+private struct CollectionView: View {
+    private enum SortOption: String, CaseIterable, Identifiable {
+        case mostPlayed = "Most Played"
+        case mostListened = "Most Listened"
+        case recentlyPlayed = "Recently Played"
+        case dateAdded = "Date Added"
+        case alphabetical = "A–Z"
 
-    @State private var offset: CGFloat = 0
-    @State private var isDeleteRevealed = false
+        var id: Self { self }
+    }
 
-    init(
-        onDelete: @escaping () -> Void,
-        @ViewBuilder destination: () -> Destination,
-        @ViewBuilder label: () -> RowLabel
-    ) {
-        self.onDelete = onDelete
-        self.destination = destination()
-        self.label = label()
+    private enum FilterOption: String, CaseIterable, Identifiable {
+        case allSongs = "All Songs"
+        case played = "Played"
+        case neverPlayed = "Never Played"
+
+        var id: Self { self }
+    }
+
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var playbackManager: PlaybackManager
+
+    @Query(sort: \Track.dateAdded, order: .reverse)
+    private var tracks: [Track]
+
+    @State private var isSelectingTracks = false
+    @State private var selectedTrackIDs: Set<PersistentIdentifier> = []
+    @State private var isShowingDeleteConfirmation = false
+    @State private var infoTrack: Track?
+    @State private var searchText = ""
+    @State private var sortOption: SortOption = .mostPlayed
+    @State private var filterOption: FilterOption = .allSongs
+
+    private var displayedTracks: [Track] {
+        let filteredTracks = tracks.filter { track in
+            matchesFilter(track) && matchesSearch(track)
+        }
+        return sortedTracks(filteredTracks, by: sortOption)
     }
 
     var body: some View {
-        ZStack(alignment: .trailing) {
-            Button(role: .destructive) {
-                withAnimation(.snappy) {
-                    offset = 0
-                    isDeleteRevealed = false
-                }
-                onDelete()
-            } label: {
-                Label("Delete", systemImage: "trash.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: actionWidth)
-                    .frame(maxHeight: .infinity)
-                    .background(.red, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            }
-            .buttonStyle(.plain)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                header
+                searchField
+                collectionControls
 
-            NavigationLink {
-                destination
-            } label: {
-                label
+                if tracks.isEmpty {
+                    ContentUnavailableView(
+                        "Your Library Is Quiet",
+                        systemImage: "music.note.list",
+                        description: Text("Add a track to start your collection.")
+                    )
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+                } else if displayedTracks.isEmpty {
+                    ContentUnavailableView(
+                        "No Matching Songs",
+                        systemImage: "magnifyingglass",
+                        description: Text("Try a different search, filter, or sort option.")
+                    )
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+                } else {
+                    LazyVStack(spacing: 10) {
+                        ForEach(displayedTracks) { track in
+                            trackRow(track)
+                        }
+                    }
+                }
             }
-            .buttonStyle(.plain)
-            .offset(x: offset)
-            .simultaneousGesture(swipeGesture)
+            .padding()
         }
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .scrollIndicators(.hidden)
+        .background(ShaudiTheme.dashboardBackground)
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: Binding(
+            get: { infoTrack != nil },
+            set: { if !$0 { infoTrack = nil } }
+        )) {
+            if let infoTrack {
+                TrackDetailView(
+                    track: infoTrack,
+                    queue: tracks,
+                    playbackOrigin: .library
+                )
+            }
+        }
+        .alert(
+            "Delete \(selectedTrackIDs.count) \(selectedTrackIDs.count == 1 ? "Song" : "Songs")?",
+            isPresented: $isShowingDeleteConfirmation
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteSelectedTracks()
+            }
+        } message: {
+            Text("These songs will be removed from your Library and any playlists containing them.")
+        }
     }
 
-    private var swipeGesture: some Gesture {
-        DragGesture(minimumDistance: 10)
-            .onChanged { value in
-                guard abs(value.translation.width) > abs(value.translation.height) else {
-                    return
-                }
+    private var header: some View {
+        HStack(spacing: 12) {
+            Text("My Collection")
+                .font(ShaudiTheme.scriptFont(size: 34, relativeTo: .title))
+                .foregroundStyle(ShaudiTheme.accent)
+                .accessibilityAddTraits(.isHeader)
 
-                let restingOffset = isDeleteRevealed ? -actionWidth : 0
-                offset = min(0, max(-actionWidth, restingOffset + value.translation.width))
-            }
-            .onEnded { value in
-                guard abs(value.translation.width) > abs(value.translation.height) else {
-                    return
-                }
+            Spacer(minLength: 8)
 
-                let shouldReveal = value.translation.width < -36
-                    || value.predictedEndTranslation.width < -actionWidth
-                withAnimation(.snappy) {
-                    isDeleteRevealed = shouldReveal
-                    offset = shouldReveal ? -actionWidth : 0
+            if isSelectingTracks {
+                Button("Delete") {
+                    isShowingDeleteConfirmation = true
+                }
+                .disabled(selectedTrackIDs.isEmpty)
+
+                Button("Done") {
+                    endTrackSelection()
+                }
+            } else {
+                Button("Select") {
+                    isSelectingTracks = true
                 }
             }
+        }
+        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline).weight(.semibold))
+        .foregroundStyle(ShaudiTheme.accent)
     }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+
+            TextField("Search title or artist", text: $searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+                        .frame(width: 32, height: 32)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(
+            ShaudiTheme.dashboardCard,
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+    }
+
+    private var collectionControls: some View {
+        HStack(spacing: 12) {
+            Menu {
+                ForEach(SortOption.allCases) { option in
+                    Button {
+                        sortOption = option
+                    } label: {
+                        if sortOption == option {
+                            Label(option.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(option.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                Label(sortOption.rawValue, systemImage: "arrow.up.arrow.down")
+                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline).weight(.semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Menu {
+                ForEach(FilterOption.allCases) { option in
+                    Button {
+                        filterOption = option
+                    } label: {
+                        if filterOption == option {
+                            Label(option.rawValue, systemImage: "checkmark")
+                        } else {
+                            Text(option.rawValue)
+                        }
+                    }
+                }
+            } label: {
+                Label(filterOption.rawValue, systemImage: "line.3.horizontal.decrease.circle")
+                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline).weight(.semibold))
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .foregroundStyle(ShaudiTheme.accent)
+    }
+
+    private func trackRow(_ track: Track) -> some View {
+        let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
+            || playbackManager.isCurrentPlayable(track.youtubeVideoID)
+        let isSelected = selectedTrackIDs.contains(track.persistentModelID)
+
+        return LibraryTrackRow(
+            track: track,
+            isCurrentlyPlaying: isCurrentlyPlaying,
+            isSelected: isSelected,
+            isSelectionMode: isSelectingTracks,
+            play: {
+                playbackManager.play(track, in: tracks, origin: .library)
+            },
+            toggleSelection: {
+                toggleTrackSelection(track)
+            },
+            showInfo: {
+                infoTrack = track
+            },
+            delete: {
+                deleteTrackFromLibrary(track, in: modelContext)
+            }
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            isSelected
+                ? ShaudiTheme.accent.opacity(0.26)
+                : (isCurrentlyPlaying ? ShaudiTheme.accent.opacity(0.14) : ShaudiTheme.dashboardCard),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+    }
+
+    private func toggleTrackSelection(_ track: Track) {
+        if selectedTrackIDs.contains(track.persistentModelID) {
+            selectedTrackIDs.remove(track.persistentModelID)
+        } else {
+            selectedTrackIDs.insert(track.persistentModelID)
+        }
+    }
+
+    private func endTrackSelection() {
+        isSelectingTracks = false
+        selectedTrackIDs.removeAll()
+    }
+
+    private func deleteSelectedTracks() {
+        let tracksToDelete = tracks.filter {
+            selectedTrackIDs.contains($0.persistentModelID)
+        }
+        tracksToDelete.forEach { track in
+            deleteTrackFromLibrary(track, in: modelContext)
+        }
+        endTrackSelection()
+    }
+
+    private func matchesFilter(_ track: Track) -> Bool {
+        let hasListeningHistory = track.playCount > 0
+            || track.totalListenedDuration > 0
+            || track.lastPlayedAt != nil
+
+        switch filterOption {
+        case .allSongs:
+            return true
+        case .played:
+            return hasListeningHistory
+        case .neverPlayed:
+            return !hasListeningHistory
+        }
+    }
+
+    private func matchesSearch(_ track: Track) -> Bool {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            return true
+        }
+
+        return track.title.range(
+            of: query,
+            options: [.caseInsensitive, .diacriticInsensitive]
+        ) != nil || track.channelTitle?.range(
+            of: query,
+            options: [.caseInsensitive, .diacriticInsensitive]
+        ) != nil
+    }
+
+    private func sortedTracks(_ tracks: [Track], by option: SortOption) -> [Track] {
+        tracks.sorted { first, second in
+            switch option {
+            case .mostPlayed:
+                if first.playCount != second.playCount {
+                    return first.playCount > second.playCount
+                }
+                if first.totalListenedDuration != second.totalListenedDuration {
+                    return first.totalListenedDuration > second.totalListenedDuration
+                }
+                if let lastPlayedComparison = sortLastPlayedDate(first, second) {
+                    return lastPlayedComparison
+                }
+            case .mostListened:
+                if first.totalListenedDuration != second.totalListenedDuration {
+                    return first.totalListenedDuration > second.totalListenedDuration
+                }
+                if first.playCount != second.playCount {
+                    return first.playCount > second.playCount
+                }
+                if let lastPlayedComparison = sortLastPlayedDate(first, second) {
+                    return lastPlayedComparison
+                }
+            case .recentlyPlayed:
+                if let lastPlayedComparison = sortLastPlayedDate(first, second) {
+                    return lastPlayedComparison
+                }
+                if first.playCount != second.playCount {
+                    return first.playCount > second.playCount
+                }
+            case .dateAdded:
+                if first.dateAdded != second.dateAdded {
+                    return first.dateAdded > second.dateAdded
+                }
+            case .alphabetical:
+                break
+            }
+
+            return titleComesBefore(first, second)
+        }
+    }
+
+    private func sortLastPlayedDate(_ first: Track, _ second: Track) -> Bool? {
+        switch (first.lastPlayedAt, second.lastPlayedAt) {
+        case let (firstDate?, secondDate?) where firstDate != secondDate:
+            return firstDate > secondDate
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            return nil
+        }
+    }
+}
+
+private struct LibraryTrackRow: View {
+    let track: Track
+    let isCurrentlyPlaying: Bool
+    let isSelected: Bool
+    let isSelectionMode: Bool
+    let play: () -> Void
+    let toggleSelection: () -> Void
+    let showInfo: () -> Void
+    let delete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                if isSelectionMode {
+                    toggleSelection()
+                } else {
+                    play()
+                }
+            } label: {
+                HStack(spacing: 13) {
+                    artwork
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(track.title)
+                            .font(
+                                isCurrentlyPlaying
+                                    ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
+                                    : ShaudiTheme.bodyFont(size: 17, relativeTo: .headline)
+                            )
+                            .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                            .lineLimit(2)
+
+                        if let channelTitle = track.channelTitle, !channelTitle.isEmpty {
+                            Text(channelTitle)
+                                .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                                .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+                                .lineLimit(1)
+                        }
+                    }
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if isSelectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? ShaudiTheme.accent : ShaudiTheme.dashboardSecondaryText)
+                    .frame(width: 44, height: 44)
+                    .accessibilityLabel(isSelected ? "Selected" : "Not selected")
+            } else {
+                Menu {
+                    Button {
+                        showInfo()
+                    } label: {
+                        Label("Show Info", systemImage: "info.circle")
+                    }
+
+                    Button(role: .destructive) {
+                        delete()
+                    } label: {
+                        Label("Delete from Library", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.headline)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Song actions")
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var artwork: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(ShaudiTheme.lavender.opacity(0.16))
+
+            Image(systemName: "music.note")
+                .font(.headline)
+                .foregroundStyle(ShaudiTheme.lavender)
+        }
+        .frame(width: 42, height: 42)
+    }
+}
+
+private func mostPlayedTracks(from tracks: [Track]) -> [Track] {
+    tracks.sorted { first, second in
+        if first.playCount != second.playCount {
+            return first.playCount > second.playCount
+        }
+
+        if first.totalListenedDuration != second.totalListenedDuration {
+            return first.totalListenedDuration > second.totalListenedDuration
+        }
+
+        switch (first.lastPlayedAt, second.lastPlayedAt) {
+        case let (firstDate?, secondDate?) where firstDate != secondDate:
+            return firstDate > secondDate
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            break
+        }
+
+        return titleComesBefore(first, second)
+    }
+}
+
+private func titleComesBefore(_ first: Track, _ second: Track) -> Bool {
+    let titleOrder = first.title.localizedCaseInsensitiveCompare(second.title)
+    if titleOrder != .orderedSame {
+        return titleOrder == .orderedAscending
+    }
+
+    return first.youtubeVideoID < second.youtubeVideoID
+}
+
+private func deleteTrackFromLibrary(_ track: Track, in modelContext: ModelContext) {
+    if let coverID = track.customCoverID {
+        ArtworkStorage.deleteTrackCover(for: coverID)
+    }
+
+    let containingPlaylists = track.playlists
+    for playlist in containingPlaylists {
+        playlist.tracks.removeAll { $0 === track }
+    }
+
+    modelContext.delete(track)
 }
 
 struct ManualTrackAdditionView: View {

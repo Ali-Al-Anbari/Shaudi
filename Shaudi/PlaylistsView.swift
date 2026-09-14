@@ -172,6 +172,7 @@ struct PlaylistDetailView: View {
     @State private var editingArtworkImage: UIImage?
     @State private var isShowingArtworkCropper = false
     @State private var isPlaylistVisible = false
+    @State private var infoTrack: Track?
 
     private let warmupTrackLimit = 10
 
@@ -326,30 +327,10 @@ struct PlaylistDetailView: View {
                             let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
                                 || playbackManager.isCurrentPlayable(track.youtubeVideoID)
 
-                            NavigationLink {
-                                TrackDetailView(
-                                    track: track,
-                                    queue: tracks,
-                                    playbackOrigin: .playlist(playlist.persistentModelID)
-                                )
-                            } label: {
-                                HStack(spacing: 13) {
-                                    trackArtwork(track)
-
-                                    Text(track.title)
-                                        .font(
-                                            isCurrentlyPlaying
-                                                ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
-                                                : ShaudiTheme.bodyFont(size: 17, relativeTo: .headline)
-                                        )
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 9)
-                                .contentShape(Rectangle())
-                            }
+                            playlistTrackRow(
+                                track,
+                                isCurrentlyPlaying: isCurrentlyPlaying
+                            )
                             .listRowBackground(
                                 isCurrentlyPlaying
                                     ? ShaudiTheme.accent.opacity(0.14)
@@ -361,7 +342,6 @@ struct PlaylistDetailView: View {
                             .listRowSeparator(.visible)
                             .listRowSeparatorTint(ShaudiTheme.accent.opacity(0.14))
                         }
-                        .onDelete(perform: removeTracks)
                     }
                     .listStyle(.insetGrouped)
                     .scrollContentBackground(.hidden)
@@ -372,6 +352,18 @@ struct PlaylistDetailView: View {
         .background(ShaudiTheme.canvas)
         .tint(ShaudiTheme.accent)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(isPresented: Binding(
+            get: { infoTrack != nil },
+            set: { if !$0 { infoTrack = nil } }
+        )) {
+            if let infoTrack {
+                TrackDetailView(
+                    track: infoTrack,
+                    queue: tracks,
+                    playbackOrigin: .playlist(playlist.persistentModelID)
+                )
+            }
+        }
         .onAppear {
             isPlaylistVisible = true
             updatePlaylistWarmup()
@@ -549,11 +541,60 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private func removeTracks(at offsets: IndexSet) {
-        for index in offsets {
-            let track = tracks[index]
-            playlist.tracks.removeAll { $0 === track }
+    private func playlistTrackRow(
+        _ track: Track,
+        isCurrentlyPlaying: Bool
+    ) -> some View {
+        HStack(spacing: 8) {
+            Button {
+                playbackManager.play(
+                    track,
+                    in: tracks,
+                    origin: .playlist(playlist.persistentModelID)
+                )
+            } label: {
+                HStack(spacing: 13) {
+                    trackArtwork(track)
+
+                    Text(track.title)
+                        .font(
+                            isCurrentlyPlaying
+                                ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
+                                : ShaudiTheme.bodyFont(size: 17, relativeTo: .headline)
+                        )
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Menu {
+                Button {
+                    infoTrack = track
+                } label: {
+                    Label("Show Info", systemImage: "info.circle")
+                }
+
+                Button(role: .destructive) {
+                    playlist.tracks.removeAll { $0 === track }
+                } label: {
+                    Label("Remove from Playlist", systemImage: "minus.circle")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.headline)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Song actions")
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 9)
     }
 
     private func trackArtwork(_ track: Track) -> some View {
