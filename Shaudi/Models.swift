@@ -21,6 +21,7 @@ final class Track {
     var lastPlayedAt: Date? = nil
     var playbackStartTime: Double? = nil
     var playbackEndTime: Double? = nil
+    var customCoverID: UUID? = nil
     var playlists: [Playlist]
 
     init(
@@ -37,6 +38,7 @@ final class Track {
         lastPlayedAt: Date? = nil,
         playbackStartTime: Double? = nil,
         playbackEndTime: Double? = nil,
+        customCoverID: UUID? = nil,
         playlists: [Playlist] = []
     ) {
         self.title = title
@@ -52,6 +54,7 @@ final class Track {
         self.lastPlayedAt = lastPlayedAt
         self.playbackStartTime = playbackStartTime
         self.playbackEndTime = playbackEndTime
+        self.customCoverID = customCoverID
         self.playlists = playlists
     }
 }

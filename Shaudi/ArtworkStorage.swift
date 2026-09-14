@@ -4,7 +4,13 @@
 //
 
 import Foundation
+import ImageIO
 import UIKit
+
+enum TrackCoverMedia {
+    case image(UIImage)
+    case animatedGIF(UIImage)
+}
 
 enum ArtworkStorage {
     static let bannerAspectRatio: CGFloat = 360 / 148
@@ -105,6 +111,59 @@ enum ArtworkStorage {
         try? FileManager.default.removeItem(at: url)
     }
 
+    static func trackCover(for coverID: UUID) -> TrackCoverMedia? {
+        let gifURL = directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID))
+        if
+            let data = try? Data(contentsOf: gifURL),
+            let image = animatedGIFImage(from: data)
+        {
+            return .animatedGIF(image)
+        }
+
+        guard let image = image(filename: trackCoverImageFilename(for: coverID)) else {
+            return nil
+        }
+
+        return .image(image)
+    }
+
+    static func saveTrackCover(data: Data, for coverID: UUID) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+
+        if isGIF(data) {
+            guard animatedGIFImage(from: data) != nil else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            deleteTrackCover(for: coverID)
+            try data.write(
+                to: directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID)),
+                options: .atomic
+            )
+            return
+        }
+
+        guard let image = UIImage(data: data) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        deleteTrackCover(for: coverID)
+        try save(image, filename: trackCoverImageFilename(for: coverID))
+    }
+
+    static func deleteTrackCover(for coverID: UUID) {
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(
+            at: directoryURL.appendingPathComponent(trackCoverImageFilename(for: coverID))
+        )
+        try? fileManager.removeItem(
+            at: directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID))
+        )
+    }
+
     private static func image(filename: String) -> UIImage? {
         UIImage(contentsOfFile: directoryURL.appendingPathComponent(filename).path)
     }
@@ -144,6 +203,64 @@ enum ArtworkStorage {
 
     private static func playlistFilename(for artworkID: UUID) -> String {
         "playlist-\(artworkID.uuidString.lowercased()).jpg"
+    }
+
+    private static func trackCoverImageFilename(for coverID: UUID) -> String {
+        "track-cover-\(coverID.uuidString.lowercased()).jpg"
+    }
+
+    private static func trackCoverGIFFilename(for coverID: UUID) -> String {
+        "track-cover-\(coverID.uuidString.lowercased()).gif"
+    }
+
+    private static func isGIF(_ data: Data) -> Bool {
+        data.starts(with: Data("GIF".utf8))
+    }
+
+    private static func animatedGIFImage(from data: Data) -> UIImage? {
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else {
+            return nil
+        }
+
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 1 else {
+            return UIImage(cgImage: firstImage)
+        }
+
+        var frames: [UIImage] = []
+        var duration: TimeInterval = 0
+        for index in 0..<frameCount {
+            guard let image = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+                continue
+            }
+
+            let frameDuration = gifFrameDuration(
+                CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            )
+            duration += frameDuration
+            frames.append(UIImage(cgImage: image))
+        }
+
+        return UIImage.animatedImage(
+            with: frames,
+            duration: max(duration, 0.1 * Double(frames.count))
+        )
+    }
+
+    private static func gifFrameDuration(_ properties: [CFString: Any]?) -> TimeInterval {
+        guard
+            let properties,
+            let gifProperties = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        else {
+            return 0.1
+        }
+
+        let unclampedDelay = gifProperties[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+        let delay = unclampedDelay ?? (gifProperties[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
+        return max(delay, 0.02)
     }
 
     private static var directoryURL: URL {

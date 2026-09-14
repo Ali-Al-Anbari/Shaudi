@@ -5,8 +5,11 @@
 //  Created by Ali Al Anbari on 9/10/26.
 //
 
+import Combine
 import SwiftUI
 import SwiftData
+import PhotosUI
+import UIKit
 
 private enum RootTab: Hashable {
     case library
@@ -101,8 +104,9 @@ struct ContentView: View {
 
             RootTabBar(selectedTab: $selectedTab)
         }
-        .sheet(isPresented: $isShowingNowPlaying) {
+        .fullScreenCover(isPresented: $isShowingNowPlaying) {
             NowPlayingView(playbackManager: playbackManager)
+                .presentationBackground(.clear)
         }
         .tint(appearanceSettings.primaryColor)
         .onChange(of: playbackManager.playbackStartEvent) { _, event in
@@ -332,6 +336,24 @@ private struct MiniPlayerView: View {
 private struct NowPlayingView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var playbackManager: PlaybackManager
+    @State private var playbackTime: TimeInterval = 0
+    @State private var isScrubbing = false
+    @State private var isShowingCoverPicker = false
+    @State private var selectedCover: PhotosPickerItem?
+    @State private var customCoverMedia: TrackCoverMedia?
+    @State private var dismissOffset: CGFloat = 0
+
+    private let artworkHorizontalInset: CGFloat = 48
+    private let maximumArtworkSize: CGFloat = 360
+    private let artworkCornerRadius: CGFloat = 24
+    private let trackSwipeDistance: CGFloat = 90
+    private let trackSwipePredictedDistance: CGFloat = 180
+
+    private let playbackClock = Timer.publish(
+        every: 0.25,
+        on: .main,
+        in: .common
+    ).autoconnect()
 
     private var isPlaying: Bool {
         if case .playing = playbackManager.state {
@@ -342,109 +364,158 @@ private struct NowPlayingView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                ShaudiTheme.dashboardBackground
-                    .ignoresSafeArea()
+        ZStack {
+            background
 
-                VStack(spacing: 24) {
-                    artwork
+            GeometryReader { geometry in
+                let artworkSize = universalArtworkSize(for: geometry)
 
-                    VStack(spacing: 6) {
-                        Text(playbackManager.currentPlayableTrack?.title ?? "")
-                            .font(ShaudiTheme.bodyFont(size: 22, relativeTo: .title3))
-                            .foregroundStyle(.white)
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
+                VStack(spacing: 0) {
+                    topBar
 
-                        if let channelTitle = playbackManager.currentPlayableTrack?.channelTitle,
-                           !channelTitle.isEmpty
-                        {
-                            Text(channelTitle)
-                                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
-                                .foregroundStyle(.white.opacity(0.68))
-                                .lineLimit(1)
-                        }
-                    }
+                    Spacer(minLength: 18)
 
-                    HStack(spacing: 34) {
-                        expandedControl(
-                            systemImage: "backward.fill",
-                            label: "Previous",
-                            isEnabled: playbackManager.hasPreviousTrack
-                        ) {
-                            playbackManager.previousTrack()
-                        }
+                    artworkFrame(size: artworkSize)
+                        .gesture(playerSwipeGesture)
 
-                        expandedControl(
-                            systemImage: isPlaying ? "pause.fill" : "play.fill",
-                            label: isPlaying ? "Pause" : "Play",
-                            isEnabled: playbackManager.currentPlayableTrack != nil,
-                            isPrimary: true
-                        ) {
-                            switch playbackManager.state {
-                            case .playing:
-                                playbackManager.pause()
-                            case .paused:
-                                playbackManager.resume()
-                            case .idle, .resolving, .loading, .failed:
-                                break
-                            }
-                        }
+                    Spacer(minLength: 28)
 
-                        expandedControl(
-                            systemImage: "forward.fill",
-                            label: "Next",
-                            isEnabled: playbackManager.hasNextTrack
-                        ) {
-                            playbackManager.nextTrack()
-                        }
-                    }
+                    metadata
 
-                    HStack(spacing: 18) {
-                        Image(systemName: "shuffle")
-                            .foregroundStyle(
-                                playbackManager.isShuffleEnabled
-                                    ? ShaudiTheme.accent
-                                    : .white.opacity(0.4)
-                            )
+                    Spacer(minLength: 24)
 
-                        Image(
-                            systemName: playbackManager.repeatMode == .one
-                                ? "repeat.1"
-                                : "repeat"
-                        )
-                        .foregroundStyle(
-                            playbackManager.repeatMode == .off
-                                ? .white.opacity(0.4)
-                                : ShaudiTheme.accent
-                        )
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("Shuffle and repeat status")
-                    .accessibilityValue(
-                        "Shuffle \(playbackManager.isShuffleEnabled ? "on" : "off"), repeat \(repeatDescription)"
-                    )
+                    progress
+
+                    Spacer(minLength: 20)
+
+                    playbackControls
+
+                    Spacer(minLength: 22)
+
+                    modeControls
                 }
                 .padding(.horizontal, 24)
-            }
-            .navigationTitle("Now Playing")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
+                .padding(.top, 14)
+                .padding(.bottom, max(24, geometry.safeAreaInsets.bottom + 8))
             }
         }
+        .offset(y: dismissOffset)
         .tint(ShaudiTheme.accent)
-        .presentationDetents([.medium, .large])
-        .presentationDragIndicator(.visible)
+        .photosPicker(
+            isPresented: $isShowingCoverPicker,
+            selection: $selectedCover,
+            matching: .images
+        )
+        .onAppear {
+            reloadCustomCover()
+            updatePlaybackTime()
+        }
+        .onReceive(playbackClock) { _ in
+            guard !isScrubbing else {
+                return
+            }
+
+            updatePlaybackTime()
+        }
+        .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
+            reloadCustomCover()
+            updatePlaybackTime()
+        }
+        .onChange(of: selectedCover) { _, selection in
+            saveSelectedCover(selection)
+        }
+    }
+
+    private var background: some View {
+        ZStack {
+            ShaudiTheme.dashboardBackground
+
+            LinearGradient(
+                colors: [
+                    ShaudiTheme.lavender.opacity(0.20),
+                    ShaudiTheme.dashboardBackground,
+                    ShaudiTheme.accent.opacity(0.12)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+        .overlay(.black.opacity(0.22))
+        .ignoresSafeArea()
+    }
+
+    private var topBar: some View {
+        HStack {
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 19, weight: .bold))
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss Now Playing")
+
+            Spacer()
+
+            Text("NOW PLAYING")
+                .font(ShaudiTheme.bodyFont(size: 13, relativeTo: .caption).weight(.semibold))
+                .tracking(1.4)
+                .foregroundStyle(.white.opacity(0.76))
+
+            Spacer()
+
+            Menu {
+                Button {
+                    isShowingCoverPicker = true
+                } label: {
+                    Label("Change Cover", systemImage: "photo.on.rectangle")
+                }
+                .disabled(currentTrack == nil)
+
+                if customCoverMedia != nil {
+                    Button(role: .destructive) {
+                        removeCustomCover()
+                    } label: {
+                        Label("Remove Custom Cover", systemImage: "trash")
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 19, weight: .bold))
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Now Playing options")
+        }
+        .foregroundStyle(.white)
+    }
+
+    private func artworkFrame(size: CGFloat) -> some View {
+        artwork
+            .frame(width: size, height: size)
+            .background(ShaudiTheme.accent.opacity(0.18))
+            .clipShape(RoundedRectangle(cornerRadius: artworkCornerRadius, style: .continuous))
+            .shadow(color: .black.opacity(0.42), radius: 24, y: 14)
     }
 
     private var artwork: some View {
+        Group {
+            switch customCoverMedia {
+            case .image(let image):
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            case .animatedGIF(let image):
+                AnimatedTrackCover(image: image)
+            case nil:
+                normalArtwork
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var normalArtwork: some View {
         Group {
             if let thumbnailURL = playbackManager.currentPlayableTrack?.thumbnailURL {
                 AsyncImage(url: thumbnailURL) { phase in
@@ -460,32 +531,130 @@ private struct NowPlayingView: View {
                 artworkPlaceholder
             }
         }
-        .frame(maxWidth: 320)
-        .aspectRatio(1, contentMode: .fit)
-        .background(ShaudiTheme.accent.opacity(0.16))
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    private func expandedControl(
+    private var metadata: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(playbackManager.currentPlayableTrack?.title ?? "")
+                .font(ShaudiTheme.bodyFont(size: 25, relativeTo: .title2).weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+
+            Text(playbackManager.currentPlayableTrack?.channelTitle ?? "Unknown artist")
+                .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .body))
+                .foregroundStyle(.white.opacity(0.68))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var progress: some View {
+        VStack(spacing: 7) {
+            Slider(
+                value: Binding(
+                    get: { playbackTime },
+                    set: { playbackTime = $0 }
+                ),
+                in: 0...sliderDuration,
+                onEditingChanged: { editing in
+                    isScrubbing = editing
+                    if !editing {
+                        playbackManager.seek(to: playbackTime)
+                    }
+                }
+            )
+            .tint(ShaudiTheme.accent)
+            .disabled(playbackDuration == nil)
+
+            HStack {
+                Text(YouTubeDuration.formatted(playbackTime))
+                Spacer()
+                Text(remainingTimeLabel)
+            }
+            .font(ShaudiTheme.bodyFont(size: 13, relativeTo: .caption).monospacedDigit())
+            .foregroundStyle(.white.opacity(0.62))
+        }
+    }
+
+    private var playbackControls: some View {
+        HStack(spacing: 18) {
+            playerControl(
+                systemImage: "shuffle",
+                label: "Shuffle \(playbackManager.isShuffleEnabled ? "on" : "off")",
+                isEnabled: true,
+                isActive: playbackManager.isShuffleEnabled
+            ) {
+                playbackManager.toggleShuffle()
+            }
+
+            playerControl(
+                systemImage: "backward.fill",
+                label: "Previous",
+                isEnabled: playbackManager.hasPreviousTrack,
+                size: 46
+            ) {
+                playbackManager.previousTrack()
+            }
+
+            playerControl(
+                systemImage: isPlaying ? "pause.fill" : "play.fill",
+                label: isPlaying ? "Pause" : "Play",
+                isEnabled: playbackManager.currentPlayableTrack != nil,
+                size: 72,
+                isPrimary: true
+            ) {
+                togglePlayback()
+            }
+
+            playerControl(
+                systemImage: "forward.fill",
+                label: "Next",
+                isEnabled: playbackManager.hasNextTrack,
+                size: 46
+            ) {
+                playbackManager.nextTrack()
+            }
+
+            playerControl(
+                systemImage: playbackManager.repeatMode == .one ? "repeat.1" : "repeat",
+                label: "Repeat \(repeatDescription)",
+                isEnabled: true,
+                isActive: playbackManager.repeatMode != .off
+            ) {
+                playbackManager.toggleRepeatMode()
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var modeControls: some View {
+        Text("Hey Shaudi, I LOVE YOU!!")
+            .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .footnote))
+            .foregroundStyle(.white.opacity(0.48))
+    }
+
+    private func playerControl(
         systemImage: String,
         label: String,
         isEnabled: Bool,
+        size: CGFloat = 40,
         isPrimary: Bool = false,
+        isActive: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
             Image(systemName: systemImage)
-                .font(.system(size: isPrimary ? 22 : 18, weight: .semibold))
+                .font(.system(size: isPrimary ? 27 : 18, weight: .semibold))
                 .foregroundStyle(
                     isEnabled
-                        ? ShaudiTheme.accent
-                        : ShaudiTheme.accent.opacity(0.35)
+                        ? (isPrimary ? Color.black : (isActive ? ShaudiTheme.accent : .white))
+                        : .white.opacity(0.28)
                 )
-                .frame(width: isPrimary ? 56 : 44, height: isPrimary ? 56 : 44)
+                .frame(width: size, height: size)
                 .background(
                     isPrimary
-                        ? ShaudiTheme.accent.opacity(0.18)
-                        : ShaudiTheme.accent.opacity(0.12),
+                        ? ShaudiTheme.accent
+                        : Color.white.opacity(isActive ? 0.14 : 0.06),
                     in: Circle()
                 )
         }
@@ -501,6 +670,168 @@ private struct NowPlayingView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    private var playbackDuration: TimeInterval? {
+        guard
+            let duration = playbackManager.currentPlayableTrack?.duration,
+            duration.isFinite,
+            duration > 0
+        else {
+            return nil
+        }
+
+        return duration
+    }
+
+    private var sliderDuration: TimeInterval {
+        max(playbackDuration ?? 0, 1)
+    }
+
+    private var remainingTimeLabel: String {
+        guard let playbackDuration else {
+            return "—"
+        }
+
+        return "−\(YouTubeDuration.formatted(max(0, playbackDuration - playbackTime)))"
+    }
+
+    private func togglePlayback() {
+        switch playbackManager.state {
+        case .playing:
+            playbackManager.pause()
+        case .paused:
+            playbackManager.resume()
+        case .idle, .resolving, .loading, .failed:
+            break
+        }
+    }
+
+    private func updatePlaybackTime() {
+        guard let currentTime = playbackManager.currentPlaybackTime else {
+            return
+        }
+
+        if let playbackDuration {
+            playbackTime = min(max(0, currentTime), playbackDuration)
+        } else {
+            playbackTime = max(0, currentTime)
+        }
+    }
+
+    private var currentTrack: Track? {
+        playbackManager.currentTrack
+    }
+
+    private func reloadCustomCover() {
+        guard let coverID = currentTrack?.customCoverID else {
+            customCoverMedia = nil
+            return
+        }
+
+        customCoverMedia = ArtworkStorage.trackCover(for: coverID)
+    }
+
+    private func saveSelectedCover(_ selection: PhotosPickerItem?) {
+        guard let selection else {
+            return
+        }
+
+        Task { @MainActor in
+            defer { selectedCover = nil }
+            guard let data = try? await selection.loadTransferable(type: Data.self) else {
+                return
+            }
+
+            do {
+                guard let track = currentTrack else {
+                    return
+                }
+
+                let coverID = track.customCoverID ?? UUID()
+                try ArtworkStorage.saveTrackCover(data: data, for: coverID)
+                track.customCoverID = coverID
+                reloadCustomCover()
+            } catch {
+#if DEBUG
+                print("[Artwork] Track cover save failed: \(error.localizedDescription)")
+#endif
+            }
+        }
+    }
+
+    private func removeCustomCover() {
+        guard let track = currentTrack, let coverID = track.customCoverID else {
+            return
+        }
+
+        ArtworkStorage.deleteTrackCover(for: coverID)
+        track.customCoverID = nil
+        customCoverMedia = nil
+    }
+
+    private func universalArtworkSize(for geometry: GeometryProxy) -> CGFloat {
+        let availableWidth = max(0, geometry.size.width - artworkHorizontalInset)
+        let availableHeight = max(0, geometry.size.height * 0.40)
+        return min(availableWidth, availableHeight, maximumArtworkSize)
+    }
+
+    private var playerSwipeGesture: some Gesture {
+        DragGesture(minimumDistance: 12)
+            .onChanged { value in
+                let horizontalDistance = abs(value.translation.width)
+                let verticalDistance = abs(value.translation.height)
+
+                if verticalDistance > horizontalDistance, value.translation.height > 0 {
+                    dismissOffset = value.translation.height
+                }
+            }
+            .onEnded { value in
+                let horizontalDistance = abs(value.translation.width)
+                let verticalDistance = abs(value.translation.height)
+
+                if horizontalDistance > verticalDistance {
+                    handleTrackSwipe(value)
+                    return
+                }
+
+                let projectedOffset = value.predictedEndTranslation.height
+                let isVerticalDismiss = value.translation.height > 0
+                    && verticalDistance > horizontalDistance
+                let shouldDismiss = isVerticalDismiss
+                    && (value.translation.height > 140 || projectedOffset > 300)
+
+                guard shouldDismiss else {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                        dismissOffset = 0
+                    }
+                    return
+                }
+
+                withAnimation(.easeOut(duration: 0.14)) {
+                    dismissOffset = max(dismissOffset, 280)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    dismiss()
+                }
+            }
+    }
+
+    private func handleTrackSwipe(_ value: DragGesture.Value) {
+        let horizontalTranslation = value.translation.width
+        let predictedTranslation = value.predictedEndTranslation.width
+        let reachedThreshold = abs(horizontalTranslation) > trackSwipeDistance
+            || abs(predictedTranslation) > trackSwipePredictedDistance
+
+        guard reachedThreshold else {
+            return
+        }
+
+        if horizontalTranslation < 0 {
+            playbackManager.nextTrack()
+        } else {
+            playbackManager.previousTrack()
+        }
+    }
+
     private var repeatDescription: String {
         switch playbackManager.repeatMode {
         case .off:
@@ -510,6 +841,28 @@ private struct NowPlayingView: View {
         case .one:
             return "one"
         }
+    }
+}
+
+private struct AnimatedTrackCover: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        imageView.image = image
+        imageView.startAnimating()
+        return imageView
+    }
+
+    func updateUIView(_ imageView: UIImageView, context: Context) {
+        guard imageView.image !== image else {
+            return
+        }
+
+        imageView.image = image
+        imageView.startAnimating()
     }
 }
 

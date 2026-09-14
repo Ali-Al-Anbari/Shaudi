@@ -261,7 +261,11 @@ struct LibraryView: View {
             } else {
                 LazyVStack(spacing: 10) {
                     ForEach(tracks) { track in
-                        NavigationLink {
+                        SwipeableDashboardRow(
+                            onDelete: {
+                                deleteTrack(track)
+                            }
+                        ) {
                             TrackDetailView(
                                 track: track,
                                 queue: tracks,
@@ -278,9 +282,7 @@ struct LibraryView: View {
                                 )
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
                     }
-                    .onDelete(perform: deleteTracks)
                 }
             }
         }
@@ -413,8 +415,15 @@ struct LibraryView: View {
 
     private func deleteTracks(at offsets: IndexSet) {
         for index in offsets {
-            modelContext.delete(tracks[index])
+            deleteTrack(tracks[index])
         }
+    }
+
+    private func deleteTrack(_ track: Track) {
+        if let coverID = track.customCoverID {
+            ArtworkStorage.deleteTrackCover(for: coverID)
+        }
+        modelContext.delete(track)
     }
 
     private func trackRow(_ track: Track) -> some View {
@@ -446,6 +455,80 @@ struct LibraryView: View {
             Spacer(minLength: 4)
         }
         .padding(.vertical, 5)
+    }
+}
+
+private struct SwipeableDashboardRow<Destination: View, RowLabel: View>: View {
+    private let actionWidth: CGFloat = 88
+    let onDelete: () -> Void
+    let destination: Destination
+    let label: RowLabel
+
+    @State private var offset: CGFloat = 0
+    @State private var isDeleteRevealed = false
+
+    init(
+        onDelete: @escaping () -> Void,
+        @ViewBuilder destination: () -> Destination,
+        @ViewBuilder label: () -> RowLabel
+    ) {
+        self.onDelete = onDelete
+        self.destination = destination()
+        self.label = label()
+    }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Button(role: .destructive) {
+                withAnimation(.snappy) {
+                    offset = 0
+                    isDeleteRevealed = false
+                }
+                onDelete()
+            } label: {
+                Label("Delete", systemImage: "trash.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: actionWidth)
+                    .frame(maxHeight: .infinity)
+                    .background(.red, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            NavigationLink {
+                destination
+            } label: {
+                label
+            }
+            .buttonStyle(.plain)
+            .offset(x: offset)
+            .simultaneousGesture(swipeGesture)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private var swipeGesture: some Gesture {
+        DragGesture(minimumDistance: 10)
+            .onChanged { value in
+                guard abs(value.translation.width) > abs(value.translation.height) else {
+                    return
+                }
+
+                let restingOffset = isDeleteRevealed ? -actionWidth : 0
+                offset = min(0, max(-actionWidth, restingOffset + value.translation.width))
+            }
+            .onEnded { value in
+                guard abs(value.translation.width) > abs(value.translation.height) else {
+                    return
+                }
+
+                let shouldReveal = value.translation.width < -36
+                    || value.predictedEndTranslation.width < -actionWidth
+                withAnimation(.snappy) {
+                    isDeleteRevealed = shouldReveal
+                    offset = shouldReveal ? -actionWidth : 0
+                }
+            }
     }
 }
 
