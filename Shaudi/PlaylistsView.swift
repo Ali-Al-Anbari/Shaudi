@@ -106,7 +106,7 @@ struct PlaylistsView: View {
     }
 }
 
-private struct PlaylistNameEditor: View {
+struct PlaylistNameEditor: View {
     @Environment(\.dismiss) private var dismiss
 
     let title: String

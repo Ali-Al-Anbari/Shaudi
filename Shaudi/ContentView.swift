@@ -337,6 +337,27 @@ private struct MiniPlayerView: View {
     }
 }
 
+private struct NowPlayingControlFrameKey: PreferenceKey {
+    static var defaultValue: [CGRect] = []
+
+    static func reduce(value: inout [CGRect], nextValue: () -> [CGRect]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
+private extension View {
+    func nowPlayingControlRegion() -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: NowPlayingControlFrameKey.self,
+                    value: [proxy.frame(in: .named("NowPlayingGestureSurface"))]
+                )
+            }
+        }
+    }
+}
+
 private struct NowPlayingView: View {
     private enum DragAxis {
         case horizontal
@@ -352,9 +373,12 @@ private struct NowPlayingView: View {
 
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var playbackManager: PlaybackManager
+    @Query(sort: \Playlist.dateCreated, order: .reverse)
+    private var playlists: [Playlist]
     @State private var playbackTime: TimeInterval = 0
     @State private var isScrubbing = false
     @State private var isShowingCoverPicker = false
+    @State private var isShowingPlaylistPicker = false
     @State private var selectedCover: PhotosPickerItem?
     @State private var customCoverMedia: TrackCoverMedia?
     @State private var previousPage: PageContent?
@@ -363,6 +387,8 @@ private struct NowPlayingView: View {
     @State private var horizontalOffset: CGFloat = 0
     @State private var dismissOffset: CGFloat = 0
     @State private var isGestureSettling = false
+    @State private var isGestureSuppressed = false
+    @State private var controlFrames: [CGRect] = []
 
     private let artworkHorizontalInset: CGFloat = 48
     private let maximumArtworkSize: CGFloat = 360
@@ -393,6 +419,10 @@ private struct NowPlayingView: View {
 
             GeometryReader { geometry in
                 let artworkSize = universalArtworkSize(for: geometry)
+                let pageWidth = max(
+                    0,
+                    geometry.size.width - artworkHorizontalInset
+                )
 
                 VStack(spacing: 0) {
                     topBar
@@ -401,11 +431,7 @@ private struct NowPlayingView: View {
 
                     pagingArea(
                         artworkSize: artworkSize,
-                        pageWidth: max(
-                            0,
-                            geometry.size.width - artworkHorizontalInset
-                        ),
-                        dismissalHeight: geometry.size.height
+                        pageWidth: pageWidth
                     )
 
                     Spacer(minLength: 24)
@@ -423,6 +449,18 @@ private struct NowPlayingView: View {
                 .padding(.horizontal, 24)
                 .padding(.top, 14)
                 .padding(.bottom, max(24, geometry.safeAreaInsets.bottom + 8))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .coordinateSpace(name: "NowPlayingGestureSurface")
+                .onPreferenceChange(NowPlayingControlFrameKey.self) { frames in
+                    controlFrames = frames
+                }
+                .simultaneousGesture(
+                    playerSwipeGesture(
+                        pageWidth: pageWidth,
+                        dismissalHeight: geometry.size.height
+                    )
+                )
             }
         }
         .offset(y: dismissOffset)
@@ -432,6 +470,12 @@ private struct NowPlayingView: View {
             selection: $selectedCover,
             matching: .images
         )
+        .sheet(isPresented: $isShowingPlaylistPicker) {
+            NowPlayingPlaylistPicker(
+                transientTrack: currentTrack,
+                playableTrack: playbackManager.currentPlayableTrack
+            )
+        }
         .onAppear {
             resetGestureState()
             reloadCustomCover()
@@ -446,6 +490,7 @@ private struct NowPlayingView: View {
             updatePlaybackTime()
         }
         .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
+            playbackTime = 0
             reloadCustomCover()
             reloadAdjacentPages()
             updatePlaybackTime()
@@ -454,6 +499,9 @@ private struct NowPlayingView: View {
             reloadAdjacentPages()
         }
         .onChange(of: playbackManager.repeatMode) { _, _ in
+            reloadAdjacentPages()
+        }
+        .onChange(of: queuePreviewSignature) { _, _ in
             reloadAdjacentPages()
         }
         .onChange(of: selectedCover) { _, selection in
@@ -490,6 +538,7 @@ private struct NowPlayingView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Dismiss Now Playing")
+            .nowPlayingControlRegion()
 
             Spacer()
 
@@ -500,36 +549,58 @@ private struct NowPlayingView: View {
 
             Spacer()
 
-            Menu {
+            HStack(spacing: 0) {
                 Button {
-                    isShowingCoverPicker = true
+                    isShowingPlaylistPicker = true
                 } label: {
-                    Label("Change Cover", systemImage: "photo.on.rectangle")
-                }
-                .disabled(currentTrack == nil)
-
-                if customCoverMedia != nil {
-                    Button(role: .destructive) {
-                        removeCustomCover()
-                    } label: {
-                        Label("Remove Custom Cover", systemImage: "trash")
-                    }
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 19, weight: .bold))
+                    Image(
+                        systemName: isCurrentTrackInAPlaylist
+                            ? "checkmark.rectangle.stack"
+                            : "plus.rectangle.on.folder"
+                    )
+                    .font(.system(size: 18, weight: .semibold))
                     .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .disabled(playbackManager.currentPlayableTrack == nil)
+                .accessibilityLabel(
+                    isCurrentTrackInAPlaylist
+                        ? "Manage playlists"
+                        : "Add to playlist"
+                )
+                .nowPlayingControlRegion()
+
+                Menu {
+                    Button {
+                        isShowingCoverPicker = true
+                    } label: {
+                        Label("Change Cover", systemImage: "photo.on.rectangle")
+                    }
+                    .disabled(currentTrack == nil)
+
+                    if customCoverMedia != nil {
+                        Button(role: .destructive) {
+                            removeCustomCover()
+                        } label: {
+                            Label("Remove Custom Cover", systemImage: "trash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 19, weight: .bold))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Now Playing options")
+                .nowPlayingControlRegion()
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Now Playing options")
         }
         .foregroundStyle(.white)
     }
 
     private func pagingArea(
         artworkSize: CGFloat,
-        pageWidth: CGFloat,
-        dismissalHeight: CGFloat
+        pageWidth: CGFloat
     ) -> some View {
         ZStack {
             if horizontalOffset > 0, let previousPage {
@@ -551,12 +622,6 @@ private struct NowPlayingView: View {
         .frame(height: artworkSize + 92)
         .contentShape(Rectangle())
         .clipped()
-        .gesture(
-            playerSwipeGesture(
-                pageWidth: pageWidth,
-                dismissalHeight: dismissalHeight
-            )
-        )
     }
 
     private func nowPlayingPage(
@@ -639,7 +704,7 @@ private struct NowPlayingView: View {
                 onEditingChanged: { editing in
                     isScrubbing = editing
                     if !editing {
-                        playbackManager.seek(to: playbackTime)
+                        playbackManager.seek(toPlaybackProgressTime: playbackTime)
                     }
                 }
             )
@@ -654,6 +719,7 @@ private struct NowPlayingView: View {
             .font(ShaudiTheme.bodyFont(size: 13, relativeTo: .caption).monospacedDigit())
             .foregroundStyle(.white.opacity(0.62))
         }
+        .nowPlayingControlRegion()
     }
 
     private var playbackControls: some View {
@@ -705,6 +771,7 @@ private struct NowPlayingView: View {
             }
         }
         .frame(maxWidth: .infinity)
+        .nowPlayingControlRegion()
     }
 
     private var modeControls: some View {
@@ -751,15 +818,7 @@ private struct NowPlayingView: View {
     }
 
     private var playbackDuration: TimeInterval? {
-        guard
-            let duration = playbackManager.currentPlayableTrack?.duration,
-            duration.isFinite,
-            duration > 0
-        else {
-            return nil
-        }
-
-        return duration
+        playbackManager.currentEffectivePlaybackDuration
     }
 
     private var sliderDuration: TimeInterval {
@@ -786,19 +845,40 @@ private struct NowPlayingView: View {
     }
 
     private func updatePlaybackTime() {
-        guard let currentTime = playbackManager.currentPlaybackTime else {
+        guard let currentTime = playbackManager.currentPlaybackProgressTime else {
+            playbackTime = 0
             return
         }
 
-        if let playbackDuration {
-            playbackTime = min(max(0, currentTime), playbackDuration)
-        } else {
-            playbackTime = max(0, currentTime)
-        }
+        playbackTime = min(max(0, currentTime), playbackDuration ?? 0)
     }
 
     private var currentTrack: Track? {
         playbackManager.currentTrack
+    }
+
+    private var currentPlaybackVideoID: String? {
+        let videoID = playbackManager.currentPlayableTrack?.youtubeVideoID
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return videoID.isEmpty ? nil : videoID
+    }
+
+    private var isCurrentTrackInAPlaylist: Bool {
+        guard let currentPlaybackVideoID else {
+            return false
+        }
+
+        return playlists.contains { playlist in
+            playlist.tracks.contains {
+                $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == currentPlaybackVideoID
+            }
+        }
+    }
+
+    private var queuePreviewSignature: [String] {
+        playbackManager.queue.map(\.youtubeVideoID)
+            + ["index:\(playbackManager.currentIndex ?? -1)"]
     }
 
     private var currentPageContent: PageContent? {
@@ -897,7 +977,16 @@ private struct NowPlayingView: View {
     ) -> some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
-                guard !isGestureSettling, !isScrubbing else {
+                guard !isGestureSettling else {
+                    return
+                }
+
+                if dragAxis == nil,
+                    (isScrubbing || controlFrames.contains(where: { $0.contains(value.startLocation) }))
+                {
+                    isGestureSuppressed = true
+                }
+                guard !isGestureSuppressed, !isScrubbing else {
                     return
                 }
 
@@ -932,6 +1021,10 @@ private struct NowPlayingView: View {
                 }
             }
             .onEnded { value in
+                if isGestureSuppressed || isScrubbing {
+                    resetGestureState()
+                    return
+                }
                 guard !isGestureSettling else {
                     return
                 }
@@ -991,6 +1084,7 @@ private struct NowPlayingView: View {
                 dismissOffset = 0
                 dragAxis = nil
                 isGestureSettling = false
+                isGestureSuppressed = false
             }
         }
     }
@@ -1032,6 +1126,7 @@ private struct NowPlayingView: View {
         } completion: {
             dragAxis = nil
             isGestureSettling = false
+            isGestureSuppressed = false
         }
     }
 
@@ -1047,6 +1142,7 @@ private struct NowPlayingView: View {
             dismissOffset = 0
             dragAxis = nil
             isGestureSettling = false
+            isGestureSuppressed = false
         }
     }
 
@@ -1059,6 +1155,150 @@ private struct NowPlayingView: View {
         case .one:
             return "one"
         }
+    }
+}
+
+private struct NowPlayingPlaylistPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+
+    @Query(sort: \Playlist.dateCreated, order: .reverse)
+    private var playlists: [Playlist]
+    @Query(sort: \Track.dateAdded, order: .reverse)
+    private var libraryTracks: [Track]
+
+    let transientTrack: Track?
+    let playableTrack: PlayableTrack?
+
+    @State private var isShowingNewPlaylist = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Playlists") {
+                    if playlists.isEmpty {
+                        Text("No playlists yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(playlists) { playlist in
+                            Button {
+                                addCurrentTrack(to: playlist)
+                            } label: {
+                                HStack {
+                                    Text(playlist.name)
+                                    Spacer()
+                                    if containsCurrentTrack(in: playlist) {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(ShaudiTheme.accent)
+                                    } else {
+                                        Image(systemName: "plus.circle")
+                                            .foregroundStyle(ShaudiTheme.accent)
+                                    }
+                                }
+                            }
+                            .disabled(containsCurrentTrack(in: playlist))
+                        }
+                    }
+                }
+
+                Section {
+                    Button {
+                        isShowingNewPlaylist = true
+                    } label: {
+                        Label("New Playlist", systemImage: "plus")
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(ShaudiTheme.canvas)
+            .navigationTitle("Add to Playlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+            .sheet(isPresented: $isShowingNewPlaylist) {
+                PlaylistNameEditor(
+                    title: "New Playlist",
+                    actionTitle: "Create"
+                ) { name in
+                    let playlist = Playlist(name: name)
+                    modelContext.insert(playlist)
+                    addCurrentTrack(to: playlist)
+                    isShowingNewPlaylist = false
+                }
+            }
+        }
+    }
+
+    private var currentVideoID: String? {
+        let videoID = playableTrack?.youtubeVideoID
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return videoID.isEmpty ? nil : videoID
+    }
+
+    private func containsCurrentTrack(in playlist: Playlist) -> Bool {
+        guard let currentVideoID else {
+            return false
+        }
+
+        return playlist.tracks.contains {
+            $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                == currentVideoID
+        }
+    }
+
+    private func addCurrentTrack(to playlist: Playlist) {
+        guard
+            !containsCurrentTrack(in: playlist),
+            let track = persistentCurrentTrack()
+        else {
+            return
+        }
+
+        playlist.tracks.append(track)
+        try? modelContext.save()
+    }
+
+    private func persistentCurrentTrack() -> Track? {
+        guard let currentVideoID else {
+            return nil
+        }
+
+        if let existingTrack = libraryTracks.first(where: {
+            $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+                == currentVideoID
+        }) {
+            return existingTrack
+        }
+
+        if let transientTrack {
+            modelContext.insert(transientTrack)
+            return transientTrack
+        }
+
+        guard let playableTrack else {
+            return nil
+        }
+
+        var components = URLComponents(string: "https://www.youtube.com/watch")!
+        components.queryItems = [URLQueryItem(name: "v", value: currentVideoID)]
+        let track = Track(
+            title: playableTrack.title,
+            youtubeURL: components.url!,
+            youtubeVideoID: currentVideoID,
+            channelTitle: playableTrack.channelTitle,
+            thumbnailURL: playableTrack.thumbnailURL,
+            duration: playableTrack.duration,
+            metadataLastRefreshed: .now,
+            playbackStartTime: playableTrack.playbackStartTime,
+            playbackEndTime: playableTrack.playbackEndTime
+        )
+        modelContext.insert(track)
+        return track
     }
 }
 

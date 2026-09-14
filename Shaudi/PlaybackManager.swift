@@ -17,6 +17,7 @@ enum PlaybackOrigin: Equatable {
     case playlist(PersistentIdentifier)
     case library
     case search
+    case recommendations
 }
 
 private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
@@ -74,6 +75,10 @@ struct PlayableTrack: Identifiable, Hashable {
 @MainActor
 final class PlaybackManager: ObservableObject {
     private let streamLookaheadCount = 10
+    private let recommendationUpcomingLimit = 6
+    private let recommendationHistoryLimit = 6
+    private let recommendationService = RecommendationService()
+    private let metadataClient = YouTubeMetadataClient()
 
     enum PlaybackState {
         case idle
@@ -187,6 +192,8 @@ final class PlaybackManager: ObservableObject {
     private var dashboardWarmupTask: Task<Void, Never>?
     private var playlistWarmupTask: Task<Void, Never>?
     private var nextItemPrerollTask: Task<Void, Never>?
+    private var recommendationTasks: [String: Task<Void, Never>] = [:]
+    private var recommendationMetadataTasks: [String: Task<Void, Never>] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
     private var nextItemStatusObservation: NSKeyValueObservation?
@@ -208,6 +215,10 @@ final class PlaybackManager: ObservableObject {
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
     private var pendingTrimPreviewStartTime: (track: Track, time: TimeInterval)?
     private var suspendedPlaybackContext: SuspendedPlaybackContext?
+    private var recommendationSessionID: UUID?
+    private var recommendationSeenVideoIDs: Set<String> = []
+    private var recommendationGeneratedSeedIDs: Set<String> = []
+    private var recommendationMetadataRequestedIDs: Set<String> = []
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
     private var inFlightResolutions: [String: InFlightResolution] = [:]
@@ -278,6 +289,14 @@ final class PlaybackManager: ObservableObject {
         origin: PlaybackOrigin
     ) {
         endActiveTrimPreviewIfNeeded()
+
+        if origin != .recommendations {
+            endRecommendationSession(
+                reason: playlistID(from: origin) == nil
+                    ? "manual playback"
+                    : "playlist playback"
+            )
+        }
 
         let previousPlaylistID = playlistID(from: playbackOrigin)
         pauseSpeculativeWarmupsForPlayback(
@@ -395,6 +414,8 @@ final class PlaybackManager: ObservableObject {
     func play(_ track: PlayableTrack) {
         endActiveTrimPreviewIfNeeded()
 
+        startRecommendationSession(seedVideoID: track.youtubeVideoID)
+
         pauseSpeculativeWarmupsForPlayback(
             requestedVideoID: normalizedVideoID(track.youtubeVideoID)
         )
@@ -407,6 +428,10 @@ final class PlaybackManager: ObservableObject {
         updateRemoteQueueCommands()
 #endif
         startPlaybackContext(track, persistentTrack: nil)
+    }
+
+    func prepareForManualSearchPlayback() {
+        endRecommendationSession(reason: "new Search selection")
     }
 
     func warmDashboardPage(
@@ -888,6 +913,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         let track = queue[currentIndex]
+        hydrateRecommendationMetadataIfNeeded(for: track)
         startPlaybackContext(
             PlayableTrack(track: track),
             persistentTrack: track,
@@ -1039,6 +1065,39 @@ final class PlaybackManager: ObservableObject {
         }
 
         return time
+    }
+
+    var currentEffectivePlaybackDuration: TimeInterval? {
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        guard let endTime = playbackRange.endTime else {
+            return nil
+        }
+
+        return validDuration(endTime - playbackRange.startTime)
+    }
+
+    var currentPlaybackProgressTime: TimeInterval? {
+        guard
+            let currentPlaybackTime,
+            let currentEffectivePlaybackDuration
+        else {
+            return nil
+        }
+
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        return min(
+            max(0, currentPlaybackTime - playbackRange.startTime),
+            currentEffectivePlaybackDuration
+        )
+    }
+
+    func seek(toPlaybackProgressTime time: TimeInterval) {
+        guard time.isFinite else {
+            return
+        }
+
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        seek(to: playbackRange.startTime + time)
     }
 
     func beginTrimPreview(
@@ -1305,6 +1364,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         cancelUpcomingPreResolutionObservation()
+        endRecommendationSession(reason: "playback stopped")
         invalidateCurrentRequest()
         clearPlayer()
         queue = []
@@ -3350,10 +3410,281 @@ final class PlaybackManager: ObservableObject {
             trackID: videoID
         )
 
+        handleConfirmedRecommendationPlaybackStart(
+            playableTrack: currentPlayableTrack,
+            sourceTrack: currentTrack,
+            origin: playbackOrigin
+        )
+
 #if DEBUG
         if case .playlist(let playlistID) = playbackOrigin {
             print("[PlaybackContext] playlist=\(playlistID)")
         }
+#endif
+    }
+
+    private func startRecommendationSession(seedVideoID: String) {
+        endRecommendationSession(reason: "new Search playback")
+
+        let seedVideoID = normalizedVideoID(seedVideoID)
+        recommendationSessionID = UUID()
+        recommendationSeenVideoIDs = seedVideoID.isEmpty ? [] : [seedVideoID]
+        recommendationGeneratedSeedIDs = []
+        recommendationLog("session started seed=\(seedVideoID)")
+    }
+
+    private func endRecommendationSession(reason: String) {
+        guard recommendationSessionID != nil else {
+            return
+        }
+
+        for task in recommendationTasks.values {
+            task.cancel()
+        }
+        for task in recommendationMetadataTasks.values {
+            task.cancel()
+        }
+        recommendationTasks = [:]
+        recommendationMetadataTasks = [:]
+        recommendationSessionID = nil
+        recommendationSeenVideoIDs = []
+        recommendationGeneratedSeedIDs = []
+        recommendationMetadataRequestedIDs = []
+        recommendationLog("mode ended for \(reason)")
+    }
+
+    private func hydrateRecommendationMetadataIfNeeded(for track: Track) {
+        guard
+            playbackOrigin == .recommendations,
+            validDuration(track.duration) == nil
+        else {
+            return
+        }
+
+        let videoID = normalizedVideoID(track.youtubeVideoID)
+        guard
+            !videoID.isEmpty,
+            let sessionID = recommendationSessionID,
+            recommendationMetadataRequestedIDs.insert(videoID).inserted
+        else {
+            return
+        }
+
+        recommendationMetadataTasks[videoID] = Task { [weak self] in
+            do {
+                let metadata = try await metadataClient.metadata(for: videoID)
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationMetadataTasks[videoID] = nil
+                }
+
+                track.title = metadata.title
+                track.channelTitle = metadata.channelTitle ?? track.channelTitle
+                track.thumbnailURL = metadata.thumbnailURL ?? track.thumbnailURL
+                track.duration = metadata.duration
+                track.metadataLastRefreshed = .now
+
+                guard currentTrack === track else {
+                    return
+                }
+
+                currentPlayableTrack = PlayableTrack(track: track)
+                updateActivePlaybackRange(
+                    effectivePlaybackRange(for: currentPlayableTrack)
+                )
+#if os(iOS)
+                if let activeRequestID, let currentPlayableTrack {
+                    publishNowPlaying(currentPlayableTrack, requestID: activeRequestID)
+                }
+#endif
+                recommendationLog("metadata ready track=\(videoID)")
+            } catch is CancellationError {
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationMetadataTasks[videoID] = nil
+                }
+            } catch {
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationMetadataTasks[videoID] = nil
+                }
+                recommendationLog("metadata failed track=\(videoID)")
+            }
+        }
+    }
+
+    private func handleConfirmedRecommendationPlaybackStart(
+        playableTrack: PlayableTrack?,
+        sourceTrack: Track?,
+        origin: PlaybackOrigin
+    ) {
+        guard
+            origin == .search || origin == .recommendations,
+            let sessionID = recommendationSessionID,
+            let playableTrack
+        else {
+            return
+        }
+
+        let seedVideoID = normalizedVideoID(playableTrack.youtubeVideoID)
+        guard
+            !seedVideoID.isEmpty,
+            recommendationGeneratedSeedIDs.insert(seedVideoID).inserted,
+            recommendationTasks[seedVideoID] == nil
+        else {
+            return
+        }
+
+        recommendationSeenVideoIDs.insert(seedVideoID)
+        let seed = RecommendationSeed(
+            youtubeVideoID: seedVideoID,
+            title: playableTrack.title,
+            displayedArtist: playableTrack.channelTitle,
+            sourceChannel: sourceTrack?.channelTitle ?? playableTrack.channelTitle
+        )
+        let excludedVideoIDs = recommendationSeenVideoIDs
+        let service = recommendationService
+
+        recommendationLog("seed=\(seedVideoID)")
+        recommendationLog("searching")
+        recommendationTasks[seedVideoID] = Task { [weak self] in
+            do {
+                let results = try await service.recommendations(
+                    for: seed,
+                    excluding: excludedVideoIDs
+                )
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationTasks[seedVideoID] = nil
+                }
+
+                guard
+                    recommendationSessionID == sessionID,
+                    playbackOrigin == .search || playbackOrigin == .recommendations
+                else {
+                    recommendationLog("ignored stale result")
+                    return
+                }
+
+                appendRecommendations(results, seed: playableTrack)
+            } catch is CancellationError {
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationTasks[seedVideoID] = nil
+                }
+                recommendationLog("ignored stale result")
+            } catch {
+                guard let self else {
+                    return
+                }
+                if recommendationSessionID == sessionID {
+                    recommendationTasks[seedVideoID] = nil
+                }
+                recommendationLog(
+                    "search failed seed=\(seedVideoID) error=\(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private func appendRecommendations(
+        _ results: [YouTubeSearchResult],
+        seed: PlayableTrack
+    ) {
+        let uniqueResults = results.filter { result in
+            let videoID = normalizedVideoID(result.youtubeVideoID)
+            guard !videoID.isEmpty else {
+                return false
+            }
+            return recommendationSeenVideoIDs.insert(videoID).inserted
+        }
+        let newTracks = uniqueResults.map(transientRecommendationTrack(for:))
+
+        guard !newTracks.isEmpty else {
+            recommendationLog("selected=")
+            return
+        }
+
+        if currentIndex == nil {
+            queue = [transientRecommendationTrack(for: seed)]
+            currentIndex = queue.startIndex
+        }
+
+        guard let currentIndex, queue.indices.contains(currentIndex) else {
+            return
+        }
+
+        let historyStart = max(queue.startIndex, currentIndex - recommendationHistoryLimit + 1)
+        let history = Array(queue[historyStart...currentIndex])
+        let existingUpcoming: [Track]
+        if currentIndex < queue.index(before: queue.endIndex) {
+            existingUpcoming = Array(queue[queue.index(after: currentIndex)...])
+        } else {
+            existingUpcoming = []
+        }
+        let upcoming = Array(
+            (existingUpcoming + newTracks)
+                .prefix(recommendationUpcomingLimit)
+        )
+
+        queue = history + upcoming
+        self.currentIndex = history.count - 1
+        playbackOrigin = .recommendations
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        refreshQueuePredictionsAfterMutation()
+        recommendationLog(
+            "selected=\(uniqueResults.map(\.youtubeVideoID).joined(separator: ","))"
+        )
+    }
+
+    private func transientRecommendationTrack(
+        for result: YouTubeSearchResult
+    ) -> Track {
+        Track(
+            title: result.title,
+            youtubeURL: youtubeWatchURL(for: result.youtubeVideoID),
+            youtubeVideoID: result.youtubeVideoID,
+            channelTitle: result.channelTitle,
+            thumbnailURL: result.thumbnailURL,
+            metadataLastRefreshed: .now
+        )
+    }
+
+    private func transientRecommendationTrack(for track: PlayableTrack) -> Track {
+        Track(
+            title: track.title,
+            youtubeURL: youtubeWatchURL(for: track.youtubeVideoID),
+            youtubeVideoID: track.youtubeVideoID,
+            channelTitle: track.channelTitle,
+            thumbnailURL: track.thumbnailURL,
+            duration: track.duration,
+            metadataLastRefreshed: .now,
+            playbackStartTime: track.playbackStartTime,
+            playbackEndTime: track.playbackEndTime
+        )
+    }
+
+    private func youtubeWatchURL(for videoID: String) -> URL {
+        var components = URLComponents(string: "https://www.youtube.com/watch")!
+        components.queryItems = [URLQueryItem(name: "v", value: videoID)]
+        return components.url!
+    }
+
+    private func recommendationLog(_ message: String) {
+#if DEBUG
+        print("[Recommendations] \(message)")
 #endif
     }
 

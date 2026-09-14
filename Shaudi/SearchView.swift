@@ -575,6 +575,7 @@ struct SearchView: View {
     }
 
     private func play(_ result: YouTubeSearchResult) {
+        playbackManager.prepareForManualSearchPlayback()
         let requestID = UUID()
         playRequestID = requestID
         beginAction(for: result)
