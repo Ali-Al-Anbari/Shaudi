@@ -12,7 +12,7 @@ struct LastFMSimilarTrack: Hashable {
     let url: URL?
 }
 
-struct LastFMRecommendationService {
+struct LastFMRecommendationService: GenreTagFetching {
     enum ServiceError: LocalizedError {
         case missingAPIKey
         case invalidRequest
@@ -105,6 +105,35 @@ struct LastFMRecommendationService {
         print("[LastFM] candidates received=\(tracks.count)")
 #endif
         return tracks
+    }
+
+    func topTags(artist: String, title: String) async throws -> [GenreTag] {
+#if DEBUG
+        print("[GenreStats] lookup artist=\(artist) track=\(title)")
+#endif
+        let data = try await request(method: "track.getTopTags", queryItems: [
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "track", value: title),
+            URLQueryItem(name: "autocorrect", value: "1")
+        ])
+
+        let response: TopTagsResponse
+        do {
+            response = try JSONDecoder().decode(TopTagsResponse.self, from: data)
+        } catch {
+#if DEBUG
+            print("[GenreStats] lookup failed=track.getTopTags response decoding")
+#endif
+            throw ServiceError.malformedResponse
+        }
+
+        return response.toptags.tag.compactMap { item in
+            let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else {
+                return nil
+            }
+            return GenreTag(name: name, weight: item.count)
+        }
     }
 
     private func request(
@@ -241,6 +270,35 @@ private struct SimilarTracksResponse: Decodable {
 
     struct Artist: Decodable {
         let name: String
+    }
+}
+
+private struct TopTagsResponse: Decodable {
+    let toptags: TopTags
+
+    struct TopTags: Decodable {
+        let tag: [Tag]
+    }
+
+    struct Tag: Decodable {
+        let name: String
+        let count: Int
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            if let value = try? container.decode(Int.self, forKey: .count) {
+                count = value
+            } else {
+                let value = try container.decode(String.self, forKey: .count)
+                count = Int(value) ?? 0
+            }
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case count
+        }
     }
 }
 

@@ -93,6 +93,8 @@ final class PlaybackManager: ObservableObject {
     private let recommendationUpcomingWatermark = RecommendationRadioPolicy.targetUpcomingCount
     private let recommendationService = RecommendationService()
     private let metadataClient = YouTubeMetadataClient()
+    private let genreTagService = LastFMRecommendationService()
+    private let genreLookupCoordinator = GenreLookupCoordinator()
 
     enum PlaybackState {
         case idle
@@ -4030,6 +4032,72 @@ final class PlaybackManager: ObservableObject {
 
         activeListeningPeriod.track.totalListenedDuration +=
             finishedAt - activeListeningPeriod.startedAt
+        scheduleGenreLookupIfNeeded(for: activeListeningPeriod.track)
+    }
+
+    private func scheduleGenreLookupIfNeeded(for track: Track) {
+        guard
+            !isTrimPreviewActive,
+            track.modelContext != nil,
+            track.totalListenedDuration >= GenreStatsPolicy.meaningfulListeningThreshold
+        else {
+#if DEBUG
+            if track.totalListenedDuration < GenreStatsPolicy.meaningfulListeningThreshold {
+                print("[GenreStats] lookup skipped=insufficient listening")
+            }
+#endif
+            return
+        }
+
+        let seed = RecommendationSeed(
+            youtubeVideoID: track.youtubeVideoID,
+            rawTitle: track.title,
+            displayedArtist: track.displayArtist,
+            sourceChannel: track.channelTitle,
+            userArtistOverride: track.userArtistOverride
+        )
+        let identity = seed.songIdentity
+        guard !identity.artist.isEmpty, !identity.title.isEmpty else {
+            return
+        }
+
+        let cacheState = track.genreTagCacheState
+        let service = genreTagService
+        Task { [weak self, track] in
+            guard let self else {
+                return
+            }
+
+            let result = await genreLookupCoordinator.lookup(
+                cacheState: cacheState,
+                cacheKey: identity.cacheKey,
+                artist: identity.artist,
+                title: identity.title,
+                fetcher: service
+            )
+            guard !Task.isCancelled, track.modelContext != nil else {
+                return
+            }
+
+            switch result {
+            case .success(let genres):
+                track.storeGenreTags(genres)
+#if DEBUG
+                print("[GenreStats] cached genres=\(genres.joined(separator: ", "))")
+#endif
+            case .cached:
+#if DEBUG
+                print("[GenreStats] cache hit track=\(identity.title)")
+#endif
+            case .failed:
+                track.genreTagsLastAttemptAt = .now
+#if DEBUG
+                print("[GenreStats] lookup failed=optional enrichment")
+#endif
+            case .inFlight, .retryDeferred:
+                break
+            }
+        }
     }
 
     private func activateAudioSession() throws {

@@ -23,6 +23,14 @@ struct ListeningStatsView: View {
         totalPlays > 0 || totalListeningTime > 0
     }
 
+    private var favoriteGenres: [FavoriteGenre] {
+        FavoriteGenreCalculator.favorites(
+            from: tracks.map {
+                (genres: $0.cachedGenreTags, listeningDuration: $0.totalListenedDuration)
+            }
+        )
+    }
+
     private var topTracks: [Track] {
         Array(
             tracks
@@ -95,6 +103,8 @@ struct ListeningStatsView: View {
                 summary
 
                 if hasListeningStats {
+                    favoriteGenresSection
+
                     if !topTracks.isEmpty {
                         statsSection("Top Tracks") {
                             ForEach(Array(topTracks.enumerated()), id: \.element.persistentModelID) {
@@ -161,6 +171,27 @@ struct ListeningStatsView: View {
         }
     }
 
+    @ViewBuilder
+    private var favoriteGenresSection: some View {
+        statsSection("Favorite Genres") {
+            if favoriteGenres.isEmpty {
+                Text("Listen to more music to discover your favorite genres.")
+                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                    .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 16)
+            } else {
+                let maximumDuration = favoriteGenres.first?.listeningDuration ?? 1
+                ForEach(Array(favoriteGenres.prefix(5))) { genre in
+                    FavoriteGenreRow(
+                        genre: genre,
+                        maximumDuration: maximumDuration
+                    )
+                }
+            }
+        }
+    }
+
     private func summaryCard(_ title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(value)
@@ -208,6 +239,47 @@ struct ListeningStatsView: View {
         }
 
         return "\(totalMinutes / 60)h \(totalMinutes % 60)m"
+    }
+}
+
+private struct FavoriteGenreRow: View {
+    let genre: FavoriteGenre
+    let maximumDuration: TimeInterval
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Text(genre.name)
+                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline).weight(.semibold))
+                    .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                Text("\(genre.percentage)%")
+                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline).weight(.semibold))
+                    .foregroundStyle(ShaudiTheme.accent)
+            }
+
+            GeometryReader { proxy in
+                Capsule()
+                    .fill(ShaudiTheme.accent)
+                    .frame(
+                        width: proxy.size.width * min(
+                            1,
+                            genre.listeningDuration / max(1, maximumDuration)
+                        )
+                    )
+            }
+            .frame(height: 6)
+            .background(
+                ShaudiTheme.accent.opacity(0.14),
+                in: Capsule()
+            )
+        }
+        .padding(.vertical, 11)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(genre.name), \(genre.percentage) percent")
     }
 }
 

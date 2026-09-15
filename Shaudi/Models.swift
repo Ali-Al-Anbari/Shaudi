@@ -20,6 +20,9 @@ final class Track {
     var playCount: Int = 0
     var totalListenedDuration: TimeInterval = 0
     var lastPlayedAt: Date? = nil
+    var genreTagsStorage: String = ""
+    var genreTagsFetchedAt: Date? = nil
+    var genreTagsLastAttemptAt: Date? = nil
     var playbackStartTime: Double? = nil
     var playbackEndTime: Double? = nil
     var customCoverID: UUID? = nil
@@ -71,6 +74,26 @@ extension Track {
         let override = userArtistOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
         let value = override?.isEmpty == false ? override : channelTitle
         return value.map(MusicMetadataText.decoded)
+    }
+
+    var cachedGenreTags: [String] {
+        genreTagsStorage
+            .split(separator: "|")
+            .map(String.init)
+    }
+
+    var genreTagCacheState: GenreTagCacheState {
+        GenreTagCacheState(
+            genres: cachedGenreTags,
+            fetchedAt: genreTagsFetchedAt,
+            lastAttemptAt: genreTagsLastAttemptAt
+        )
+    }
+
+    func storeGenreTags(_ genres: [String], fetchedAt: Date = .now) {
+        genreTagsStorage = genres.joined(separator: "|")
+        genreTagsFetchedAt = fetchedAt
+        genreTagsLastAttemptAt = fetchedAt
     }
 }
 
