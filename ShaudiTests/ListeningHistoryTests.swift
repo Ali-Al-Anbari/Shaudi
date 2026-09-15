@@ -189,6 +189,71 @@ final class ListeningHistoryTests: XCTestCase {
         XCTAssertEqual(recent.first?.canonicalTitle, "Song 249")
         XCTAssertEqual(recent.last?.canonicalTitle, "Song 240")
     }
+
+    func testTopArtistsGroupsCaseDifferencesAndKeepsDisplayArtistReadable() {
+        let artists = ListeningHistoryStats.topArtists(from: [
+            historyEntry(artist: "Juice WRLD", title: "Bandit", duration: 40),
+            historyEntry(artist: "juice wrld", title: "Lucid Dreams", duration: 20),
+            historyEntry(artist: "JUICE WRLD", title: "Robbery", duration: 10)
+        ])
+
+        XCTAssertEqual(artists.count, 1)
+        XCTAssertEqual(artists[0].displayArtist, "Juice WRLD")
+        XCTAssertEqual(artists[0].listenedDuration, 70, accuracy: 0.001)
+        XCTAssertEqual(artists[0].eventCount, 3)
+    }
+
+    func testTopArtistsSortByListenedDuration() {
+        let artists = ListeningHistoryStats.topArtists(from: [
+            historyEntry(artist: "Paramore", title: "A", duration: 40),
+            historyEntry(artist: "Shakira", title: "B", duration: 80)
+        ])
+
+        XCTAssertEqual(artists.map(\.displayArtist), ["Shakira", "Paramore"])
+    }
+
+    func testTopArtistsBreakDurationTieByEventCountThenAlphabetically() {
+        let artists = ListeningHistoryStats.topArtists(from: [
+            historyEntry(artist: "Zulu", title: "A", duration: 60),
+            historyEntry(artist: "Alpha", title: "B", duration: 30),
+            historyEntry(artist: "Alpha", title: "C", duration: 30),
+            historyEntry(artist: "Bravo", title: "D", duration: 60),
+            historyEntry(artist: "Charlie", title: "E", duration: 60)
+        ])
+
+        XCTAssertEqual(artists.map(\.displayArtist), ["Alpha", "Bravo", "Charlie", "Zulu"])
+    }
+
+    func testTopArtistsIgnoresZeroDurationEventsAndIncludesUnsavedSources() {
+        let artists = ListeningHistoryStats.topArtists(from: [
+            historyEntry(artist: "Lil Peep", title: "Falling Down", duration: 30, source: .search),
+            historyEntry(artist: "Lil Peep", title: "Star Shopping", duration: 45, source: .recommendations),
+            historyEntry(artist: "Distractor", title: "Silent", duration: 0, source: .search)
+        ])
+
+        XCTAssertEqual(artists.count, 1)
+        XCTAssertEqual(artists[0].displayArtist, "Lil Peep")
+        XCTAssertEqual(artists[0].listenedDuration, 75, accuracy: 0.001)
+        XCTAssertEqual(artists[0].eventCount, 2)
+    }
+}
+
+@MainActor
+private func historyEntry(
+    artist: String,
+    title: String,
+    duration: TimeInterval,
+    source: ListeningHistoryPlaybackSource = .library
+) -> ListeningHistoryEntry {
+    let identity = SongIdentity(artist: artist, title: title)
+    return ListeningHistoryEntry(
+        youtubeVideoID: UUID().uuidString,
+        canonicalArtist: identity.artist,
+        canonicalTitle: identity.title,
+        canonicalIdentityKey: identity.cacheKey,
+        playbackSourceRawValue: source.rawValue,
+        listenedDuration: duration
+    )
 }
 
 @MainActor

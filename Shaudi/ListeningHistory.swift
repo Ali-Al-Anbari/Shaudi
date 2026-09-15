@@ -230,6 +230,15 @@ final class ListeningHistoryRecorder {
 }
 
 enum ListeningHistoryStats {
+    struct TopArtist: Identifiable, Equatable {
+        let normalizedArtist: String
+        let displayArtist: String
+        let listenedDuration: TimeInterval
+        let eventCount: Int
+
+        var id: String { normalizedArtist }
+    }
+
     static func recentDescriptor(limit: Int) -> FetchDescriptor<ListeningHistoryEntry> {
         var descriptor = FetchDescriptor<ListeningHistoryEntry>(
             sortBy: [SortDescriptor(\.startedAt, order: .reverse)]
@@ -240,5 +249,59 @@ enum ListeningHistoryStats {
 
     static func identity(for entry: ListeningHistoryEntry) -> SongIdentity {
         SongIdentity(artist: entry.canonicalArtist, title: entry.canonicalTitle)
+    }
+
+    static func topArtists(
+        from entries: [ListeningHistoryEntry],
+        limit: Int = 5
+    ) -> [TopArtist] {
+        struct Accumulator {
+            var displayArtist: String
+            var listenedDuration: TimeInterval
+            var eventCount: Int
+        }
+
+        var artists: [String: Accumulator] = [:]
+        for entry in entries where entry.confirmedPlay && entry.listenedDuration > 0 {
+            let displayArtist = MusicMetadataText.decoded(entry.canonicalArtist)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedArtist = SongNormalization.text(displayArtist)
+            guard !normalizedArtist.isEmpty else {
+                continue
+            }
+
+            if var artist = artists[normalizedArtist] {
+                artist.listenedDuration += entry.listenedDuration
+                artist.eventCount += 1
+                artists[normalizedArtist] = artist
+            } else {
+                artists[normalizedArtist] = Accumulator(
+                    displayArtist: displayArtist,
+                    listenedDuration: entry.listenedDuration,
+                    eventCount: 1
+                )
+            }
+        }
+
+        return artists.map { normalizedArtist, artist in
+            TopArtist(
+                normalizedArtist: normalizedArtist,
+                displayArtist: artist.displayArtist,
+                listenedDuration: artist.listenedDuration,
+                eventCount: artist.eventCount
+            )
+        }
+        .sorted { first, second in
+            if first.listenedDuration != second.listenedDuration {
+                return first.listenedDuration > second.listenedDuration
+            }
+            if first.eventCount != second.eventCount {
+                return first.eventCount > second.eventCount
+            }
+            return first.displayArtist.localizedStandardCompare(second.displayArtist)
+                == .orderedAscending
+        }
+        .prefix(max(0, limit))
+        .map { $0 }
     }
 }

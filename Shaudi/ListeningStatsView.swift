@@ -7,6 +7,8 @@ struct ListeningStatsView: View {
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var tracks: [Track]
     @Query private var recentHistory: [ListeningHistoryEntry]
+    @Query(sort: \ListeningHistoryEntry.startedAt, order: .reverse)
+    private var listeningHistory: [ListeningHistoryEntry]
 
     init() {
         _recentHistory = Query(ListeningHistoryStats.recentDescriptor(limit: 5))
@@ -34,6 +36,10 @@ struct ListeningStatsView: View {
                 (genres: $0.cachedGenreTags, listeningDuration: $0.totalListenedDuration)
             }
         )
+    }
+
+    private var topArtists: [ListeningHistoryStats.TopArtist] {
+        ListeningHistoryStats.topArtists(from: listeningHistory)
     }
 
     private var topTracks: [Track] {
@@ -86,6 +92,7 @@ struct ListeningStatsView: View {
 
                 if hasListeningStats {
                     favoriteGenresSection
+                    topArtistsSection
 
                     if !topTracks.isEmpty {
                         statsSection("Top Tracks") {
@@ -162,6 +169,27 @@ struct ListeningStatsView: View {
                 ShaudiTheme.dashboardCard,
                 in: RoundedRectangle(cornerRadius: 18, style: .continuous)
             )
+        }
+    }
+
+    @ViewBuilder
+    private var topArtistsSection: some View {
+        statsSection("Top Artists") {
+            if topArtists.isEmpty {
+                Text("Based on listening history recorded by Shaudi.")
+                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                    .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 16)
+            } else {
+                ForEach(Array(topArtists.enumerated()), id: \.element.id) { index, artist in
+                    TopArtistRow(
+                        rank: index + 1,
+                        artist: artist,
+                        detail: formattedListeningTime(artist.listenedDuration)
+                    )
+                }
+            }
         }
     }
 
@@ -353,6 +381,39 @@ private struct StatsTrackRow: View {
             .frame(width: 42, height: 42)
             .background(ShaudiTheme.lavender.opacity(0.14))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct TopArtistRow: View {
+    let rank: Int
+    let artist: ListeningHistoryStats.TopArtist
+    let detail: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("\(rank)")
+                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline).weight(.semibold))
+                .foregroundStyle(ShaudiTheme.accent)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(artist.displayArtist)
+                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+                    .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                    .lineLimit(1)
+
+                Text("\(artist.eventCount) \(artist.eventCount == 1 ? "listen" : "listens")")
+                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                    .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+            }
+
+            Spacer(minLength: 8)
+
+            Text(detail)
+                .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+        }
+        .padding(.vertical, 11)
     }
 }
 
