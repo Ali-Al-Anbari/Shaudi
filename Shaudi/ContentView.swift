@@ -113,6 +113,9 @@ struct ContentView: View {
         // the system's default black window background.
         .background(ShaudiTheme.dashboardBackground.ignoresSafeArea())
         .tint(appearanceSettings.primaryColor)
+        .onAppear {
+            playbackManager.configureListeningHistory(modelContext: modelContext)
+        }
         .onChange(of: playbackManager.playbackStartEvent) { _, event in
             recordRecentlyPlayedPlaylist(for: event)
         }

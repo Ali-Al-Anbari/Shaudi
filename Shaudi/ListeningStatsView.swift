@@ -6,6 +6,11 @@ struct ListeningStatsView: View {
 
     @Query(sort: \Track.dateAdded, order: .reverse)
     private var tracks: [Track]
+    @Query private var recentHistory: [ListeningHistoryEntry]
+
+    init() {
+        _recentHistory = Query(ListeningHistoryStats.recentDescriptor(limit: 5))
+    }
 
     private var totalListeningTime: TimeInterval {
         tracks.reduce(0) { $0 + $1.totalListenedDuration }
@@ -20,7 +25,7 @@ struct ListeningStatsView: View {
     }
 
     private var hasListeningStats: Bool {
-        totalPlays > 0 || totalListeningTime > 0
+        totalPlays > 0 || totalListeningTime > 0 || !recentHistory.isEmpty
     }
 
     private var favoriteGenres: [FavoriteGenre] {
@@ -69,29 +74,6 @@ struct ListeningStatsView: View {
         )
     }
 
-    private var recentlyPlayedTracks: [Track] {
-        Array(
-            tracks
-                .compactMap { track -> (track: Track, date: Date)? in
-                    guard let date = track.lastPlayedAt else {
-                        return nil
-                    }
-
-                    return (track, date)
-                }
-                .sorted { first, second in
-                    if first.date != second.date {
-                        return first.date > second.date
-                    }
-
-                    return first.track.title.localizedStandardCompare(second.track.title)
-                        == .orderedAscending
-                }
-                .prefix(5)
-                .map(\.track)
-        )
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
@@ -134,12 +116,8 @@ struct ListeningStatsView: View {
                         }
                     }
 
-                    if !recentlyPlayedTracks.isEmpty {
-                        statsSection("Recently Played") {
-                            ForEach(recentlyPlayedTracks) { track in
-                                RecentlyPlayedTrackRow(track: track)
-                            }
-                        }
+                    if !recentHistory.isEmpty {
+                        recentlyPlayedSection
                     }
                 } else {
                     ContentUnavailableView(
@@ -157,6 +135,34 @@ struct ListeningStatsView: View {
         .background(ShaudiTheme.dashboardBackground)
         .navigationBarTitleDisplayMode(.inline)
         .tint(appearanceSettings.primaryColor)
+    }
+
+    private var recentlyPlayedSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Recently Played")
+                    .font(ShaudiTheme.bodyFont(size: 19, relativeTo: .headline).weight(.semibold))
+                    .foregroundStyle(ShaudiTheme.accent)
+
+                Spacer()
+
+                NavigationLink("Show All") {
+                    ListeningHistoryView()
+                }
+                .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline).weight(.semibold))
+            }
+
+            LazyVStack(spacing: 0) {
+                ForEach(recentHistory) { entry in
+                    ListeningHistoryRow(entry: entry)
+                }
+            }
+            .padding(.horizontal, 14)
+            .background(
+                ShaudiTheme.dashboardCard,
+                in: RoundedRectangle(cornerRadius: 18, style: .continuous)
+            )
+        }
     }
 
     private var summary: some View {
@@ -350,35 +356,125 @@ private struct StatsTrackRow: View {
     }
 }
 
-private struct RecentlyPlayedTrackRow: View {
-    let track: Track
+private struct ListeningHistoryRow: View {
+    let entry: ListeningHistoryEntry
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(track.displayTitle)
-                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
-                .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
-                .lineLimit(1)
+        HStack(spacing: 12) {
+            artwork
 
-            HStack(spacing: 6) {
-                if let artist = track.displayArtist, !artist.isEmpty {
-                    Text(artist)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(entry.canonicalTitle)
+                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+                    .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
+                    .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    if !entry.canonicalArtist.isEmpty {
+                        Text(entry.canonicalArtist)
+                            .lineLimit(1)
+                    }
+
+                    if !entry.canonicalArtist.isEmpty {
+                        Text("•")
+                    }
+
+                    Text(entry.startedAt.formatted(date: .abbreviated, time: .shortened))
                         .lineLimit(1)
                 }
-
-                if track.displayArtist?.isEmpty == false {
-                    Text("•")
-                }
-
-                if let lastPlayedAt = track.lastPlayedAt {
-                    Text(lastPlayedAt.formatted(date: .abbreviated, time: .shortened))
-                        .lineLimit(1)
-                }
+                .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
             }
-            .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
-            .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 11)
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        if let artworkURL = entry.artworkURL {
+            AsyncImage(url: artworkURL) { phase in
+                if case let .success(image) = phase {
+                    image.resizable().scaledToFill()
+                } else {
+                    artworkPlaceholder
+                }
+            }
+            .frame(width: 42, height: 42)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        } else {
+            artworkPlaceholder
+        }
+    }
+
+    private var artworkPlaceholder: some View {
+        Image(systemName: "music.note")
+            .font(.headline)
+            .foregroundStyle(ShaudiTheme.lavender)
+            .frame(width: 42, height: 42)
+            .background(ShaudiTheme.lavender.opacity(0.14))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct ListeningHistoryView: View {
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
+    @State private var entries: [ListeningHistoryEntry] = []
+    @State private var reachedEnd = false
+
+    var body: some View {
+        Group {
+            if entries.isEmpty, reachedEnd {
+                ContentUnavailableView(
+                    "No Listening History",
+                    systemImage: "clock.arrow.circlepath",
+                    description: Text("Songs you listen to will appear here.")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(entries) { entry in
+                            ListeningHistoryRow(entry: entry)
+                                .padding(.horizontal, 16)
+                                .onAppear {
+                                    if entry.id == entries.last?.id {
+                                        loadNextBatch()
+                                    }
+                                }
+
+                            Divider().opacity(0.2).padding(.leading, 70)
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
+        }
+        .background(ShaudiTheme.dashboardBackground.ignoresSafeArea())
+        .navigationTitle("Listening History")
+        .navigationBarTitleDisplayMode(.inline)
+        .tint(appearanceSettings.primaryColor)
+        .task {
+            if entries.isEmpty, !reachedEnd {
+                loadNextBatch()
+            }
+        }
+    }
+
+    private func loadNextBatch() {
+        guard !reachedEnd else {
+            return
+        }
+        var descriptor = ListeningHistoryStats.recentDescriptor(
+            limit: ListeningHistoryPolicy.fullHistoryBatchSize
+        )
+        descriptor.fetchOffset = entries.count
+        do {
+            let batch = try modelContext.fetch(descriptor)
+            entries.append(contentsOf: batch)
+            reachedEnd = batch.count < ListeningHistoryPolicy.fullHistoryBatchSize
+        } catch {
+            reachedEnd = true
+        }
     }
 }

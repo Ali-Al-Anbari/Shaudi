@@ -179,7 +179,7 @@ final class PlaybackManager: ObservableObject {
 
     private struct ActiveListeningPeriod {
         let requestID: UUID
-        let track: Track
+        let track: Track?
         let player: AVPlayer
         let startedAt: TimeInterval
     }
@@ -218,6 +218,7 @@ final class PlaybackManager: ObservableObject {
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackBoundaryObserver: Any?
     private var trimPreviewTimeObserver: (player: AVPlayer, token: Any)?
+    private var listeningCheckpointObserver: (player: AVPlayer, token: Any)?
     private var activeRequestID: UUID?
     private var lastReportedPlaybackRequestID: UUID?
     private var playbackOrigin: PlaybackOrigin?
@@ -228,6 +229,7 @@ final class PlaybackManager: ObservableObject {
     private var activeLookaheadID: UUID?
     private var lastRecordedTrackPlaybackRequestID: UUID?
     private var activeListeningPeriod: ActiveListeningPeriod?
+    private var listeningHistoryRecorder: ListeningHistoryRecorder?
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
@@ -262,6 +264,13 @@ final class PlaybackManager: ObservableObject {
 #if os(iOS)
         configureRemoteCommands()
 #endif
+    }
+
+    func configureListeningHistory(modelContext: ModelContext) {
+        guard listeningHistoryRecorder == nil else {
+            return
+        }
+        listeningHistoryRecorder = ListeningHistoryRecorder(modelContext: modelContext)
     }
 
     var hasPreviousTrack: Bool {
@@ -2540,6 +2549,8 @@ final class PlaybackManager: ObservableObject {
                 playbackRange: playbackRange,
                 requestID: requestID
             )
+        } else {
+            installListeningCheckpointObserver(on: player, requestID: requestID)
         }
 
         playbackEndObserver = NotificationCenter.default.addObserver(
@@ -2630,6 +2641,10 @@ final class PlaybackManager: ObservableObject {
                     videoID: videoID
                 )
                 self.recordTrackPlaybackStartIfNeeded(requestID: requestID)
+                self.recordListeningHistoryStartIfNeeded(
+                    player: player,
+                    requestID: requestID
+                )
                 self.beginActiveListeningPeriod(
                     for: player,
                     requestID: requestID
@@ -3991,6 +4006,39 @@ final class PlaybackManager: ObservableObject {
         currentTrack?.lastPlayedAt = .now
     }
 
+    private func recordListeningHistoryStartIfNeeded(
+        player: AVPlayer,
+        requestID: UUID
+    ) {
+        guard
+            !isTrimPreviewActive,
+            let playableTrack = currentPlayableTrack,
+            let origin = playbackOrigin
+        else {
+            return
+        }
+
+        let videoID = normalizedVideoID(playableTrack.youtubeVideoID)
+        let seed = recommendationSeed(
+            videoID: videoID,
+            playableTrack: playableTrack,
+            sourceTrack: currentTrack
+        )
+        let identity = seed.songIdentity
+        let snapshot = ListeningHistorySnapshot(
+            youtubeVideoID: videoID,
+            identity: identity,
+            artworkURL: playableTrack.thumbnailURL,
+            source: ListeningHistoryPlaybackSource(origin),
+            genres: currentTrack?.cachedGenreTags ?? []
+        )
+        listeningHistoryRecorder?.confirmPlayback(
+            requestID: requestID,
+            snapshot: snapshot,
+            mediaTime: player.currentTime().seconds
+        )
+    }
+
     private func beginActiveListeningPeriod(
         for player: AVPlayer,
         requestID: UUID
@@ -3998,7 +4046,8 @@ final class PlaybackManager: ObservableObject {
         guard
             !isTrimPreviewActive,
             activeListeningPeriod?.requestID != requestID,
-            let track = currentTrack
+            player.currentTime().seconds.isFinite,
+            player.currentTime().seconds >= 0
         else {
             return
         }
@@ -4012,9 +4061,13 @@ final class PlaybackManager: ObservableObject {
 
         activeListeningPeriod = ActiveListeningPeriod(
             requestID: requestID,
-            track: track,
+            track: currentTrack,
             player: player,
             startedAt: startedAt
+        )
+        listeningHistoryRecorder?.beginSegment(
+            requestID: requestID,
+            mediaTime: startedAt
         )
     }
 
@@ -4030,9 +4083,14 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        activeListeningPeriod.track.totalListenedDuration +=
-            finishedAt - activeListeningPeriod.startedAt
-        scheduleGenreLookupIfNeeded(for: activeListeningPeriod.track)
+        listeningHistoryRecorder?.closeSegment(
+            requestID: activeListeningPeriod.requestID,
+            mediaTime: finishedAt
+        )
+        if let track = activeListeningPeriod.track {
+            track.totalListenedDuration += finishedAt - activeListeningPeriod.startedAt
+            scheduleGenreLookupIfNeeded(for: track)
+        }
     }
 
     private func scheduleGenreLookupIfNeeded(for track: Track) {
@@ -4114,7 +4172,9 @@ final class PlaybackManager: ObservableObject {
 
     private func clearPlayer() {
         finishActiveListeningPeriod()
+        listeningHistoryRecorder?.finalize(requestID: activeRequestID)
         removeTrimPreviewTimeObserver()
+        removeListeningCheckpointObserver()
 
         if let playbackEndObserver {
             NotificationCenter.default.removeObserver(playbackEndObserver)
@@ -4132,6 +4192,47 @@ final class PlaybackManager: ObservableObject {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+    }
+
+    private func installListeningCheckpointObserver(
+        on player: AVPlayer,
+        requestID: UUID
+    ) {
+        removeListeningCheckpointObserver()
+        let interval = CMTime(
+            seconds: ListeningHistoryPolicy.checkpointInterval,
+            preferredTimescale: 600
+        )
+        let managerReference = WeakReference(self)
+        let token = player.addPeriodicTimeObserver(
+            forInterval: interval,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    self.isActive(requestID),
+                    self.player === player,
+                    player.timeControlStatus == .playing,
+                    self.activeListeningPeriod?.requestID == requestID
+                else {
+                    return
+                }
+                self.finishActiveListeningPeriod()
+                self.beginActiveListeningPeriod(for: player, requestID: requestID)
+            }
+        }
+        listeningCheckpointObserver = (player, token)
+    }
+
+    private func removeListeningCheckpointObserver() {
+        guard let listeningCheckpointObserver else {
+            return
+        }
+        listeningCheckpointObserver.player.removeTimeObserver(
+            listeningCheckpointObserver.token
+        )
+        self.listeningCheckpointObserver = nil
     }
 
     private func isActive(_ requestID: UUID) -> Bool {

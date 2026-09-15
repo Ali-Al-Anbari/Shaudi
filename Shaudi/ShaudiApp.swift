@@ -19,6 +19,6 @@ struct ShaudiApp: App {
                 .environmentObject(playbackManager)
                 .environmentObject(appearanceSettings)
         }
-        .modelContainer(for: [Track.self, Playlist.self])
+        .modelContainer(for: [Track.self, Playlist.self, ListeningHistoryEntry.self])
     }
 }
