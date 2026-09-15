@@ -12,6 +12,53 @@ enum RecommendationRadioPolicy {
     nonisolated static let upcomingQueueLimit = 6
     nonisolated static let historyQueueLimit = 6
     nonisolated static let sessionIdentityLimit = 512
+    nonisolated static let criticalUpcomingCount = 1
+    nonisolated static let maxDataAPIFallbacksPerEpoch = 2
+    nonisolated static let maxDataAPIFallbacksPerRadioSession = 6
+    nonisolated static let maxDataAPIFallbacksPerDay = 10
+    nonisolated static let webCircuitCooldown: TimeInterval = 15 * 60
+    nonisolated static let transientWebCooldown: TimeInterval = 30
+    nonisolated static let resolverSliceSize = 8
+}
+
+struct RecommendationResolutionContext {
+    let sessionID: UUID
+    let epochID: UUID
+    private let fallbackUpcomingCount: Int
+    private let currentUpcomingCountProvider: () -> Int
+    private let activeProvider: () -> Bool
+
+    init(
+        sessionID: UUID,
+        epochID: UUID,
+        upcomingCount: Int,
+        currentUpcomingCount: (() -> Int)? = nil,
+        isActive: @escaping () -> Bool = { true }
+    ) {
+        self.sessionID = sessionID
+        self.epochID = epochID
+        fallbackUpcomingCount = upcomingCount
+        currentUpcomingCountProvider = currentUpcomingCount ?? { upcomingCount }
+        activeProvider = isActive
+    }
+
+    var isActive: Bool {
+        activeProvider()
+    }
+
+    func currentUpcomingCount(addingResolved count: Int = 0) -> Int {
+        max(0, currentUpcomingCountProvider()) + count
+    }
+
+    func addingResolved(_ count: Int) -> RecommendationResolutionContext {
+        RecommendationResolutionContext(
+            sessionID: sessionID,
+            epochID: epochID,
+            upcomingCount: fallbackUpcomingCount + count,
+            currentUpcomingCount: { currentUpcomingCountProvider() + count },
+            isActive: activeProvider
+        )
+    }
 }
 
 struct RecommendationRadioEpoch {
@@ -90,6 +137,16 @@ struct RecommendationRadioSession {
 
         epoch = RecommendationRadioEpoch(anchor: seed)
         return .startNewEpoch(epochID: epoch.id, anchor: seed)
+    }
+
+    mutating func startEarlyEpochIfPossible(
+        anchor: RecommendationSeed
+    ) -> PlaybackAction? {
+        guard epoch.consumedRecommendationCount > 0 else {
+            return nil
+        }
+        epoch = RecommendationRadioEpoch(anchor: anchor)
+        return .startNewEpoch(epochID: epoch.id, anchor: anchor)
     }
 
     mutating func recordSeen(_ identity: SongIdentity) {

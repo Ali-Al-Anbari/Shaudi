@@ -268,6 +268,20 @@ struct RecommendationBatch {
 struct RecommendationReservoirResolution {
     let recommendations: [ResolvedRecommendation]
     let unusedCandidates: [LastFMSimilarTrack]
+    let exhaustedCurrentPaths: Bool
+}
+
+enum RecommendationYouTubeResolutionAttempt {
+    case cacheOnly
+    case primaryOnly(RecommendationResolutionContext? = nil)
+    case officialFallback(RecommendationResolutionContext)
+}
+
+private enum RecommendationCandidateResolution {
+    case resolved(ResolvedRecommendation)
+    case candidateMiss
+    case temporarilyUnavailable
+    case fallbackUnavailable
 }
 
 struct RecommendationCandidateReservoir {
@@ -374,7 +388,8 @@ struct RecommendationService {
     func recommendations(
         for seed: RecommendationSeed,
         excludingVideoIDs: Set<String>,
-        excludingSongIdentities: Set<RecommendationSongIdentity>
+        excludingSongIdentities: Set<RecommendationSongIdentity>,
+        context: RecommendationResolutionContext
     ) async throws -> RecommendationBatch {
         let seedArtist = seed.cleanedArtist
         let seedTitle = seed.cleanedTitle
@@ -400,6 +415,8 @@ struct RecommendationService {
         var seenSongs = excludingSongIdentities
         var artistCounts: [String: Int] = [:]
         var deferredForDiversity: [RankedSong] = []
+        var fallbackCandidates: [RankedSong] = []
+        var temporarilyUnavailableCandidates: [RankedSong] = []
         var attemptedResolutions = 0
         var attemptedSongIdentities = Set<RecommendationSongIdentity>()
 
@@ -417,7 +434,15 @@ struct RecommendationService {
 
             attemptedResolutions += 1
             attemptedSongIdentities.insert(candidate.identity)
-            guard let resolved = try await safelyResolveOnYouTube(candidate.track) else {
+            let outcome = try await safelyResolveCandidate(
+                candidate.track,
+                attempt: .primaryOnly(context)
+            )
+            guard case .resolved(let resolved) = outcome else {
+                fallbackCandidates.append(candidate)
+                if case .temporarilyUnavailable = outcome {
+                    temporarilyUnavailableCandidates.append(candidate)
+                }
                 continue
             }
             let videoID = normalizedVideoID(resolved.youtubeResult.youtubeVideoID)
@@ -440,7 +465,15 @@ struct RecommendationService {
                 }
                 attemptedResolutions += 1
                 attemptedSongIdentities.insert(candidate.identity)
-                guard let resolved = try await safelyResolveOnYouTube(candidate.track) else {
+                let outcome = try await safelyResolveCandidate(
+                    candidate.track,
+                    attempt: .primaryOnly(context)
+                )
+                guard case .resolved(let resolved) = outcome else {
+                    fallbackCandidates.append(candidate)
+                    if case .temporarilyUnavailable = outcome {
+                        temporarilyUnavailableCandidates.append(candidate)
+                    }
                     continue
                 }
                 let videoID = normalizedVideoID(resolved.youtubeResult.youtubeVideoID)
@@ -454,6 +487,34 @@ struct RecommendationService {
             }
         }
 
+        for candidate in fallbackCandidates {
+            try Task.checkCancellation()
+            guard selected.count < resultLimit else {
+                break
+            }
+            let outcome = try await safelyResolveCandidate(
+                candidate.track,
+                attempt: .officialFallback(context.addingResolved(selected.count))
+            )
+            guard case .resolved(let resolved) = outcome else {
+                if case .fallbackUnavailable = outcome,
+                   !temporarilyUnavailableCandidates.contains(where: {
+                       $0.identity == candidate.identity
+                   }) {
+                    temporarilyUnavailableCandidates.append(candidate)
+                }
+                continue
+            }
+            let videoID = normalizedVideoID(resolved.youtubeResult.youtubeVideoID)
+            guard
+                seenVideoIDs.insert(videoID).inserted,
+                seenSongs.insert(resolved.songIdentity).inserted
+            else {
+                continue
+            }
+            selected.append(resolved)
+        }
+
 #if DEBUG
         print("[Recommendations] selected=\(selected.count)")
         for (index, item) in selected.enumerated() {
@@ -461,8 +522,10 @@ struct RecommendationService {
         }
 #endif
         let selectedIdentities = Set(selected.map(\.songIdentity))
+        let deferredIdentities = Set(temporarilyUnavailableCandidates.map(\.identity))
         let reservoirCandidates = Array(ranked.lazy.filter {
-            !attemptedSongIdentities.contains($0.identity)
+            (!attemptedSongIdentities.contains($0.identity)
+                || deferredIdentities.contains($0.identity))
                 && !selectedIdentities.contains($0.identity)
         }.prefix(reservoirCandidateLimit).map(\.track))
         return RecommendationBatch(
@@ -475,13 +538,15 @@ struct RecommendationService {
         _ candidates: [LastFMSimilarTrack],
         desiredCount: Int,
         excludingVideoIDs: Set<String>,
-        excludingSongIdentities: Set<RecommendationSongIdentity>
+        excludingSongIdentities: Set<RecommendationSongIdentity>,
+        context: RecommendationResolutionContext
     ) async throws -> [ResolvedRecommendation] {
         try await resolveReservoirCandidates(
             candidates,
             desiredCount: desiredCount,
             excludingVideoIDs: excludingVideoIDs,
-            excludingSongIdentities: excludingSongIdentities
+            excludingSongIdentities: excludingSongIdentities,
+            context: context
         ).recommendations
     }
 
@@ -489,25 +554,35 @@ struct RecommendationService {
         _ candidates: [LastFMSimilarTrack],
         desiredCount: Int,
         excludingVideoIDs: Set<String>,
-        excludingSongIdentities: Set<RecommendationSongIdentity>
+        excludingSongIdentities: Set<RecommendationSongIdentity>,
+        context: RecommendationResolutionContext
     ) async throws -> RecommendationReservoirResolution {
         guard desiredCount > 0 else {
             return RecommendationReservoirResolution(
                 recommendations: [],
-                unusedCandidates: candidates
+                unusedCandidates: candidates,
+                exhaustedCurrentPaths: false
             )
         }
         var resolved: [ResolvedRecommendation] = []
-        var unused: [LastFMSimilarTrack] = []
+        var fallbackCandidates: [LastFMSimilarTrack] = []
+        var deferredCandidates: [LastFMSimilarTrack] = []
         var seenVideoIDs = Set(excludingVideoIDs.map(normalizedVideoID))
         var seenSongs = excludingSongIdentities
-        let attemptLimit = min(candidates.count, 8)
+        var cacheMisses: [LastFMSimilarTrack] = []
+        var cacheScannedCount = 0
 
-        for (index, candidate) in candidates.prefix(attemptLimit).enumerated() {
+        for (index, candidate) in candidates.enumerated() {
             try Task.checkCancellation()
+            guard context.isActive else {
+                throw CancellationError()
+            }
             guard resolved.count < desiredCount else {
-                unused.append(contentsOf: candidates[index...])
-                break
+                return RecommendationReservoirResolution(
+                    recommendations: resolved,
+                    unusedCandidates: cacheMisses + Array(candidates[index...]),
+                    exhaustedCurrentPaths: false
+                )
             }
             let identity = RecommendationSongIdentity(
                 artist: candidate.artist,
@@ -516,7 +591,13 @@ struct RecommendationService {
             guard !seenSongs.contains(identity) else {
                 continue
             }
-            guard let recommendation = try await safelyResolveOnYouTube(candidate) else {
+            cacheScannedCount += 1
+            let outcome = try await safelyResolveCandidate(
+                candidate,
+                attempt: .cacheOnly
+            )
+            guard case .resolved(let recommendation) = outcome else {
+                cacheMisses.append(candidate)
                 continue
             }
             let videoID = normalizedVideoID(recommendation.youtubeResult.youtubeVideoID)
@@ -526,12 +607,141 @@ struct RecommendationService {
             seenSongs.insert(identity)
             resolved.append(recommendation)
         }
-        if candidates.count > attemptLimit, resolved.count < desiredCount {
-            unused.append(contentsOf: candidates[attemptLimit...])
+#if DEBUG
+        print(
+            "[Recommendations] cacheRecovery hits=\(resolved.count) "
+                + "scanned=\(cacheScannedCount)"
+        )
+#endif
+        guard resolved.count < desiredCount else {
+            return RecommendationReservoirResolution(
+                recommendations: resolved,
+                unusedCandidates: cacheMisses,
+                exhaustedCurrentPaths: false
+            )
+        }
+
+        var nextCandidateIndex = 0
+        if videoResolver.isWebSearchCircuitOpen {
+            fallbackCandidates = cacheMisses
+            deferredCandidates = cacheMisses
+            nextCandidateIndex = cacheMisses.count
+#if DEBUG
+            print("[Recommendations] cacheRecovery webSkipped=true reason=circuitOpen")
+#endif
+        }
+        resolutionLoop: while nextCandidateIndex < cacheMisses.count,
+                              resolved.count < desiredCount {
+            try Task.checkCancellation()
+            guard context.isActive else {
+                throw CancellationError()
+            }
+            let sliceEnd = min(
+                nextCandidateIndex + RecommendationRadioPolicy.resolverSliceSize,
+                cacheMisses.count
+            )
+            let resolvedBeforeSlice = resolved.count
+            var processedThroughIndex = nextCandidateIndex
+            for candidateIndex in nextCandidateIndex..<sliceEnd {
+                let candidate = cacheMisses[candidateIndex]
+                try Task.checkCancellation()
+                guard context.isActive else {
+                    throw CancellationError()
+                }
+                if videoResolver.isWebSearchCircuitOpen {
+                    let unavailable = Array(cacheMisses[candidateIndex...])
+                    fallbackCandidates.append(contentsOf: unavailable)
+                    deferredCandidates.append(contentsOf: unavailable)
+                    nextCandidateIndex = cacheMisses.count
+#if DEBUG
+                    print("[Recommendations] cacheRecovery webSkipped=true reason=circuitOpen")
+#endif
+                    break resolutionLoop
+                }
+                processedThroughIndex = candidateIndex + 1
+                let outcome = try await safelyResolveCandidate(
+                    candidate,
+                    attempt: .primaryOnly(context)
+                )
+                guard case .resolved(let recommendation) = outcome else {
+                    fallbackCandidates.append(candidate)
+                    if case .temporarilyUnavailable = outcome {
+                        deferredCandidates.append(candidate)
+                    }
+                    continue
+                }
+                let videoID = normalizedVideoID(recommendation.youtubeResult.youtubeVideoID)
+                guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                    continue
+                }
+                seenSongs.insert(recommendation.songIdentity)
+                resolved.append(recommendation)
+                if resolved.count >= desiredCount {
+                    break
+                }
+            }
+            nextCandidateIndex = processedThroughIndex
+#if DEBUG
+            if resolved.count == resolvedBeforeSlice {
+                print(
+                    "[Recommendations] refillSlice resolved=0 "
+                        + "remainingReservoir=\(cacheMisses.count - nextCandidateIndex)"
+                )
+                if nextCandidateIndex < cacheMisses.count {
+                    print("[Recommendations] refillContinuing=true")
+                }
+            }
+#endif
+        }
+
+        if resolved.count >= desiredCount {
+            let remaining = nextCandidateIndex < cacheMisses.count
+                ? Array(cacheMisses[nextCandidateIndex...])
+                : []
+            return RecommendationReservoirResolution(
+                recommendations: resolved,
+                unusedCandidates: deferredCandidates + remaining,
+                exhaustedCurrentPaths: false
+            )
+        }
+
+        for candidate in fallbackCandidates {
+            try Task.checkCancellation()
+            guard context.isActive, resolved.count < desiredCount else {
+                break
+            }
+            let outcome = try await safelyResolveCandidate(
+                candidate,
+                attempt: .officialFallback(context.addingResolved(resolved.count))
+            )
+            guard case .resolved(let recommendation) = outcome else {
+                if case .fallbackUnavailable = outcome,
+                   !deferredCandidates.contains(where: {
+                       RecommendationSongIdentity(artist: $0.artist, title: $0.title)
+                           == RecommendationSongIdentity(artist: candidate.artist, title: candidate.title)
+                   }) {
+                    deferredCandidates.append(candidate)
+                }
+                continue
+            }
+            let videoID = normalizedVideoID(recommendation.youtubeResult.youtubeVideoID)
+            guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                continue
+            }
+            seenSongs.insert(recommendation.songIdentity)
+            resolved.append(recommendation)
+        }
+        let resolvedIdentities = Set(resolved.map(\.songIdentity))
+        let stillDeferred = deferredCandidates.filter {
+            !resolvedIdentities.contains(RecommendationSongIdentity(
+                artist: $0.artist,
+                title: $0.title
+            ))
         }
         return RecommendationReservoirResolution(
             recommendations: resolved,
-            unusedCandidates: unused
+            unusedCandidates: stillDeferred,
+            exhaustedCurrentPaths: resolved.isEmpty
         )
     }
 
@@ -670,42 +880,89 @@ struct RecommendationService {
     }
 
     func resolveOnYouTube(
-        _ target: LastFMSimilarTrack
+        _ target: LastFMSimilarTrack,
+        attempt: RecommendationYouTubeResolutionAttempt = .primaryOnly()
     ) async throws -> ResolvedRecommendation? {
+        guard case .resolved(let recommendation) = try await resolveCandidate(
+            target,
+            attempt: attempt
+        ) else {
+            return nil
+        }
+        return recommendation
+    }
+
+    private func resolveCandidate(
+        _ target: LastFMSimilarTrack,
+        attempt: RecommendationYouTubeResolutionAttempt
+    ) async throws -> RecommendationCandidateResolution {
 #if DEBUG
         print("[YouTubeResolver] attempting=\(target.artist) - \(target.title)")
 #endif
         let identity = SongIdentity(artist: target.artist, title: target.title)
-        if let cachedResult = await resolutionCache.result(for: identity, now: .now) {
+        let cachedResult: YouTubeSearchResult?
+        switch attempt {
+        case .cacheOnly:
+            cachedResult = await resolutionCache.peek(for: identity, now: .now)
+        case .primaryOnly, .officialFallback:
+            cachedResult = await resolutionCache.result(for: identity, now: .now)
+        }
+        if let cachedResult {
 #if DEBUG
-            print("[YouTubeResolver] cacheHit=\(cachedResult.youtubeVideoID)")
+            print(
+                "[RecommendationResolver] cacheHit=true "
+                    + "target=\(target.artist) - \(target.title)"
+            )
 #endif
-            return resolvedRecommendation(target: target, result: cachedResult)
+            return .resolved(resolvedRecommendation(target: target, result: cachedResult))
         }
 
         let query = "\(target.artist) \(target.title)"
-        let primaryResults = try await videoResolver.primaryResults(query: query)
-        if let best = bestYouTubeResult(in: primaryResults, target: target) {
+        let results: [YouTubeSearchResult]
+        switch attempt {
+        case .cacheOnly:
+            return .temporarilyUnavailable
+        case .primaryOnly(let context):
+            guard !videoResolver.isWebSearchCircuitOpen else {
+                return .temporarilyUnavailable
+            }
+            let outcome = try await videoResolver.primaryOutcome(
+                query: query,
+                isActive: { context?.isActive ?? true }
+            )
+            switch outcome {
+            case .results(let primaryResults):
+                results = primaryResults
+            case .temporarilyUnavailable, .blocked, .parserFailure, .circuitOpen:
+                return .temporarilyUnavailable
+            }
+        case .officialFallback(let context):
+            let outcome = try await videoResolver.dataAPIFallbackOutcome(
+                query: query,
+                context: context
+            )
+            switch outcome {
+            case .results(let fallbackResults):
+                results = fallbackResults
+            case .unavailable:
+                return .fallbackUnavailable
+            }
+        }
+        if let best = bestYouTubeResult(in: results, target: target) {
 #if DEBUG
             print("[YouTubeResolver] resolved=\(best.youtubeVideoID)")
 #endif
             await resolutionCache.store(best, for: identity, now: .now)
-            return resolvedRecommendation(target: target, result: best)
+            return .resolved(resolvedRecommendation(target: target, result: best))
         }
-
-        let fallbackResults = try await videoResolver.dataAPIFallbackResults(query: query)
-        guard let best = bestYouTubeResult(in: fallbackResults, target: target) else {
 #if DEBUG
+        if case .primaryOnly = attempt {
+            print("[RecommendationResolver] webMiss reason=candidateSpecificMiss target=\(query)")
+        } else if case .officialFallback = attempt {
             print("[YouTubeResolver] no canonical match target=\(target.artist) - \(target.title)")
-#endif
-            return nil
         }
-
-#if DEBUG
-        print("[YouTubeResolver] resolved=\(best.youtubeVideoID)")
 #endif
-        await resolutionCache.store(best, for: identity, now: .now)
-        return resolvedRecommendation(target: target, result: best)
+        return .candidateMiss
     }
 
     func invalidateVideoResolution(for identity: SongIdentity) async {
@@ -740,18 +997,19 @@ struct RecommendationService {
         )
     }
 
-    private func safelyResolveOnYouTube(
-        _ target: LastFMSimilarTrack
-    ) async throws -> ResolvedRecommendation? {
+    private func safelyResolveCandidate(
+        _ target: LastFMSimilarTrack,
+        attempt: RecommendationYouTubeResolutionAttempt
+    ) async throws -> RecommendationCandidateResolution {
         do {
-            return try await resolveOnYouTube(target)
+            return try await resolveCandidate(target, attempt: attempt)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
             recommendationLog(
                 "YouTube resolution failed target=\(target.artist) - \(target.title) error=\(error.localizedDescription)"
             )
-            return nil
+            return .temporarilyUnavailable
         }
     }
 

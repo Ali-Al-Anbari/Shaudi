@@ -426,11 +426,19 @@ final class RecommendationPipelineTests: XCTestCase {
             dataAPISearch: { _ in
                 requestCount += 1
                 throw YouTubeMetadataClient.ClientError.quotaExceeded
-            }
+            },
+            fallbackBudget: isolatedFallbackBudget()
         )
+        let context = resolutionContext()
 
-        let first = try await resolver.dataAPIFallbackResults(query: "Artist Song")
-        let second = try await resolver.dataAPIFallbackResults(query: "Another Song")
+        let first = try await resolver.dataAPIFallbackResults(
+            query: "Artist Song",
+            context: context
+        )
+        let second = try await resolver.dataAPIFallbackResults(
+            query: "Another Song",
+            context: context
+        )
 
         XCTAssertTrue(first.isEmpty)
         XCTAssertTrue(second.isEmpty)
@@ -472,6 +480,154 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertTrue(resolver.isWebSearchCircuitOpen)
     }
 
+    func testCandidateSpecificWebMissDoesNotOpenCircuit() async throws {
+        var requestCount = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in requestCount += 1; return [] },
+            dataAPISearch: { _ in [] }
+        )
+
+        _ = try await resolver.primaryResults(query: "First")
+        _ = try await resolver.primaryResults(query: "Second")
+
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertFalse(resolver.isWebSearchCircuitOpen)
+    }
+
+    func testWebCircuitCooldownAllowsHalfOpenProbeAndSuccessfulRecovery() async throws {
+        var date = Date(timeIntervalSince1970: 10_000)
+        var requestCount = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                requestCount += 1
+                if requestCount == 1 {
+                    throw URLError(.httpTooManyRedirects)
+                }
+                return []
+            },
+            dataAPISearch: { _ in [] },
+            now: { date }
+        )
+
+        _ = try await resolver.primaryOutcome(query: "blocked")
+        date.addTimeInterval(RecommendationRadioPolicy.webCircuitCooldown - 1)
+        let blocked = try await resolver.primaryOutcome(query: "too early")
+        if case .circuitOpen = blocked {} else {
+            XCTFail("Expected the circuit to remain open before cooldown")
+        }
+        XCTAssertEqual(requestCount, 1)
+
+        date.addTimeInterval(2)
+        _ = try await resolver.primaryOutcome(query: "probe")
+        XCTAssertFalse(resolver.isWebSearchCircuitOpen)
+        _ = try await resolver.primaryOutcome(query: "normal")
+        XCTAssertEqual(requestCount, 3)
+    }
+
+    func testHalfOpenSystemicFailureReopensCircuit() async throws {
+        var date = Date(timeIntervalSince1970: 20_000)
+        var requestCount = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                requestCount += 1
+                throw URLError(.httpTooManyRedirects)
+            },
+            dataAPISearch: { _ in [] },
+            now: { date }
+        )
+
+        _ = try await resolver.primaryOutcome(query: "initial")
+        date.addTimeInterval(RecommendationRadioPolicy.webCircuitCooldown + 1)
+        _ = try await resolver.primaryOutcome(query: "failed probe")
+        _ = try await resolver.primaryOutcome(query: "blocked again")
+
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertTrue(resolver.isWebSearchCircuitOpen)
+    }
+
+    func testOnlyOneHalfOpenProbeCanRun() async throws {
+        var date = Date(timeIntervalSince1970: 30_000)
+        var requestCount = 0
+        let gate = AsyncSearchGate()
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                requestCount += 1
+                if requestCount == 1 {
+                    throw URLError(.httpTooManyRedirects)
+                }
+                await gate.suspendUntilReleased()
+                return []
+            },
+            dataAPISearch: { _ in [] },
+            now: { date }
+        )
+        _ = try await resolver.primaryOutcome(query: "initial")
+        date.addTimeInterval(RecommendationRadioPolicy.webCircuitCooldown + 1)
+
+        let probe = Task { try await resolver.primaryOutcome(query: "probe") }
+        await gate.waitUntilStarted()
+        let simultaneous = try await resolver.primaryOutcome(query: "simultaneous")
+        if case .circuitOpen = simultaneous {} else {
+            XCTFail("Expected a second half-open request to be rejected")
+        }
+        XCTAssertEqual(requestCount, 2)
+        await gate.release()
+        _ = try await probe.value
+    }
+
+    func testTransientNetworkFailureRecoversAfterShortCooldown() async throws {
+        var date = Date(timeIntervalSince1970: 40_000)
+        var requestCount = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                requestCount += 1
+                if requestCount == 1 {
+                    throw URLError(.timedOut)
+                }
+                return []
+            },
+            dataAPISearch: { _ in [] },
+            now: { date }
+        )
+
+        _ = try await resolver.primaryOutcome(query: "timeout")
+        _ = try await resolver.primaryOutcome(query: "temporarily blocked")
+        XCTAssertEqual(requestCount, 1)
+        date.addTimeInterval(RecommendationRadioPolicy.transientWebCooldown + 1)
+        _ = try await resolver.primaryOutcome(query: "probe")
+
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertFalse(resolver.isWebSearchCircuitOpen)
+    }
+
+    func testSystemicWebFailureDoesNotRepeatedlyInvokeWebOrDataAPI() async throws {
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                webRequests += 1
+                throw URLError(.httpTooManyRedirects)
+            },
+            dataAPISearch: { _ in
+                dataAPIRequests += 1
+                return []
+            },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = resolutionContext()
+
+        for index in 0..<20 {
+            _ = try await resolver.primaryResults(query: "Song \(index)")
+            _ = try await resolver.dataAPIFallbackResults(
+                query: "Song \(index)",
+                context: context
+            )
+        }
+
+        XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 2)
+    }
+
     func testWebAbuseChallengeURLIsRecognized() {
         XCTAssertTrue(YouTubeWebSearchClient.isAbuseChallengeURL(
             URL(string: "https://www.google.com/sorry/index?continue=youtube")
@@ -494,12 +650,17 @@ final class RecommendationPipelineTests: XCTestCase {
             dataAPISearch: { _ in
                 dataAPIRequestCount += 1
                 throw YouTubeMetadataClient.ClientError.quotaExceeded
-            }
+            },
+            fallbackBudget: isolatedFallbackBudget()
         )
+        let context = resolutionContext()
 
         for query in ["First", "Second", "Third"] {
             let web = try await resolver.primaryResults(query: query)
-            let dataAPI = try await resolver.dataAPIFallbackResults(query: query)
+            let dataAPI = try await resolver.dataAPIFallbackResults(
+                query: query,
+                context: context
+            )
             if !web.isEmpty || !dataAPI.isEmpty {
                 queue.append(query)
             }
@@ -542,6 +703,7 @@ final class RecommendationPipelineTests: XCTestCase {
         let target = candidate("Artist", "Song")
         let cache = MemoryYouTubeResolutionCache()
         var webRequests = 0
+        var dataAPIRequests = 0
         let result = youtubeResult(
             videoID: "cachemiss01",
             artist: target.artist,
@@ -549,7 +711,7 @@ final class RecommendationPipelineTests: XCTestCase {
         )
         let resolver = YouTubeRecommendationResolver(
             primarySearch: { _ in webRequests += 1; return [result] },
-            dataAPISearch: { _ in [] }
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] }
         )
         let service = RecommendationService(
             similarTracks: { _, _, _ in [] },
@@ -563,7 +725,283 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(first?.youtubeResult.youtubeVideoID, "cachemiss01")
         XCTAssertEqual(second?.youtubeResult.youtubeVideoID, "cachemiss01")
         XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 0)
         XCTAssertEqual(cache.storeCount, 1)
+    }
+
+    func testHealthyBufferSkipsOfficialFallbackAndUsesReservoirAlternative() async throws {
+        let cache = MemoryYouTubeResolutionCache()
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { query in
+                webRequests += 1
+                guard query.contains("Working Song") else { return [] }
+                return [self.youtubeResult(
+                    videoID: "working0001",
+                    artist: "Artist B",
+                    title: "Working Song"
+                )]
+            },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: resolver,
+            resolutionCache: cache
+        )
+
+        let resolved = try await service.recommendationsFromReservoir(
+            [candidate("Artist A", "Broken Song"), candidate("Artist B", "Working Song")],
+            desiredCount: 1,
+            excludingVideoIDs: [],
+            excludingSongIdentities: [],
+            context: resolutionContext(upcomingCount: 2)
+        )
+
+        XCTAssertEqual(resolved.map(\.title), ["Working Song"])
+        XCTAssertEqual(webRequests, 2)
+        XCTAssertEqual(dataAPIRequests, 0)
+    }
+
+    func testCriticalBufferAllowsOfficialFallbackAndCachesResult() async throws {
+        let target = candidate("Artist", "Emergency Song")
+        let cache = MemoryYouTubeResolutionCache()
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let official = youtubeResult(
+            videoID: "emergency01",
+            artist: target.artist,
+            title: target.title
+        )
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in webRequests += 1; return [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [official] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: resolver,
+            resolutionCache: cache
+        )
+        let context = resolutionContext(upcomingCount: 1)
+
+        let resolved = try await service.recommendationsFromReservoir(
+            [target],
+            desiredCount: 1,
+            excludingVideoIDs: [],
+            excludingSongIdentities: [],
+            context: context
+        )
+        let second = try await service.resolveOnYouTube(target)
+
+        XCTAssertEqual(resolved.first?.youtubeResult.youtubeVideoID, "emergency01")
+        XCTAssertEqual(second?.youtubeResult.youtubeVideoID, "emergency01")
+        XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 1)
+        XCTAssertEqual(cache.storeCount, 1)
+    }
+
+    func testHealthyBufferDirectlyBlocksOfficialFallback() async throws {
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+
+        let results = try await resolver.dataAPIFallbackResults(
+            query: "Artist Song",
+            context: resolutionContext(upcomingCount: 2)
+        )
+
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertEqual(dataAPIRequests, 0)
+    }
+
+    func testPerEpochOfficialFallbackLimitIsTwo() async throws {
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = resolutionContext()
+
+        for index in 0..<12 {
+            _ = try await resolver.dataAPIFallbackResults(
+                query: "Song \(index)",
+                context: context
+            )
+        }
+
+        XCTAssertEqual(dataAPIRequests, 2)
+    }
+
+    func testRadioSessionOfficialFallbackLimitIsSixAcrossEpochs() async throws {
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let sessionID = UUID()
+
+        for _ in 0..<4 {
+            let context = resolutionContext(sessionID: sessionID)
+            for index in 0..<4 {
+                _ = try await resolver.dataAPIFallbackResults(
+                    query: "Song \(index)",
+                    context: context
+                )
+            }
+        }
+
+        XCTAssertEqual(dataAPIRequests, 6)
+    }
+
+    func testNewSeedResetsSessionBudgetButPreservesDailyUsage() {
+        let budget = RecommendationDataAPIFallbackBudget(defaults: isolatedUserDefaults())
+        let firstSession = UUID()
+        for _ in 0..<3 {
+            let epochID = UUID()
+            _ = budget.reserveFallback(sessionID: firstSession, epochID: epochID)
+            _ = budget.reserveFallback(sessionID: firstSession, epochID: epochID)
+        }
+        let newSessionReservation = budget.reserveFallback(
+            sessionID: UUID(),
+            epochID: UUID()
+        )
+
+        guard case .success(let usage) = newSessionReservation else {
+            return XCTFail("Expected a new radio session allowance")
+        }
+        XCTAssertEqual(usage.session, 1)
+        XCTAssertEqual(usage.daily, 7)
+    }
+
+    func testDailyBudgetPersistsAcrossResolverInstances() async throws {
+        let defaults = isolatedUserDefaults()
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        var dataAPIRequests = 0
+
+        for _ in 0..<2 {
+            let budget = RecommendationDataAPIFallbackBudget(
+                defaults: defaults,
+                now: { date }
+            )
+            let resolver = YouTubeRecommendationResolver(
+                primarySearch: { _ in [] },
+                dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+                fallbackBudget: budget
+            )
+            for _ in 0..<3 {
+                let context = resolutionContext()
+                for index in 0..<2 {
+                    _ = try await resolver.dataAPIFallbackResults(
+                        query: "Song \(index)",
+                        context: context
+                    )
+                }
+            }
+        }
+
+        let restartedBudget = RecommendationDataAPIFallbackBudget(
+            defaults: defaults,
+            now: { date }
+        )
+        let restartedResolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: restartedBudget
+        )
+        _ = try await restartedResolver.dataAPIFallbackResults(
+            query: "Blocked after restart",
+            context: resolutionContext()
+        )
+
+        XCTAssertEqual(dataAPIRequests, 10)
+        XCTAssertEqual(restartedBudget.dailyCount(), 10)
+    }
+
+    func testDailyBudgetResetsOnCalendarDayChange() {
+        let defaults = isolatedUserDefaults()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var date = Date(timeIntervalSince1970: 1_704_110_400)
+        let budget = RecommendationDataAPIFallbackBudget(
+            defaults: defaults,
+            calendar: calendar,
+            now: { date }
+        )
+
+        if case .failure = budget.reserveFallback(sessionID: UUID(), epochID: UUID()) {
+            XCTFail("Expected fallback reservation")
+        }
+        XCTAssertEqual(budget.dailyCount(), 1)
+        date = calendar.date(byAdding: .day, value: 1, to: date)!
+
+        XCTAssertEqual(budget.dailyCount(), 0)
+        if case .failure = budget.reserveFallback(sessionID: UUID(), epochID: UUID()) {
+            XCTFail("Expected fallback reservation after day reset")
+        }
+        XCTAssertEqual(budget.dailyCount(), 1)
+    }
+
+    func testTwentyFourTrackBadWebEpochUsesAtMostTwoOfficialCalls() async throws {
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                webRequests += 1
+                throw YouTubeWebSearchClient.SearchError.tooManyHTTPRedirects
+            },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = resolutionContext()
+
+        for index in 0..<24 {
+            _ = try await resolver.primaryResults(query: "Song \(index)")
+            _ = try await resolver.dataAPIFallbackResults(
+                query: "Song \(index)",
+                context: context
+            )
+        }
+
+        XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 2)
+    }
+
+    func testFiftyTrackBadWebRadioUsesAtMostSixOfficialCalls() async throws {
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                webRequests += 1
+                throw YouTubeWebSearchClient.SearchError.abuseChallenge
+            },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let sessionID = UUID()
+        let epochIDs = [UUID(), UUID(), UUID()]
+
+        for index in 0..<50 {
+            let context = resolutionContext(
+                sessionID: sessionID,
+                epochID: epochIDs[min(index / 24, 2)]
+            )
+            _ = try await resolver.primaryResults(query: "Song \(index)")
+            _ = try await resolver.dataAPIFallbackResults(
+                query: "Song \(index)",
+                context: context
+            )
+        }
+
+        XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 6)
     }
 
     func testUnavailableCachedVideoIsEvictedAndCanBeResolvedAgain() async throws {
@@ -665,11 +1103,192 @@ final class RecommendationPipelineTests: XCTestCase {
             [candidate("Artist A", "Broken Song"), candidate("Artist B", "Working Song")],
             desiredCount: 1,
             excludingVideoIDs: [],
-            excludingSongIdentities: []
+            excludingSongIdentities: [],
+            context: resolutionContext()
         )
 
         XCTAssertEqual(resolved.map(\.title), ["Working Song"])
         XCTAssertEqual(webRequests, 2)
+    }
+
+    func testZeroResultRefillSliceContinuesToNextSlice() async throws {
+        let cache = MemoryYouTubeResolutionCache()
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { query in
+                webRequests += 1
+                guard query.contains("Song 9") else { return [] }
+                return [self.youtubeResult(
+                    videoID: "slicevalid1",
+                    artist: "Artist 9",
+                    title: "Song 9"
+                )]
+            },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: resolver,
+            resolutionCache: cache
+        )
+        let candidates = (1...9).map { candidate("Artist \($0)", "Song \($0)") }
+
+        let resolution = try await service.resolveReservoirCandidates(
+            candidates,
+            desiredCount: 1,
+            excludingVideoIDs: [],
+            excludingSongIdentities: [],
+            context: resolutionContext()
+        )
+
+        XCTAssertEqual(resolution.recommendations.map(\.title), ["Song 9"])
+        XCTAssertEqual(webRequests, 9)
+        XCTAssertEqual(dataAPIRequests, 0)
+        XCTAssertFalse(resolution.exhaustedCurrentPaths)
+    }
+
+    func testMultipleFailedRefillSlicesTerminateAtTrueExhaustion() async throws {
+        let cache = MemoryYouTubeResolutionCache()
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in webRequests += 1; return [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: resolver,
+            resolutionCache: cache
+        )
+        let candidates = (1...20).map { candidate("Artist \($0)", "Song \($0)") }
+
+        let resolution = try await service.resolveReservoirCandidates(
+            candidates,
+            desiredCount: 1,
+            excludingVideoIDs: [],
+            excludingSongIdentities: [],
+            context: resolutionContext()
+        )
+
+        XCTAssertTrue(resolution.recommendations.isEmpty)
+        XCTAssertTrue(resolution.exhaustedCurrentPaths)
+        XCTAssertEqual(webRequests, 20)
+        XCTAssertEqual(dataAPIRequests, 2)
+    }
+
+    func testOpenWebCircuitRecoversCachedReservoirCandidatesWithoutNetwork() async throws {
+        let first = candidate("Cached Artist 1", "Cached Song 1")
+        let second = candidate("Cached Artist 2", "Cached Song 2")
+        let cache = MemoryYouTubeResolutionCache([
+            SongIdentity(artist: first.artist, title: first.title): youtubeResult(
+                videoID: "cachedopen1",
+                artist: first.artist,
+                title: first.title
+            ),
+            SongIdentity(artist: second.artist, title: second.title): youtubeResult(
+                videoID: "cachedopen2",
+                artist: second.artist,
+                title: second.title
+            )
+        ])
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in
+                webRequests += 1
+                throw URLError(.httpTooManyRedirects)
+            },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        _ = try await resolver.primaryResults(query: "open circuit")
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: resolver,
+            resolutionCache: cache
+        )
+
+        let resolution = try await service.resolveReservoirCandidates(
+            [candidate("Uncached", "Unavailable"), first, second],
+            desiredCount: 2,
+            excludingVideoIDs: [],
+            excludingSongIdentities: [],
+            context: resolutionContext(upcomingCount: 1)
+        )
+
+        XCTAssertEqual(Set(resolution.recommendations.map(\.title)), ["Cached Song 1", "Cached Song 2"])
+        XCTAssertEqual(webRequests, 1)
+        XCTAssertEqual(dataAPIRequests, 0)
+    }
+
+    func testOfficialFallbackUsesCurrentUpcomingCountInsteadOfSnapshot() async throws {
+        var upcomingCount = 3
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = RecommendationResolutionContext(
+            sessionID: UUID(),
+            epochID: UUID(),
+            upcomingCount: 3,
+            currentUpcomingCount: { upcomingCount }
+        )
+        upcomingCount = 0
+
+        _ = try await resolver.dataAPIFallbackOutcome(query: "Artist Song", context: context)
+
+        XCTAssertEqual(dataAPIRequests, 1)
+    }
+
+    func testOfficialFallbackSkipsWhenCurrentBufferIsHealthy() async throws {
+        var upcomingCount = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = RecommendationResolutionContext(
+            sessionID: UUID(),
+            epochID: UUID(),
+            upcomingCount: 0,
+            currentUpcomingCount: { upcomingCount }
+        )
+        upcomingCount = 2
+
+        _ = try await resolver.dataAPIFallbackOutcome(query: "Artist Song", context: context)
+
+        XCTAssertEqual(dataAPIRequests, 0)
+    }
+
+    func testInactiveOldSessionCannotInvokeResolversOrConsumeBudget() async throws {
+        var webRequests = 0
+        var dataAPIRequests = 0
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in webRequests += 1; return [] },
+            dataAPISearch: { _ in dataAPIRequests += 1; return [] },
+            fallbackBudget: isolatedFallbackBudget()
+        )
+        let context = RecommendationResolutionContext(
+            sessionID: UUID(),
+            epochID: UUID(),
+            upcomingCount: 0,
+            isActive: { false }
+        )
+
+        do {
+            _ = try await resolver.primaryOutcome(query: "stale", isActive: { false })
+            XCTFail("Expected stale primary resolution to cancel")
+        } catch is CancellationError {}
+        _ = try await resolver.dataAPIFallbackOutcome(query: "stale", context: context)
+
+        XCTAssertEqual(webRequests, 0)
+        XCTAssertEqual(dataAPIRequests, 0)
     }
 
     func testAnchoredEpochDoesNotReseedRecommendationsOneThroughTwenty() {
@@ -714,6 +1333,53 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(session.epoch.anchor.cleanedTitle, "Song 24")
         XCTAssertEqual(session.epoch.consumedRecommendationCount, 0)
         XCTAssertEqual(lastFMCallCount, 2)
+    }
+
+    func testEarlyEpochRolloverUsesLastPlayedRecommendationExactlyOnce() {
+        var session = RecommendationRadioSession(anchor: banditSeed())
+        let played = canonicalSeed(index: 1)
+        _ = session.confirmedRecommendationPlayback(seed: played)
+
+        let first = session.startEarlyEpochIfPossible(anchor: played)
+        let second = session.startEarlyEpochIfPossible(anchor: played)
+
+        guard case .startNewEpoch(_, let anchor)? = first else {
+            return XCTFail("Expected early epoch rollover")
+        }
+        XCTAssertEqual(anchor.songIdentity, played.songIdentity)
+        XCTAssertEqual(session.epoch.consumedRecommendationCount, 0)
+        XCTAssertNil(second)
+    }
+
+    func testEarlyEpochRolloverDoesNotLoopWithoutSuccessfulPlayback() {
+        var session = RecommendationRadioSession(anchor: banditSeed())
+
+        XCTAssertNil(session.startEarlyEpochIfPossible(anchor: banditSeed()))
+        XCTAssertEqual(session.epoch.anchor.songIdentity, banditSeed().songIdentity)
+    }
+
+    func testEarlyEpochRolloverResetsOnlyEpochFallbackBudget() {
+        let defaults = isolatedUserDefaults()
+        let budget = RecommendationDataAPIFallbackBudget(defaults: defaults)
+        let sessionID = UUID()
+        let firstEpoch = UUID()
+        let secondEpoch = UUID()
+
+        _ = budget.reserveFallback(sessionID: sessionID, epochID: firstEpoch)
+        _ = budget.reserveFallback(sessionID: sessionID, epochID: firstEpoch)
+        XCTAssertEqual(
+            budget.reserveFallback(sessionID: sessionID, epochID: firstEpoch),
+            .failure(.epochBudgetExhausted)
+        )
+        guard case .success(let usage) = budget.reserveFallback(
+            sessionID: sessionID,
+            epochID: secondEpoch
+        ) else {
+            return XCTFail("Expected a fresh epoch allowance")
+        }
+        XCTAssertEqual(usage.epoch, 1)
+        XCTAssertEqual(usage.session, 3)
+        XCTAssertEqual(usage.daily, 3)
     }
 
     func testReservoirRefillUsesSameEpochWithoutLastFMRequest() {
@@ -877,6 +1543,60 @@ final class RecommendationPipelineTests: XCTestCase {
             thumbnailURL: nil
         )
     }
+
+    private func resolutionContext(
+        sessionID: UUID = UUID(),
+        epochID: UUID = UUID(),
+        upcomingCount: Int = 0
+    ) -> RecommendationResolutionContext {
+        RecommendationResolutionContext(
+            sessionID: sessionID,
+            epochID: epochID,
+            upcomingCount: upcomingCount
+        )
+    }
+
+    private func isolatedFallbackBudget(
+        now: @escaping () -> Date = Date.init
+    ) -> RecommendationDataAPIFallbackBudget {
+        RecommendationDataAPIFallbackBudget(defaults: isolatedUserDefaults(), now: now)
+    }
+
+    private func isolatedUserDefaults() -> UserDefaults {
+        UserDefaults(suiteName: "RecommendationFallbackTests.\(UUID().uuidString)")!
+    }
+}
+
+private actor AsyncSearchGate {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspendUntilReleased() async {
+        started = true
+        let waiters = startWaiters
+        startWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
 }
 
 private actor FakeGenreTagFetcher: GenreTagFetching {
@@ -921,6 +1641,10 @@ private final class MemoryYouTubeResolutionCache: YouTubeResolutionCaching {
     }
 
     func result(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult? {
+        storage[identity]
+    }
+
+    func peek(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult? {
         storage[identity]
     }
 
@@ -1036,7 +1760,12 @@ private final class MockRecommendationRadioHarness {
         let batch = try await service.recommendations(
             for: session.epoch.anchor,
             excludingVideoIDs: Set(upcoming.map { $0.youtubeResult.youtubeVideoID }),
-            excludingSongIdentities: session.globalPlayedSongIdentities
+            excludingSongIdentities: session.globalPlayedSongIdentities,
+            context: RecommendationResolutionContext(
+                sessionID: session.id,
+                epochID: epochID,
+                upcomingCount: upcoming.count
+            )
         )
         XCTAssertTrue(session.replaceReservoir(batch.reservoirCandidates, epochID: epochID))
         append(batch.recommendations)
@@ -1053,7 +1782,12 @@ private final class MockRecommendationRadioHarness {
             candidates,
             desiredCount: desired,
             excludingVideoIDs: Set(upcoming.map { $0.youtubeResult.youtubeVideoID }),
-            excludingSongIdentities: session.globalPlayedSongIdentities
+            excludingSongIdentities: session.globalPlayedSongIdentities,
+            context: RecommendationResolutionContext(
+                sessionID: session.id,
+                epochID: session.epoch.id,
+                upcomingCount: upcoming.count
+            )
         )
         XCTAssertTrue(session.returnUnusedReservoirCandidates(
             resolution.unusedCandidates,

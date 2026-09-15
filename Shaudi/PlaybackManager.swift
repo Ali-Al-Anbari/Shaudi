@@ -3719,6 +3719,20 @@ final class PlaybackManager: ObservableObject {
         }
         let excludedVideoIDs = recommendationSeenVideoIDs
         let excludedSongIdentities = recommendationSeenSongIdentities
+        let resolutionContext = RecommendationResolutionContext(
+            sessionID: sessionID,
+            epochID: epochID,
+            upcomingCount: recommendationUpcomingCount,
+            currentUpcomingCount: { [weak self] in
+                self?.recommendationUpcomingCount ?? Int.max
+            },
+            isActive: { [weak self] in
+                self?.isCurrentRecommendationEpoch(
+                    sessionID: sessionID,
+                    epochID: epochID
+                ) == true
+            }
+        )
         let service = recommendationService
 
         recommendationLog(
@@ -3729,7 +3743,8 @@ final class PlaybackManager: ObservableObject {
                 let batch = try await service.recommendations(
                     for: anchor,
                     excludingVideoIDs: excludedVideoIDs,
-                    excludingSongIdentities: excludedSongIdentities
+                    excludingSongIdentities: excludedSongIdentities,
+                    context: resolutionContext
                 )
                 guard let self else {
                     return
@@ -3790,9 +3805,16 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        let candidates = radioSession.takeReservoirCandidates(upTo: 8, epochID: epochID)
+        let candidates = radioSession.takeReservoirCandidates(
+            upTo: RecommendationRadioPolicy.candidatePoolSize,
+            epochID: epochID
+        )
         recommendationRadioSession = radioSession
         guard !candidates.isEmpty else {
+            beginEarlyRecommendationEpochIfNeeded(
+                sessionID: sessionID,
+                epochID: epochID
+            )
             return
         }
         recommendationLog(
@@ -3802,6 +3824,20 @@ final class PlaybackManager: ObservableObject {
         let service = recommendationService
         let excludedVideoIDs = recommendationSeenVideoIDs
         let excludedSongIdentities = recommendationSeenSongIdentities
+        let resolutionContext = RecommendationResolutionContext(
+            sessionID: sessionID,
+            epochID: epochID,
+            upcomingCount: recommendationUpcomingCount,
+            currentUpcomingCount: { [weak self] in
+                self?.recommendationUpcomingCount ?? Int.max
+            },
+            isActive: { [weak self] in
+                self?.isCurrentRecommendationEpoch(
+                    sessionID: sessionID,
+                    epochID: epochID
+                ) == true
+            }
+        )
         let refillID = UUID()
         recommendationRefillID = refillID
         recommendationRefillTask = Task { [weak self] in
@@ -3810,7 +3846,8 @@ final class PlaybackManager: ObservableObject {
                     candidates,
                     desiredCount: neededCount,
                     excludingVideoIDs: excludedVideoIDs,
-                    excludingSongIdentities: excludedSongIdentities
+                    excludingSongIdentities: excludedSongIdentities,
+                    context: resolutionContext
                 )
                 guard let self else {
                     return
@@ -3828,6 +3865,13 @@ final class PlaybackManager: ObservableObject {
                     epochID: epochID
                 )
                 appendRecommendations(resolution.recommendations, seed: seed)
+                if resolution.exhaustedCurrentPaths,
+                   resolution.recommendations.isEmpty {
+                    beginEarlyRecommendationEpochIfNeeded(
+                        sessionID: sessionID,
+                        epochID: epochID
+                    )
+                }
             } catch is CancellationError {
                 guard let self else {
                     return
@@ -3848,6 +3892,49 @@ final class PlaybackManager: ObservableObject {
                 recommendationLog("reservoir resolution failed=\(error.localizedDescription)")
             }
         }
+    }
+
+    private func beginEarlyRecommendationEpochIfNeeded(
+        sessionID: UUID,
+        epochID: UUID
+    ) {
+        guard
+            recommendationRefillTask == nil,
+            recommendationTasks[epochID.uuidString] == nil,
+            recommendationUpcomingCount == 0,
+            isCurrentRecommendationEpoch(sessionID: sessionID, epochID: epochID),
+            let playableTrack = currentPlayableTrack,
+            var radioSession = recommendationRadioSession,
+            radioSession.id == sessionID,
+            radioSession.epoch.id == epochID
+        else {
+            return
+        }
+        let videoID = normalizedVideoID(playableTrack.youtubeVideoID)
+        guard !videoID.isEmpty else {
+            return
+        }
+        let sourceTrack = currentTrack.flatMap {
+            normalizedVideoID($0.youtubeVideoID) == videoID ? $0 : nil
+        }
+        let anchor = recommendationSeed(
+            videoID: videoID,
+            playableTrack: playableTrack,
+            sourceTrack: sourceTrack
+        )
+        guard case .startNewEpoch(let newEpochID, let newAnchor)? =
+            radioSession.startEarlyEpochIfPossible(anchor: anchor)
+        else {
+            return
+        }
+        recommendationRadioSession = radioSession
+        recommendationLog("earlyEpochRollover=true reason=reservoirExhausted")
+        beginRecommendationEpoch(
+            anchor: newAnchor,
+            epochID: newEpochID,
+            sessionID: sessionID,
+            seedTrack: playableTrack
+        )
     }
 
     private func isCurrentRecommendationEpoch(sessionID: UUID, epochID: UUID) -> Bool {

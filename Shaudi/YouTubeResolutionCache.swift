@@ -7,6 +7,7 @@ import Foundation
 
 @MainActor
 protocol YouTubeResolutionCaching {
+    func peek(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult?
     func result(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult?
     func store(
         _ result: YouTubeSearchResult,
@@ -84,6 +85,19 @@ final class PersistentYouTubeResolutionCache: YouTubeResolutionCaching {
         entry.lastAccessedAt = now
         entries[key] = entry
         persist()
+        return entry.searchResult
+    }
+
+    func peek(for identity: SongIdentity, now: Date = .now) async -> YouTubeSearchResult? {
+        loadIfNeeded(now: now)
+        guard let entry = entries[identity.cacheKey] else {
+            return nil
+        }
+        guard now.timeIntervalSince(entry.resolvedAt) <= policy.timeToLive else {
+            entries[identity.cacheKey] = nil
+            persist()
+            return nil
+        }
         return entry.searchResult
     }
 
