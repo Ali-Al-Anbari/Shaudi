@@ -10,6 +10,18 @@ struct YouTubeMetadata {
     let channelTitle: String?
     let thumbnailURL: URL?
     let duration: TimeInterval?
+
+    init(
+        title: String,
+        channelTitle: String?,
+        thumbnailURL: URL?,
+        duration: TimeInterval?
+    ) {
+        self.title = MusicMetadataText.decoded(title)
+        self.channelTitle = channelTitle.map(MusicMetadataText.decoded)
+        self.thumbnailURL = thumbnailURL
+        self.duration = duration
+    }
 }
 
 struct YouTubeSearchResult: Identifiable, Hashable {
@@ -20,6 +32,18 @@ struct YouTubeSearchResult: Identifiable, Hashable {
 
     var id: String {
         youtubeVideoID
+    }
+
+    init(
+        youtubeVideoID: String,
+        title: String,
+        channelTitle: String,
+        thumbnailURL: URL?
+    ) {
+        self.youtubeVideoID = youtubeVideoID
+        self.title = MusicMetadataText.decoded(title)
+        self.channelTitle = MusicMetadataText.decoded(channelTitle)
+        self.thumbnailURL = thumbnailURL
     }
 }
 

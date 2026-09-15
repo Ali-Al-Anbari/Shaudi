@@ -896,47 +896,7 @@ enum SongNormalization {
     }
 
     static func humanReadable(_ value: String) -> String {
-        var result = value
-        let namedEntities = [
-            "&quot;": "\"", "&#39;": "'", "&apos;": "'", "&amp;": "&",
-            "&lt;": "<", "&gt;": ">"
-        ]
-        for _ in 0..<2 {
-            for (entity, replacement) in namedEntities {
-                result = result.replacingOccurrences(
-                    of: entity,
-                    with: replacement,
-                    options: .caseInsensitive
-                )
-            }
-        }
-
-        let pattern = #"&#(x[0-9a-fA-F]+|[0-9]+);"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else {
-            return result
-        }
-        while true {
-            let range = NSRange(result.startIndex..<result.endIndex, in: result)
-            guard
-                let match = expression.firstMatch(in: result, range: range),
-                let fullRange = Range(match.range(at: 0), in: result),
-                let valueRange = Range(match.range(at: 1), in: result)
-            else {
-                break
-            }
-            let encodedValue = String(result[valueRange])
-            let number: UInt32?
-            if encodedValue.lowercased().hasPrefix("x") {
-                number = UInt32(encodedValue.dropFirst(), radix: 16)
-            } else {
-                number = UInt32(encodedValue, radix: 10)
-            }
-            guard let number, let scalar = UnicodeScalar(number) else {
-                break
-            }
-            result.replaceSubrange(fullRange, with: String(Character(scalar)))
-        }
-        return result
+        MusicMetadataText.decoded(value)
     }
 
     static func displayTitle(_ value: String, removingArtist artist: String) -> String {

@@ -207,8 +207,26 @@ private struct RootTabBar: View {
 }
 
 private struct MiniPlayerView: View {
+    private enum DragAxis: Equatable {
+        case horizontal
+        case vertical
+    }
+
+    private struct PageContent {
+        let title: String
+        let artist: String?
+        let thumbnailURL: URL?
+    }
+
     @ObservedObject var playbackManager: PlaybackManager
     let onOpen: () -> Void
+    @State private var dragAxis: DragAxis?
+    @State private var horizontalOffset: CGFloat = 0
+    @State private var isGestureSettling = false
+
+    private let gestureDeadZone: CGFloat = 10
+    private let swipeDistance: CGFloat = 64
+    private let swipePredictedDistance: CGFloat = 120
 
     private var isPlaying: Bool {
         if case .playing = playbackManager.state {
@@ -220,40 +238,49 @@ private struct MiniPlayerView: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Button(action: onOpen) {
-                HStack(spacing: 12) {
-                    artwork
+            GeometryReader { geometry in
+                let pageWidth = max(1, geometry.size.width)
 
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(playbackManager.currentPlayableTrack?.title ?? "")
-                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-
-                        if let channelTitle = playbackManager.currentPlayableTrack?.channelTitle,
-                           !channelTitle.isEmpty
-                        {
-                            Text(channelTitle)
-                                .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
+                ZStack {
+                    if horizontalOffset > 0, let previousPage {
+                        miniPlayerPage(previousPage)
+                            .offset(x: horizontalOffset - pageWidth)
                     }
 
-                    Spacer(minLength: 4)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Open Now Playing")
+                    if horizontalOffset < 0, let nextPage {
+                        miniPlayerPage(nextPage)
+                            .offset(x: horizontalOffset + pageWidth)
+                    }
 
-            miniPlayerControl(
-                systemImage: "backward.fill",
-                label: "Previous",
-                isEnabled: playbackManager.hasPreviousTrack
-            ) {
-                playbackManager.previousTrack()
+                    if let currentPage {
+                        miniPlayerPage(currentPage)
+                            .offset(x: horizontalOffset)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .clipped()
+                .onTapGesture {
+                    guard !isGestureSettling, dragAxis == nil else {
+                        return
+                    }
+                    onOpen()
+                }
+                .simultaneousGesture(miniPlayerSwipeGesture(pageWidth: pageWidth))
+            }
+            .frame(height: 44)
+            .accessibilityLabel("Open Now Playing")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { onOpen() }
+            .accessibilityAction(named: "Previous track") {
+                if playbackManager.hasPreviousTrack {
+                    playbackManager.previousTrack()
+                }
+            }
+            .accessibilityAction(named: "Next track") {
+                if playbackManager.hasNextTrack {
+                    playbackManager.nextTrack()
+                }
             }
 
             miniPlayerControl(
@@ -271,19 +298,15 @@ private struct MiniPlayerView: View {
                 }
             }
 
-            miniPlayerControl(
-                systemImage: "forward.fill",
-                label: "Next",
-                isEnabled: playbackManager.hasNextTrack
-            ) {
-                playbackManager.nextTrack()
-            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .shaudiGlassSurface(
             in: RoundedRectangle(cornerRadius: 22, style: .continuous)
         )
+        .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
+            resetMiniPlayerGesture()
+        }
     }
 
     private func miniPlayerControl(
@@ -308,9 +331,62 @@ private struct MiniPlayerView: View {
         .accessibilityLabel(label)
     }
 
-    private var artwork: some View {
+    private var currentPage: PageContent? {
+        guard let track = playbackManager.currentPlayableTrack else {
+            return nil
+        }
+        return PageContent(
+            title: track.title,
+            artist: track.channelTitle,
+            thumbnailURL: track.thumbnailURL
+        )
+    }
+
+    private var previousPage: PageContent? {
+        pageContent(for: playbackManager.previousQueueTrack)
+    }
+
+    private var nextPage: PageContent? {
+        pageContent(for: playbackManager.nextQueueTrack)
+    }
+
+    private func pageContent(for track: Track?) -> PageContent? {
+        guard let track else {
+            return nil
+        }
+        return PageContent(
+            title: track.displayTitle,
+            artist: track.displayArtist,
+            thumbnailURL: track.thumbnailURL
+        )
+    }
+
+    private func miniPlayerPage(_ content: PageContent) -> some View {
+        HStack(spacing: 12) {
+            artwork(thumbnailURL: content.thumbnailURL)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(content.title)
+                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                if let artist = content.artist, !artist.isEmpty {
+                    Text(artist)
+                        .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func artwork(thumbnailURL: URL?) -> some View {
         Group {
-            if let thumbnailURL = playbackManager.currentPlayableTrack?.thumbnailURL {
+            if let thumbnailURL {
                 AsyncImage(url: thumbnailURL) { phase in
                     if case .success(let image) = phase {
                         image
@@ -327,6 +403,99 @@ private struct MiniPlayerView: View {
         .frame(width: 44, height: 44)
         .background(ShaudiTheme.accent.opacity(0.16))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func miniPlayerSwipeGesture(pageWidth: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: gestureDeadZone)
+            .onChanged { value in
+                guard !isGestureSettling else {
+                    return
+                }
+                let horizontalDistance = abs(value.translation.width)
+                let verticalDistance = abs(value.translation.height)
+                if dragAxis == nil {
+                    guard max(horizontalDistance, verticalDistance) >= gestureDeadZone else {
+                        return
+                    }
+                    dragAxis = horizontalDistance > verticalDistance
+                        ? .horizontal
+                        : .vertical
+                }
+                guard dragAxis == .horizontal else {
+                    return
+                }
+
+                let translation = value.translation.width
+                let hasDestination = translation < 0
+                    ? nextPage != nil
+                    : previousPage != nil
+                horizontalOffset = hasDestination
+                    ? translation
+                    : translation * 0.16
+            }
+            .onEnded { value in
+                guard !isGestureSettling else {
+                    return
+                }
+                guard dragAxis == .horizontal else {
+                    resetMiniPlayerGesture()
+                    return
+                }
+
+                let translation = value.translation.width
+                let predicted = value.predictedEndTranslation.width
+                let direction = abs(translation) >= gestureDeadZone ? translation : predicted
+                let destinationExists = direction < 0
+                    ? nextPage != nil
+                    : previousPage != nil
+                let shouldComplete = destinationExists
+                    && (abs(translation) >= swipeDistance
+                        || abs(predicted) >= swipePredictedDistance)
+
+                guard shouldComplete else {
+                    springMiniPlayerBack()
+                    return
+                }
+
+                isGestureSettling = true
+                let movesToNext = direction < 0
+                withAnimation(
+                    .easeInOut(duration: 0.22),
+                    completionCriteria: .logicallyComplete
+                ) {
+                    horizontalOffset = movesToNext ? -pageWidth : pageWidth
+                } completion: {
+                    if movesToNext {
+                        playbackManager.nextTrack()
+                    } else {
+                        playbackManager.previousTrack()
+                    }
+                    resetMiniPlayerGesture()
+                }
+            }
+    }
+
+    private func springMiniPlayerBack() {
+        isGestureSettling = true
+        withAnimation(
+            .spring(response: 0.34, dampingFraction: 0.84),
+            completionCriteria: .logicallyComplete
+        ) {
+            horizontalOffset = 0
+        } completion: {
+            dragAxis = nil
+            isGestureSettling = false
+        }
+    }
+
+    private func resetMiniPlayerGesture() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            horizontalOffset = 0
+            dragAxis = nil
+            isGestureSettling = false
+        }
     }
 
     private var artworkPlaceholder: some View {
@@ -372,6 +541,7 @@ private struct NowPlayingView: View {
     }
 
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appearanceSettings: AppearanceSettings
     @ObservedObject var playbackManager: PlaybackManager
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
@@ -680,12 +850,13 @@ private struct NowPlayingView: View {
     private func metadata(_ content: PageContent) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(content.title)
-                .font(ShaudiTheme.bodyFont(size: 25, relativeTo: .title2).weight(.semibold))
-                .foregroundStyle(.white)
+                .font(.custom("Snell Roundhand", size: 29, relativeTo: .title2))
+                .foregroundStyle(appearanceSettings.primaryColor)
                 .lineLimit(2)
+                .minimumScaleFactor(0.72)
 
             Text(content.artist)
-                .font(ShaudiTheme.bodyFont(size: 17, relativeTo: .body))
+                .font(.custom("Times New Roman", size: 17, relativeTo: .body))
                 .foregroundStyle(.white.opacity(0.68))
                 .lineLimit(1)
         }
@@ -904,7 +1075,7 @@ private struct NowPlayingView: View {
         }
 
         return PageContent(
-            title: track.title,
+            title: track.displayTitle,
             artist: track.displayArtist ?? "Unknown artist",
             thumbnailURL: track.thumbnailURL,
             coverMedia: coverMedia

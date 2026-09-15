@@ -901,7 +901,7 @@ private struct LibraryTrackRow: View {
                     artwork
 
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(track.title)
+                        Text(track.displayTitle)
                             .font(
                                 isCurrentlyPlaying
                                     ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
@@ -1538,7 +1538,7 @@ struct TrackDetailView: View {
             }
 
             Section("Track") {
-                Text(track.title)
+                Text(track.displayTitle)
                     .font(ShaudiTheme.scriptFont(size: 28, relativeTo: .title2))
                     .foregroundStyle(ShaudiTheme.accent)
                     .lineLimit(2)
@@ -1552,7 +1552,7 @@ struct TrackDetailView: View {
 
             Section("Playback") {
                 if let currentTrack = playbackManager.currentTrack {
-                    LabeledContent("Current Track", value: currentTrack.title)
+                    LabeledContent("Current Track", value: currentTrack.displayTitle)
                 }
 
                 playbackControls
@@ -1592,7 +1592,7 @@ struct TrackDetailView: View {
         .scrollContentBackground(.hidden)
         .background(ShaudiTheme.canvas)
         .tint(ShaudiTheme.accent)
-        .navigationTitle(track.title)
+        .navigationTitle(track.displayTitle)
         .toolbar {
             Menu {
                 Button {
@@ -1689,7 +1689,7 @@ struct TrackDetailView: View {
             playButton(playbackManager.currentTrack == nil ? "Play Track" : "Play This Track")
 
             if let currentTrack = playbackManager.currentTrack {
-                Text("Playback continues for \(currentTrack.title).")
+                Text("Playback continues for \(currentTrack.displayTitle).")
                     .foregroundStyle(.secondary)
             }
         }

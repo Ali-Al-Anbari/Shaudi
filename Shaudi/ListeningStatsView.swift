@@ -226,7 +226,7 @@ private struct StatsTrackRow: View {
             artwork
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(track.title)
+                Text(track.displayTitle)
                     .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
                     .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                     .lineLimit(1)
@@ -283,7 +283,7 @@ private struct RecentlyPlayedTrackRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(track.title)
+            Text(track.displayTitle)
                 .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                 .lineLimit(1)

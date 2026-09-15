@@ -562,7 +562,7 @@ struct PlaylistDetailView: View {
                 HStack(spacing: 13) {
                     trackArtwork(track)
 
-                    Text(track.title)
+                    Text(track.displayTitle)
                         .font(
                             isCurrentlyPlaying
                                 ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
@@ -762,7 +762,7 @@ private struct AddTracksView: View {
                             } label: {
                                 HStack {
                                     VStack(alignment: .leading) {
-                                        Text(track.title)
+                                        Text(track.displayTitle)
                                             .foregroundStyle(.primary)
 
                                         if isAlreadyAdded(track) {

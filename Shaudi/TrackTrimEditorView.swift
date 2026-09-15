@@ -112,7 +112,7 @@ struct TrackTrimEditorView: View {
 
     private func editor(for duration: TimeInterval) -> some View {
         VStack(alignment: .leading, spacing: 24) {
-            Text(track.title)
+            Text(track.displayTitle)
                 .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title))
                 .foregroundStyle(ShaudiTheme.accent)
                 .lineLimit(2)

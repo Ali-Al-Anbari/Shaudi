@@ -64,8 +64,8 @@ struct PlayableTrack: Identifiable, Hashable {
         playbackEndTime: TimeInterval? = nil
     ) {
         self.youtubeVideoID = youtubeVideoID
-        self.title = title
-        self.channelTitle = channelTitle
+        self.title = MusicMetadataText.decoded(title)
+        self.channelTitle = channelTitle.map(MusicMetadataText.decoded)
         self.thumbnailURL = thumbnailURL
         self.duration = duration
         self.playbackStartTime = playbackStartTime
@@ -75,7 +75,7 @@ struct PlayableTrack: Identifiable, Hashable {
     init(track: Track) {
         self.init(
             youtubeVideoID: track.youtubeVideoID,
-            title: track.title,
+            title: track.displayTitle,
             channelTitle: track.displayArtist,
             thumbnailURL: track.thumbnailURL,
             duration: track.duration,

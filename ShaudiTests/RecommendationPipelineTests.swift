@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class RecommendationPipelineTests: XCTestCase {
+    func testMusicMetadataDecodesCommonHTMLEntitiesForDisplay() {
+        XCTAssertEqual(
+            MusicMetadataText.decoded("That&#39;s What You Get"),
+            "That's What You Get"
+        )
+        XCTAssertEqual(
+            MusicMetadataText.decoded("Rock &amp; Roll"),
+            "Rock & Roll"
+        )
+        XCTAssertEqual(
+            MusicMetadataText.decoded("&quot;Song&#x27;s Name&quot;"),
+            "\"Song's Name\""
+        )
+    }
+
+    func testMusicMetadataLeavesAlreadyDecodedTextUnchanged() {
+        let value = "That's What You Get"
+
+        XCTAssertEqual(MusicMetadataText.decoded(value), value)
+    }
+
     func testParamoreOfficialVideoIdentity() {
         let seed = manualSeed(
             title: "Paramore - That's What You Get [OFFICIAL VIDEO]",

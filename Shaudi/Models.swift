@@ -63,9 +63,14 @@ final class Track {
 }
 
 extension Track {
+    var displayTitle: String {
+        MusicMetadataText.decoded(title)
+    }
+
     var displayArtist: String? {
         let override = userArtistOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return override?.isEmpty == false ? override : channelTitle
+        let value = override?.isEmpty == false ? override : channelTitle
+        return value.map(MusicMetadataText.decoded)
     }
 }
 

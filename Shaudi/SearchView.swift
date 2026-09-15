@@ -629,7 +629,7 @@ struct SearchView: View {
                 let track = makeTrack(for: result, metadata: metadata)
                 modelContext.insert(track)
                 try modelContext.save()
-                noticeMessage = "Added “\(track.title)” to Library"
+                noticeMessage = "Added “\(track.displayTitle)” to Library"
                 searchLog("Created Library track \(result.youtubeVideoID)")
             } catch {
                 errorMessage = error.localizedDescription
@@ -667,7 +667,7 @@ struct SearchView: View {
 
                 playlist.tracks.append(track)
                 try modelContext.save()
-                noticeMessage = "Added “\(track.title)” to \(playlist.name)"
+                noticeMessage = "Added “\(track.displayTitle)” to \(playlist.name)"
 
                 if reusedLibraryTrack {
                     searchLog(
