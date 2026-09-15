@@ -58,6 +58,10 @@ struct SettingsView: View {
                         )
                     }
 
+                    settingsSection("Ambient") {
+                        Toggle("Love Letters", isOn: $appearanceSettings.loveLettersEnabled)
+                    }
+
                     settingsSection("Your Library") {
                         NavigationLink {
                             ListeningStatsView()

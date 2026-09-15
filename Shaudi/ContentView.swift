@@ -69,13 +69,15 @@ private extension View {
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var playbackManager: PlaybackManager
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
     @State private var selectedTab: RootTab = .library
     @State private var isShowingNowPlaying = false
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack {
+            VStack(spacing: 0) {
             TabView(selection: $selectedTab) {
                 LibraryView()
                     .tag(RootTab.library)
@@ -103,6 +105,14 @@ struct ContentView: View {
             }
 
             RootTabBar(selectedTab: $selectedTab)
+            }
+
+            AmbientLoveLetterOverlay(
+                isEnabled: appearanceSettings.loveLettersEnabled,
+                isAppActive: scenePhase == .active,
+                isSuppressed: isShowingNowPlaying || playbackManager.isTrimPreviewActive,
+                accentColor: appearanceSettings.primaryColor
+            )
         }
         .fullScreenCover(isPresented: $isShowingNowPlaying) {
             NowPlayingView(playbackManager: playbackManager)

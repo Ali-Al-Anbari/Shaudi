@@ -71,11 +71,17 @@ final class AppearanceSettings: ObservableObject {
         }
     }
 
+    @Published var loveLettersEnabled: Bool {
+        didSet {
+            defaults.set(loveLettersEnabled, forKey: Keys.loveLettersEnabled)
+        }
+    }
+
     @Published private(set) var bannerRevision = UUID()
 
     private let defaults: UserDefaults
 
-    private init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         primaryFont = PrimaryFont(
             rawValue: defaults.string(forKey: Keys.primaryFont) ?? ""
@@ -93,6 +99,7 @@ final class AppearanceSettings: ObservableObject {
             defaultValue: Self.defaultSecondaryColor,
             defaults: defaults
         )
+        loveLettersEnabled = defaults.object(forKey: Keys.loveLettersEnabled) as? Bool ?? true
     }
 
     func restoreDefaults() {
@@ -111,6 +118,7 @@ final class AppearanceSettings: ObservableObject {
         static let secondaryFont = "shaudi.appearance.secondaryFont"
         static let primaryColor = "shaudi.appearance.primaryColor"
         static let secondaryColor = "shaudi.appearance.secondaryColor"
+        static let loveLettersEnabled = "shaudi.appearance.loveLettersEnabled"
     }
 
     private struct ColorComponents: Codable {
