@@ -1,0 +1,250 @@
+//
+//  LastFMRecommendationService.swift
+//  Shaudi
+//
+
+import Foundation
+
+struct LastFMSimilarTrack: Hashable {
+    let artist: String
+    let title: String
+    let match: Double
+    let url: URL?
+}
+
+struct LastFMRecommendationService {
+    enum ServiceError: LocalizedError {
+        case missingAPIKey
+        case invalidRequest
+        case invalidResponse
+        case network(String)
+        case api(code: Int?, message: String)
+        case malformedResponse
+
+        var errorDescription: String? {
+            switch self {
+            case .missingAPIKey:
+                return "Last.fm recommendations are unavailable because LASTFM_API_KEY is not configured."
+            case .invalidRequest:
+                return "The Last.fm recommendation request could not be created."
+            case .invalidResponse:
+                return "Last.fm returned an invalid response."
+            case .network(let message):
+                return "Could not reach Last.fm: \(message)"
+            case .api(_, let message):
+                return "Last.fm could not provide recommendations: \(message)"
+            case .malformedResponse:
+                return "Last.fm returned recommendations in an unexpected format."
+            }
+        }
+
+        var permitsAlternateSeedRetry: Bool {
+            guard case .api(let code, let message) = self else {
+                return false
+            }
+            return code == 7 || message.localizedCaseInsensitiveContains("not found")
+        }
+    }
+
+    private let session: URLSession
+
+    init(session: URLSession = .shared) {
+        self.session = session
+    }
+
+    func similarTracks(
+        artist: String,
+        title: String,
+        limit: Int = RecommendationRadioPolicy.candidatePoolSize
+    ) async throws -> [LastFMSimilarTrack] {
+#if DEBUG
+        print("[LastFM] request artist=\(artist) track=\(title) autocorrect=true")
+#endif
+        let data = try await request(method: "track.getSimilar", queryItems: [
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "track", value: title),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "limit", value: String(limit))
+        ])
+
+        let response: SimilarTracksResponse
+        do {
+            response = try JSONDecoder().decode(SimilarTracksResponse.self, from: data)
+        } catch {
+#if DEBUG
+            print("[LastFM] request failed=track.getSimilar response decoding: \(error.localizedDescription)")
+#endif
+            throw ServiceError.malformedResponse
+        }
+
+#if DEBUG
+        if let attributes = response.similartracks.attributes {
+            print(
+                "[LastFM] response artist=\(attributes.artist) "
+                    + "track=\(attributes.track)"
+            )
+        }
+#endif
+
+        let tracks = response.similartracks.track.compactMap { item -> LastFMSimilarTrack? in
+            let artist = item.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !artist.isEmpty, !title.isEmpty else {
+                return nil
+            }
+
+            return LastFMSimilarTrack(
+                artist: artist,
+                title: title,
+                match: item.match,
+                url: item.url.flatMap(URL.init(string:))
+            )
+        }
+
+#if DEBUG
+        print("[LastFM] candidates received=\(tracks.count)")
+#endif
+        return tracks
+    }
+
+    private func request(
+        method: String,
+        queryItems: [URLQueryItem]
+    ) async throws -> Data {
+        let apiKey = try apiKey()
+        var components = URLComponents(string: "https://ws.audioscrobbler.com/2.0/")
+        components?.queryItems = [
+            URLQueryItem(name: "method", value: method),
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "format", value: "json")
+        ] + queryItems
+
+        guard let url = components?.url else {
+            throw ServiceError.invalidRequest
+        }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(from: url)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+#if DEBUG
+            print("[LastFM] request failed=\(error.localizedDescription)")
+#endif
+            throw ServiceError.network(error.localizedDescription)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ServiceError.invalidResponse
+        }
+
+#if DEBUG
+        print("[LastFM] HTTP status=\(httpResponse.statusCode)")
+#endif
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let apiError = try? JSONDecoder().decode(APIErrorResponse.self, from: data)
+#if DEBUG
+            if let apiError {
+                print("[LastFM] API error=\(apiError.error)/\(apiError.message)")
+            }
+#endif
+            throw ServiceError.api(
+                code: apiError?.error,
+                message: apiError?.message ?? "HTTP \(httpResponse.statusCode)"
+            )
+        }
+
+        if let apiError = try? JSONDecoder().decode(APIErrorResponse.self, from: data) {
+#if DEBUG
+            print("[LastFM] API error=\(apiError.error)/\(apiError.message)")
+#endif
+            throw ServiceError.api(code: apiError.error, message: apiError.message)
+        }
+        return data
+    }
+
+    private func apiKey() throws -> String {
+        let value = (Bundle.main.object(forInfoDictionaryKey: "LASTFM_API_KEY") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let isAvailable = value?.isEmpty == false
+            && value?.contains("$(LASTFM_API_KEY)") == false
+#if DEBUG
+        print("[LastFM] API key available=\(isAvailable)")
+#endif
+
+        guard
+            let value,
+            isAvailable
+        else {
+            throw ServiceError.missingAPIKey
+        }
+        return value
+    }
+}
+
+private struct SimilarTracksResponse: Decodable {
+    let similartracks: SimilarTracks
+
+    struct SimilarTracks: Decodable {
+        let track: [Item]
+        let attributes: Attributes?
+
+        private enum CodingKeys: String, CodingKey {
+            case track
+            case attributes = "@attr"
+        }
+    }
+
+    struct Attributes: Decodable {
+        let artist: String
+        let track: String
+    }
+
+    struct Item: Decodable {
+        let name: String
+        let match: Double
+        let url: String?
+        let artist: Artist
+
+        private enum CodingKeys: String, CodingKey {
+            case name
+            case match
+            case url
+            case artist
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            url = try container.decodeIfPresent(String.self, forKey: .url)
+            artist = try container.decode(Artist.self, forKey: .artist)
+
+            if let numericMatch = try? container.decode(Double.self, forKey: .match) {
+                match = numericMatch
+            } else {
+                let stringMatch = try container.decode(String.self, forKey: .match)
+                guard let numericMatch = Double(stringMatch) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .match,
+                        in: container,
+                        debugDescription: "Expected a numeric Last.fm match score."
+                    )
+                }
+                match = numericMatch
+            }
+        }
+    }
+
+    struct Artist: Decodable {
+        let name: String
+    }
+}
+
+private struct APIErrorResponse: Decodable {
+    let error: Int
+    let message: String
+}

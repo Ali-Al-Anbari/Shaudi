@@ -35,6 +35,7 @@ struct YouTubeMetadataClient {
         case invalidResponse
         case network(String)
         case api(String)
+        case quotaExceeded
         case malformedResponse
         case videoUnavailable
 
@@ -50,6 +51,8 @@ struct YouTubeMetadataClient {
                 return "Could not reach YouTube: \(message)"
             case .api(let message):
                 return "YouTube could not provide metadata: \(message)"
+            case .quotaExceeded:
+                return "YouTube Data API search quota is unavailable."
             case .malformedResponse:
                 return "YouTube returned metadata in an unexpected format."
             case .videoUnavailable:
@@ -203,8 +206,11 @@ struct YouTubeMetadataClient {
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
-            let apiMessage = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data).error.message
-            throw ClientError.api(apiMessage ?? "HTTP \(httpResponse.statusCode)")
+            let apiError = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data).error
+            if apiError?.isQuotaExceeded == true {
+                throw ClientError.quotaExceeded
+            }
+            throw ClientError.api(apiError?.message ?? "HTTP \(httpResponse.statusCode)")
         }
 
         return data
@@ -341,4 +347,16 @@ private struct APIErrorEnvelope: Decodable {
 
 private struct APIError: Decodable {
     let message: String
+    let errors: [APIErrorDetail]?
+
+    var isQuotaExceeded: Bool {
+        message.localizedCaseInsensitiveContains("quota")
+            || errors?.contains(where: {
+                $0.reason == "quotaExceeded" || $0.reason == "dailyLimitExceeded"
+            }) == true
+    }
+}
+
+private struct APIErrorDetail: Decodable {
+    let reason: String
 }

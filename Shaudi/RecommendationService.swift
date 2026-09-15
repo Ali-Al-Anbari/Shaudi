@@ -5,179 +5,993 @@
 
 import Foundation
 
-struct RecommendationSeed {
-    let youtubeVideoID: String
+struct SongIdentity: Hashable {
+    let artist: String
     let title: String
-    let displayedArtist: String?
-    let sourceChannel: String?
-}
+    private let normalizedArtist: String
+    private let normalizedTitle: String
 
-struct RecommendationService {
-    private struct RankedCandidate {
-        let result: YouTubeSearchResult
-        let score: Int
-        let signature: String
+    init(artist: String, title: String) {
+        self.artist = SongNormalization.humanReadable(artist)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.title = SongNormalization.humanReadable(title)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        normalizedArtist = SongNormalization.text(artist)
+        normalizedTitle = SongNormalization.baseTitle(title)
     }
 
-    private let metadataClient = YouTubeMetadataClient()
-    private let resultLimit = 3
+    static func == (lhs: SongIdentity, rhs: SongIdentity) -> Bool {
+        lhs.normalizedArtist == rhs.normalizedArtist
+            && lhs.normalizedTitle == rhs.normalizedTitle
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(normalizedArtist)
+        hasher.combine(normalizedTitle)
+    }
+
+    var cacheKey: String {
+        normalizedArtist + "\u{1F}" + normalizedTitle
+    }
+}
+
+typealias RecommendationSongIdentity = SongIdentity
+
+struct RecommendationSeed {
+    let youtubeVideoID: String
+    let rawTitle: String
+    let displayedArtist: String?
+    let sourceChannel: String?
+    let userArtistOverride: String?
+    let cleanedArtist: String
+    let cleanedTitle: String
+    let fallbackTitle: String?
+    let artistSource: RecommendationSeedArtistSource
+
+    init(
+        youtubeVideoID: String,
+        rawTitle: String,
+        displayedArtist: String?,
+        sourceChannel: String?,
+        userArtistOverride: String?
+    ) {
+        self.youtubeVideoID = youtubeVideoID
+        self.rawTitle = rawTitle
+        self.displayedArtist = displayedArtist
+        self.sourceChannel = sourceChannel
+        self.userArtistOverride = userArtistOverride
+
+        let identity = RecommendationSeedIdentityResolver.resolve(
+            rawTitle: rawTitle,
+            displayedArtist: displayedArtist,
+            channel: sourceChannel,
+            userArtistOverride: userArtistOverride
+        )
+        cleanedArtist = identity.artist
+        cleanedTitle = identity.title
+        fallbackTitle = identity.fallbackTitle
+        artistSource = identity.artistSource
+
+#if DEBUG
+        print(
+            "[RecommendationIdentity] source=manualSearch rawTitle=\(rawTitle) "
+                + "rawChannel=\(sourceChannel ?? "")"
+        )
+        print(
+            "[RecommendationIdentity] canonicalArtist=\(identity.artist) "
+                + "canonicalTitle=\(identity.title) artistSource=\(identity.artistSource.rawValue)"
+        )
+#endif
+    }
+
+    init(
+        youtubeVideoID: String,
+        canonicalIdentity: SongIdentity,
+        youtubeTitle: String,
+        youtubeChannel: String
+    ) {
+        self.youtubeVideoID = youtubeVideoID
+        rawTitle = youtubeTitle
+        displayedArtist = canonicalIdentity.artist
+        sourceChannel = youtubeChannel
+        userArtistOverride = nil
+        cleanedArtist = canonicalIdentity.artist
+        cleanedTitle = canonicalIdentity.title
+        fallbackTitle = nil
+        artistSource = .lastFM
+
+#if DEBUG
+        print(
+            "[RecommendationIdentity] source=lastFM "
+                + "canonicalArtist=\(canonicalIdentity.artist) "
+                + "canonicalTitle=\(canonicalIdentity.title) reparseSkipped=true"
+        )
+#endif
+    }
+
+    var songIdentity: RecommendationSongIdentity {
+        RecommendationSongIdentity(artist: cleanedArtist, title: cleanedTitle)
+    }
+}
+
+enum RecommendationSeedArtistSource: String {
+    case lastFM
+    case userOverride
+    case titlePrefix
+    case topicChannel
+    case channelFallback
+}
+
+private struct RecommendationSeedIdentity {
+    let artist: String
+    let title: String
+    let fallbackTitle: String?
+    let artistSource: RecommendationSeedArtistSource
+}
+
+private enum RecommendationSeedIdentityResolver {
+    static func resolve(
+        rawTitle: String,
+        displayedArtist: String?,
+        channel: String?,
+        userArtistOverride: String?
+    ) -> RecommendationSeedIdentity {
+        let cleanedRawTitle = SongNormalization.displayTitle(rawTitle)
+        let parsedTitle = parsedArtistAndTitle(from: cleanedRawTitle)
+        let override = nonempty(userArtistOverride).map { SongNormalization.artist($0) }
+        let cleanedChannel = nonempty(channel).map { SongNormalization.artist($0) }
+        let cleanedDisplayArtist = nonempty(displayedArtist).map {
+            SongNormalization.artist($0)
+        }
+
+        let artist: String
+        let artistSource: RecommendationSeedArtistSource
+        if let override, !override.isEmpty {
+            artist = override
+            artistSource = .userOverride
+        } else if let parsedTitle {
+            artist = parsedTitle.artist
+            artistSource = .titlePrefix
+        } else if let channel, isTopicChannel(channel), let cleanedChannel {
+            artist = cleanedChannel
+            artistSource = .topicChannel
+        } else {
+            artist = cleanedDisplayArtist ?? cleanedChannel ?? ""
+            artistSource = .channelFallback
+        }
+
+        let titleWithFeatures: String
+        if override != nil {
+            titleWithFeatures = SongNormalization.displayTitle(
+                cleanedRawTitle,
+                removingArtist: artist
+            )
+        } else if let parsedTitle {
+            titleWithFeatures = parsedTitle.title
+        } else {
+            titleWithFeatures = SongNormalization.displayTitle(
+                cleanedRawTitle,
+                removingArtist: artist
+            )
+        }
+        let presentationCleanedTitle = SongNormalization.displayTitle(titleWithFeatures)
+        let titleWithoutProductionCredit = SongNormalization.removingTrailingProductionCredit(
+            from: presentationCleanedTitle
+        )
+        let canonicalTitle = SongNormalization.displayTitle(
+            SongNormalization.removingFeaturedArtistCredit(
+                from: titleWithoutProductionCredit
+            )
+        )
+        let fallbackTitle = SongNormalization.text(canonicalTitle)
+            == SongNormalization.text(presentationCleanedTitle)
+            ? nil
+            : presentationCleanedTitle
+
+        return RecommendationSeedIdentity(
+            artist: artist,
+            title: canonicalTitle,
+            fallbackTitle: fallbackTitle,
+            artistSource: artistSource
+        )
+    }
+
+    private static func parsedArtistAndTitle(
+        from value: String
+    ) -> (artist: String, title: String)? {
+        guard let separatorRange = value.range(
+            of: #"\s[-–—]\s"#,
+            options: .regularExpression
+        ) else {
+            return nil
+        }
+
+        let artist = value[..<separatorRange.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = value[separatorRange.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let artistWordCount = artist.split(whereSeparator: \.isWhitespace).count
+        guard
+            !artist.isEmpty,
+            !title.isEmpty,
+            artist.count <= 80,
+            (1...10).contains(artistWordCount),
+            artist.rangeOfCharacter(from: .alphanumerics) != nil,
+            title.rangeOfCharacter(from: .alphanumerics) != nil
+        else {
+            return nil
+        }
+
+        return (SongNormalization.artist(artist), title)
+    }
+
+    private static func isTopicChannel(_ value: String) -> Bool {
+        value.range(of: #"(?i)\s*-\s*topic\s*$"#, options: .regularExpression) != nil
+    }
+
+    private static func nonempty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+}
+
+struct ResolvedRecommendation {
+    let artist: String
+    let title: String
+    let match: Double
+    let youtubeResult: YouTubeSearchResult
+
+    var songIdentity: RecommendationSongIdentity {
+        SongIdentity(artist: artist, title: title)
+    }
+
+    var transportMetadata: RecommendationTransportMetadata {
+        RecommendationTransportMetadata(
+            canonicalIdentity: songIdentity,
+            youtubeTitle: youtubeResult.title,
+            youtubeChannel: youtubeResult.channelTitle
+        )
+    }
+}
+
+struct RecommendationTransportMetadata {
+    let canonicalIdentity: SongIdentity
+    let youtubeTitle: String
+    let youtubeChannel: String
+}
+
+struct RecommendationBatch {
+    let recommendations: [ResolvedRecommendation]
+    let reservoirCandidates: [LastFMSimilarTrack]
+}
+
+struct RecommendationReservoirResolution {
+    let recommendations: [ResolvedRecommendation]
+    let unusedCandidates: [LastFMSimilarTrack]
+}
+
+struct RecommendationCandidateReservoir {
+    private(set) var candidates: [LastFMSimilarTrack] = []
+
+    var count: Int {
+        candidates.count
+    }
+
+    var isEmpty: Bool {
+        candidates.isEmpty
+    }
+
+    mutating func reset() {
+        candidates = []
+    }
+
+    mutating func store(
+        _ newCandidates: [LastFMSimilarTrack],
+        excluding excluded: Set<RecommendationSongIdentity>,
+        limit: Int
+    ) {
+        guard limit > 0 else {
+            candidates = []
+            return
+        }
+        let existing = Set(candidates.map {
+            RecommendationSongIdentity(artist: $0.artist, title: $0.title)
+        })
+        var seen = existing.union(excluded)
+        let fresh = newCandidates.filter { candidate in
+            seen.insert(RecommendationSongIdentity(
+                artist: candidate.artist,
+                title: candidate.title
+            )).inserted
+        }
+        candidates = Array((fresh + candidates).prefix(limit))
+    }
+
+    mutating func take(upTo limit: Int) -> [LastFMSimilarTrack] {
+        guard limit > 0, !candidates.isEmpty else {
+            return []
+        }
+        let count = min(limit, candidates.count)
+        let result = Array(candidates.prefix(count))
+        candidates.removeFirst(count)
+        return result
+    }
+}
+
+@MainActor
+struct RecommendationService {
+    private struct RankedSong {
+        let track: LastFMSimilarTrack
+        let identity: RecommendationSongIdentity
+
+        var score: Double {
+            track.match
+        }
+    }
+
+    private struct RankedYouTubeResult {
+        let result: YouTubeSearchResult
+        let score: Int
+    }
+
+    typealias SimilarTracksOperation = (
+        _ artist: String,
+        _ title: String,
+        _ limit: Int
+    ) async throws -> [LastFMSimilarTrack]
+
+    private let similarTracksOperation: SimilarTracksOperation
+    private let videoResolver: YouTubeRecommendationResolver
+    private let resolutionCache: any YouTubeResolutionCaching
+    private let resultLimit = RecommendationRadioPolicy.targetUpcomingCount
+    private let candidatePoolLimit = RecommendationRadioPolicy.candidatePoolSize
+    private let youtubeResolutionLimit = 12
+    private let reservoirCandidateLimit = RecommendationRadioPolicy.candidatePoolSize
+
+    init() {
+        let lastFMService = LastFMRecommendationService()
+        similarTracksOperation = { artist, title, limit in
+            try await lastFMService.similarTracks(
+                artist: artist,
+                title: title,
+                limit: limit
+            )
+        }
+        videoResolver = YouTubeRecommendationResolver()
+        resolutionCache = PersistentYouTubeResolutionCache.shared
+    }
+
+    init(
+        similarTracks: @escaping SimilarTracksOperation,
+        videoResolver: YouTubeRecommendationResolver,
+        resolutionCache: any YouTubeResolutionCaching
+    ) {
+        similarTracksOperation = similarTracks
+        self.videoResolver = videoResolver
+        self.resolutionCache = resolutionCache
+    }
 
     func recommendations(
         for seed: RecommendationSeed,
-        excluding excludedVideoIDs: Set<String>
-    ) async throws -> [YouTubeSearchResult] {
-        let queries = focusedQueries(for: seed)
-        var candidates: [YouTubeSearchResult] = []
-        var seenVideoIDs = excludedVideoIDs
-        seenVideoIDs.insert(normalizedVideoID(seed.youtubeVideoID))
+        excludingVideoIDs: Set<String>,
+        excludingSongIdentities: Set<RecommendationSongIdentity>
+    ) async throws -> RecommendationBatch {
+        let seedArtist = seed.cleanedArtist
+        let seedTitle = seed.cleanedTitle
+        guard !seedArtist.isEmpty, !seedTitle.isEmpty else {
+            recommendationLog("all candidates filtered reason=blank normalized seed")
+            return RecommendationBatch(recommendations: [], reservoirCandidates: [])
+        }
 
-        for query in queries {
-            let page = try await metadataClient.search(query: query)
-            for result in page.results {
-                let videoID = normalizedVideoID(result.youtubeVideoID)
-                guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
-                    continue
-                }
-                candidates.append(result)
-            }
+#if DEBUG
+        print("[Recommendations] seed=\(seedArtist) - \(seedTitle)")
+#endif
+        let candidates = try await similarTracks(for: seed)
+        let ranked = filteredCandidates(
+            candidates,
+            seed: seed,
+            excluding: excludingSongIdentities
+        ).sorted(by: rankedSongOrder)
+#if DEBUG
+        print("[Recommendations] candidates after diversity=\(ranked.count)")
+#endif
+        var selected: [ResolvedRecommendation] = []
+        var seenVideoIDs = Set(excludingVideoIDs.map(normalizedVideoID))
+        var seenSongs = excludingSongIdentities
+        var artistCounts: [String: Int] = [:]
+        var deferredForDiversity: [RankedSong] = []
+        var attemptedResolutions = 0
+        var attemptedSongIdentities = Set<RecommendationSongIdentity>()
 
-            if rankedCandidates(candidates, seed: seed).count >= resultLimit {
+        for candidate in ranked {
+            try Task.checkCancellation()
+            guard selected.count < resultLimit, attemptedResolutions < youtubeResolutionLimit else {
                 break
             }
-        }
 
-        return Array(
-            rankedCandidates(candidates, seed: seed)
-                .prefix(resultLimit)
-                .map(\.result)
-        )
-    }
-
-    private func focusedQueries(for seed: RecommendationSeed) -> [String] {
-        let artist = cleanedQueryComponent(
-            seed.displayedArtist ?? seed.sourceChannel ?? ""
-        )
-        let title = cleanedQueryComponent(seed.title)
-
-        var queries: [String] = []
-        if !artist.isEmpty {
-            queries.append("\(artist) \(title) similar songs music")
-            queries.append("\(artist) songs official audio")
-        } else {
-            queries.append("\(title) similar songs music")
-            queries.append("\(title) related music")
-        }
-
-        var seen = Set<String>()
-        return queries.filter { seen.insert($0.lowercased()).inserted }
-    }
-
-    private func rankedCandidates(
-        _ candidates: [YouTubeSearchResult],
-        seed: RecommendationSeed
-    ) -> [RankedCandidate] {
-        let seedArtistTokens = tokens(
-            seed.displayedArtist ?? seed.sourceChannel ?? ""
-        )
-        let seedTitleTokens = meaningfulTitleTokens(seed.title)
-        let seedSignature = titleSignature(seed.title, artistTokens: seedArtistTokens)
-
-        let ranked = candidates.enumerated().compactMap { index, result -> RankedCandidate? in
-            let normalizedTitle = normalizedText(result.title)
-            guard !containsExcludedVariant(normalizedTitle) else {
-                return nil
+            let normalizedArtist = SongNormalization.text(candidate.track.artist)
+            if artistCounts[normalizedArtist, default: 0] >= 2 {
+                deferredForDiversity.append(candidate)
+                continue
             }
 
-            let candidateArtistTokens = tokens(result.channelTitle)
-            let candidateTitleTokens = meaningfulTitleTokens(result.title)
-            let signature = titleSignature(
-                result.title,
-                artistTokens: candidateArtistTokens.union(seedArtistTokens)
+            attemptedResolutions += 1
+            attemptedSongIdentities.insert(candidate.identity)
+            guard let resolved = try await safelyResolveOnYouTube(candidate.track) else {
+                continue
+            }
+            let videoID = normalizedVideoID(resolved.youtubeResult.youtubeVideoID)
+            guard
+                seenVideoIDs.insert(videoID).inserted,
+                seenSongs.insert(resolved.songIdentity).inserted
+            else {
+                recommendationLog("rejected duplicate resolved song=\(resolved.artist) - \(resolved.title)")
+                continue
+            }
+            selected.append(resolved)
+            artistCounts[normalizedArtist, default: 0] += 1
+        }
+
+        if selected.count < resultLimit {
+            for candidate in deferredForDiversity {
+                try Task.checkCancellation()
+                guard selected.count < resultLimit, attemptedResolutions < youtubeResolutionLimit else {
+                    break
+                }
+                attemptedResolutions += 1
+                attemptedSongIdentities.insert(candidate.identity)
+                guard let resolved = try await safelyResolveOnYouTube(candidate.track) else {
+                    continue
+                }
+                let videoID = normalizedVideoID(resolved.youtubeResult.youtubeVideoID)
+                guard
+                    seenVideoIDs.insert(videoID).inserted,
+                    seenSongs.insert(resolved.songIdentity).inserted
+                else {
+                    continue
+                }
+                selected.append(resolved)
+            }
+        }
+
+#if DEBUG
+        print("[Recommendations] selected=\(selected.count)")
+        for (index, item) in selected.enumerated() {
+            print("\(index + 1). \(item.artist) - \(item.title)")
+        }
+#endif
+        let selectedIdentities = Set(selected.map(\.songIdentity))
+        let reservoirCandidates = Array(ranked.lazy.filter {
+            !attemptedSongIdentities.contains($0.identity)
+                && !selectedIdentities.contains($0.identity)
+        }.prefix(reservoirCandidateLimit).map(\.track))
+        return RecommendationBatch(
+            recommendations: selected,
+            reservoirCandidates: reservoirCandidates
+        )
+    }
+
+    func recommendationsFromReservoir(
+        _ candidates: [LastFMSimilarTrack],
+        desiredCount: Int,
+        excludingVideoIDs: Set<String>,
+        excludingSongIdentities: Set<RecommendationSongIdentity>
+    ) async throws -> [ResolvedRecommendation] {
+        try await resolveReservoirCandidates(
+            candidates,
+            desiredCount: desiredCount,
+            excludingVideoIDs: excludingVideoIDs,
+            excludingSongIdentities: excludingSongIdentities
+        ).recommendations
+    }
+
+    func resolveReservoirCandidates(
+        _ candidates: [LastFMSimilarTrack],
+        desiredCount: Int,
+        excludingVideoIDs: Set<String>,
+        excludingSongIdentities: Set<RecommendationSongIdentity>
+    ) async throws -> RecommendationReservoirResolution {
+        guard desiredCount > 0 else {
+            return RecommendationReservoirResolution(
+                recommendations: [],
+                unusedCandidates: candidates
             )
-            guard !signature.isEmpty, signature != seedSignature else {
-                return nil
-            }
-
-            let artistOverlap = seedArtistTokens.intersection(candidateArtistTokens).count
-            let titleOverlap = seedTitleTokens.intersection(candidateTitleTokens).count
-            var score = max(0, 30 - index)
-
-            if !seedArtistTokens.isEmpty, candidateArtistTokens == seedArtistTokens {
-                score += 80
-            } else {
-                score += artistOverlap * 24
-            }
-            score += titleOverlap * 12
-
-            if normalizedTitle.contains("official audio")
-                || normalizedTitle.contains("official music video")
-            {
-                score += 10
-            }
-            if containsSoftVariant(normalizedTitle) {
-                score -= 32
-            }
-
-            guard score >= 8 else {
-                return nil
-            }
-            return RankedCandidate(result: result, score: score, signature: signature)
         }
-        .sorted { lhs, rhs in
-            if lhs.score != rhs.score {
-                return lhs.score > rhs.score
+        var resolved: [ResolvedRecommendation] = []
+        var unused: [LastFMSimilarTrack] = []
+        var seenVideoIDs = Set(excludingVideoIDs.map(normalizedVideoID))
+        var seenSongs = excludingSongIdentities
+        let attemptLimit = min(candidates.count, 8)
+
+        for (index, candidate) in candidates.prefix(attemptLimit).enumerated() {
+            try Task.checkCancellation()
+            guard resolved.count < desiredCount else {
+                unused.append(contentsOf: candidates[index...])
+                break
             }
-            return lhs.result.youtubeVideoID < rhs.result.youtubeVideoID
+            let identity = RecommendationSongIdentity(
+                artist: candidate.artist,
+                title: candidate.title
+            )
+            guard !seenSongs.contains(identity) else {
+                continue
+            }
+            guard let recommendation = try await safelyResolveOnYouTube(candidate) else {
+                continue
+            }
+            let videoID = normalizedVideoID(recommendation.youtubeResult.youtubeVideoID)
+            guard !videoID.isEmpty, seenVideoIDs.insert(videoID).inserted else {
+                continue
+            }
+            seenSongs.insert(identity)
+            resolved.append(recommendation)
         }
-
-        var seenSignatures = Set<String>()
-        return ranked.filter { seenSignatures.insert($0.signature).inserted }
-    }
-
-    private func containsExcludedVariant(_ title: String) -> Bool {
-        [
-            "reaction", "interview", "tutorial", "karaoke", "sped up",
-            "speed up", "slowed", "nightcore", "8d audio", " youtube shorts",
-            " #shorts"
-        ].contains { title.contains($0) }
-    }
-
-    private func containsSoftVariant(_ title: String) -> Bool {
-        ["lyrics", "lyric video", " live", "cover"].contains {
-            title.contains($0)
+        if candidates.count > attemptLimit, resolved.count < desiredCount {
+            unused.append(contentsOf: candidates[attemptLimit...])
         }
-    }
-
-    private func titleSignature(
-        _ title: String,
-        artistTokens: Set<String>
-    ) -> String {
-        let ignored = artistTokens.union([
-            "official", "audio", "video", "music", "lyrics", "lyric", "live",
-            "cover", "remix", "visualizer", "hd", "hq"
-        ])
-        let remaining = tokens(title).subtracting(ignored)
-        return remaining.sorted().joined(separator: " ")
-    }
-
-    private func meaningfulTitleTokens(_ value: String) -> Set<String> {
-        tokens(value).subtracting([
-            "official", "audio", "video", "music", "lyrics", "lyric", "the",
-            "and", "feat", "ft", "with", "from"
-        ])
-    }
-
-    private func tokens(_ value: String) -> Set<String> {
-        Set(
-            normalizedText(value)
-                .split(separator: " ")
-                .map(String.init)
-                .filter { $0.count > 1 }
+        return RecommendationReservoirResolution(
+            recommendations: resolved,
+            unusedCandidates: unused
         )
     }
 
-    private func normalizedText(_ value: String) -> String {
-        value
+    private func similarTracks(
+        for seed: RecommendationSeed
+    ) async throws -> [LastFMSimilarTrack] {
+        do {
+            let primary = try await similarTracksOperation(
+                seed.cleanedArtist,
+                seed.cleanedTitle,
+                candidatePoolLimit
+            )
+            guard primary.isEmpty, let fallbackTitle = usableFallbackTitle(for: seed) else {
+                return primary
+            }
+
+#if DEBUG
+            print("[LastFM] primary seed failed reason=zero usable candidates")
+            print("[LastFM] retry artist=\(seed.cleanedArtist) track=\(fallbackTitle)")
+#endif
+            return try await similarTracksOperation(
+                seed.cleanedArtist,
+                fallbackTitle,
+                candidatePoolLimit
+            )
+        } catch let error as LastFMRecommendationService.ServiceError {
+            guard
+                error.permitsAlternateSeedRetry,
+                let fallbackTitle = usableFallbackTitle(for: seed)
+            else {
+                throw error
+            }
+
+#if DEBUG
+            print("[LastFM] primary seed failed reason=\(error.localizedDescription)")
+            print("[LastFM] retry artist=\(seed.cleanedArtist) track=\(fallbackTitle)")
+#endif
+            return try await similarTracksOperation(
+                seed.cleanedArtist,
+                fallbackTitle,
+                candidatePoolLimit
+            )
+        }
+    }
+
+    private func usableFallbackTitle(for seed: RecommendationSeed) -> String? {
+        guard let fallbackTitle = seed.fallbackTitle else {
+            return nil
+        }
+        let trimmed = fallbackTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !trimmed.isEmpty,
+            SongNormalization.text(trimmed) != SongNormalization.text(seed.cleanedTitle)
+        else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private func filteredCandidates(
+        _ candidates: [LastFMSimilarTrack],
+        seed: RecommendationSeed,
+        excluding excludedSongIdentities: Set<RecommendationSongIdentity>
+    ) -> [RankedSong] {
+        let seedIdentity = seed.songIdentity
+        var seen = excludedSongIdentities
+        seen.insert(seedIdentity)
+        var versionSurvivorCount = 0
+        var filtered: [RankedSong] = []
+
+        for track in candidates {
+            let artist = SongNormalization.humanReadable(track.artist)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = SongNormalization.humanReadable(track.title)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let identity = RecommendationSongIdentity(artist: artist, title: title)
+            guard !artist.isEmpty, !title.isEmpty else {
+                recommendationLog("rejected missing artist/title")
+                continue
+            }
+            guard !isAlternateVersion(title, identity: identity, existing: seen) else {
+                recommendationLog("rejected existing-song version=\(artist) - \(title)")
+                continue
+            }
+            versionSurvivorCount += 1
+            guard seen.insert(identity).inserted else {
+                recommendationLog("rejected session duplicate=\(artist) - \(title)")
+                continue
+            }
+
+#if DEBUG
+            print("[Recommendations] candidate=\(artist) - \(title) match=\(String(format: "%.2f", track.match))")
+#endif
+            filtered.append(RankedSong(
+                track: LastFMSimilarTrack(
+                    artist: artist,
+                    title: title,
+                    match: track.match,
+                    url: track.url
+                ),
+                identity: identity
+            ))
+        }
+
+#if DEBUG
+        print("[Recommendations] candidates received=\(candidates.count)")
+        print("[Recommendations] candidates after song-level dedupe=\(filtered.count)")
+        print("[Recommendations] candidates after version filtering=\(versionSurvivorCount)")
+        if filtered.isEmpty {
+            print("[Recommendations] all candidates filtered")
+        }
+#endif
+        return filtered
+    }
+
+    private func rankedSongOrder(_ lhs: RankedSong, _ rhs: RankedSong) -> Bool {
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
+        if lhs.identity.artist != rhs.identity.artist {
+            return lhs.identity.artist < rhs.identity.artist
+        }
+        return lhs.identity.title < rhs.identity.title
+    }
+
+    private func isAlternateVersion(
+        _ title: String,
+        identity: RecommendationSongIdentity,
+        existing: Set<RecommendationSongIdentity>
+    ) -> Bool {
+        let normalizedTitle = SongNormalization.text(title)
+        guard SongNormalization.containsVersionMarker(normalizedTitle) else {
+            return false
+        }
+        return existing.contains(identity)
+    }
+
+    func resolveOnYouTube(
+        _ target: LastFMSimilarTrack
+    ) async throws -> ResolvedRecommendation? {
+#if DEBUG
+        print("[YouTubeResolver] attempting=\(target.artist) - \(target.title)")
+#endif
+        let identity = SongIdentity(artist: target.artist, title: target.title)
+        if let cachedResult = await resolutionCache.result(for: identity, now: .now) {
+#if DEBUG
+            print("[YouTubeResolver] cacheHit=\(cachedResult.youtubeVideoID)")
+#endif
+            return resolvedRecommendation(target: target, result: cachedResult)
+        }
+
+        let query = "\(target.artist) \(target.title)"
+        let primaryResults = try await videoResolver.primaryResults(query: query)
+        if let best = bestYouTubeResult(in: primaryResults, target: target) {
+#if DEBUG
+            print("[YouTubeResolver] resolved=\(best.youtubeVideoID)")
+#endif
+            await resolutionCache.store(best, for: identity, now: .now)
+            return resolvedRecommendation(target: target, result: best)
+        }
+
+        let fallbackResults = try await videoResolver.dataAPIFallbackResults(query: query)
+        guard let best = bestYouTubeResult(in: fallbackResults, target: target) else {
+#if DEBUG
+            print("[YouTubeResolver] no canonical match target=\(target.artist) - \(target.title)")
+#endif
+            return nil
+        }
+
+#if DEBUG
+        print("[YouTubeResolver] resolved=\(best.youtubeVideoID)")
+#endif
+        await resolutionCache.store(best, for: identity, now: .now)
+        return resolvedRecommendation(target: target, result: best)
+    }
+
+    func invalidateVideoResolution(for identity: SongIdentity) async {
+        await resolutionCache.remove(identity)
+    }
+
+    private func bestYouTubeResult(
+        in results: [YouTubeSearchResult],
+        target: LastFMSimilarTrack
+    ) -> YouTubeSearchResult? {
+        results.compactMap { result -> RankedYouTubeResult? in
+            guard let score = youtubeScore(result, target: target) else {
+                return nil
+            }
+            return RankedYouTubeResult(result: result, score: score)
+        }.sorted { lhs, rhs in
+            lhs.score == rhs.score
+                ? lhs.result.youtubeVideoID < rhs.result.youtubeVideoID
+                : lhs.score > rhs.score
+        }.first?.result
+    }
+
+    private func resolvedRecommendation(
+        target: LastFMSimilarTrack,
+        result: YouTubeSearchResult
+    ) -> ResolvedRecommendation {
+        return ResolvedRecommendation(
+            artist: target.artist,
+            title: target.title,
+            match: target.match,
+            youtubeResult: result
+        )
+    }
+
+    private func safelyResolveOnYouTube(
+        _ target: LastFMSimilarTrack
+    ) async throws -> ResolvedRecommendation? {
+        do {
+            return try await resolveOnYouTube(target)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            recommendationLog(
+                "YouTube resolution failed target=\(target.artist) - \(target.title) error=\(error.localizedDescription)"
+            )
+            return nil
+        }
+    }
+
+    func youtubeScore(
+        _ result: YouTubeSearchResult,
+        target: LastFMSimilarTrack
+    ) -> Int? {
+        let resultText = SongNormalization.text(result.title)
+        let channel = SongNormalization.text(result.channelTitle)
+        let targetArtist = SongNormalization.text(target.artist)
+        let targetTitle = SongNormalization.text(target.title)
+        let targetArtistTokens = Set(targetArtist.split(separator: " ").map(String.init))
+        let targetTitleTokens = SongNormalization.meaningfulTokens(target.title)
+        let resultTokens = SongNormalization.meaningfulTokens(result.title)
+
+        guard !targetArtist.isEmpty, !targetTitleTokens.isEmpty else {
+            return nil
+        }
+        guard targetTitleTokens.isSubset(of: resultTokens) else {
+            return nil
+        }
+        guard SongNormalization.baseTitle(
+            result.title,
+            removingArtist: target.artist
+        ) == SongNormalization.baseTitle(target.title) else {
+            return nil
+        }
+
+        let resultArtistTokens = Set(resultText.split(separator: " ").map(String.init))
+        let channelTokens = Set(channel.split(separator: " ").map(String.init))
+        let cleanedChannel = SongNormalization.text(SongNormalization.artist(result.channelTitle))
+        let cleanedChannelTokens = Set(cleanedChannel.split(separator: " ").map(String.init))
+        let artistInTitle = targetArtistTokens.isSubset(of: resultArtistTokens)
+        let artistInChannel = targetArtistTokens.isSubset(of: channelTokens)
+            || (!cleanedChannelTokens.isEmpty
+                && cleanedChannelTokens.isSubset(of: targetArtistTokens))
+        guard artistInTitle || artistInChannel else {
+            return nil
+        }
+
+        let targetAllowsLive = targetTitle.contains("live")
+        let targetAllowsRemix = targetTitle.contains("remix")
+        let hardRejects = ["reaction", "interview", "tutorial", "nightcore", "8d audio", "shorts"]
+        guard !hardRejects.contains(where: resultText.contains) else {
+            return nil
+        }
+        let versionRejects = ["karaoke", "cover", "slowed", "sped up", "speed up", "instrumental"]
+        guard !versionRejects.contains(where: { marker in
+            resultText.contains(marker) && !targetTitle.contains(marker)
+        }) else {
+            return nil
+        }
+        if resultText.contains(" live"), !targetAllowsLive {
+            return nil
+        }
+        if resultText.contains("remix"), !targetAllowsRemix {
+            return nil
+        }
+
+        var score = 200
+        score += artistInTitle ? 55 : 45
+
+        if channel == targetArtist || channel == "\(targetArtist) topic" {
+            score += 35
+        }
+        if resultText.contains("official music video") {
+            score += 30
+        } else if resultText.contains("official audio") {
+            score += 28
+        } else if channel.hasSuffix(" topic") {
+            score += 26
+        } else if resultText.contains("official video") {
+            score += 24
+        }
+        if resultText.contains("lyric") || resultText.contains("lyrics") {
+            score -= 12
+        }
+        return score
+    }
+
+    private func normalizedVideoID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func recommendationLog(_ message: String) {
+#if DEBUG
+        print("[Recommendations] \(message)")
+#endif
+    }
+}
+
+enum SongNormalization {
+    private static let displayNoise = [
+        "official lyric video", "official music video", "official visualizer",
+        "official lyrics", "official video", "official audio", "lyric video",
+        "official 4k video", "official hd video", "visualizer", "lyrics",
+        "audio", "hd", "4k"
+    ]
+    private static let versionMarkers = [
+        "live", "remix", "acoustic", "sped up", "speed up", "slowed",
+        "cover", "karaoke", "instrumental"
+    ]
+
+    static func artist(_ value: String) -> String {
+        var result = humanReadable(value).trimmingCharacters(in: .whitespacesAndNewlines)
+        result = result.replacingOccurrences(
+            of: #"(?i)\s*-\s*topic\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(
+            of: #"(?i)vevo\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func displayTitle(_ value: String) -> String {
+        var result = humanReadable(value).trimmingCharacters(in: .whitespacesAndNewlines)
+        let alternatives = displayNoise.joined(separator: "|")
+        let patterns = [
+            "(?i)\\s*[\\(\\[]\\s*(?:\(alternatives))\\s*[\\)\\]]",
+            "(?i)\\s*[-–—|]\\s*(?:\(alternatives))\\s*$",
+            "(?i)\\s+(?:\(alternatives))\\s*$"
+        ]
+
+        var changed = true
+        while changed {
+            let previous = result
+            for pattern in patterns {
+                result = result.replacingOccurrences(
+                    of: pattern,
+                    with: "",
+                    options: .regularExpression
+                )
+            }
+            result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            changed = result != previous
+        }
+        return result
+    }
+
+    static func humanReadable(_ value: String) -> String {
+        var result = value
+        let namedEntities = [
+            "&quot;": "\"", "&#39;": "'", "&apos;": "'", "&amp;": "&",
+            "&lt;": "<", "&gt;": ">"
+        ]
+        for _ in 0..<2 {
+            for (entity, replacement) in namedEntities {
+                result = result.replacingOccurrences(
+                    of: entity,
+                    with: replacement,
+                    options: .caseInsensitive
+                )
+            }
+        }
+
+        let pattern = #"&#(x[0-9a-fA-F]+|[0-9]+);"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else {
+            return result
+        }
+        while true {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            guard
+                let match = expression.firstMatch(in: result, range: range),
+                let fullRange = Range(match.range(at: 0), in: result),
+                let valueRange = Range(match.range(at: 1), in: result)
+            else {
+                break
+            }
+            let encodedValue = String(result[valueRange])
+            let number: UInt32?
+            if encodedValue.lowercased().hasPrefix("x") {
+                number = UInt32(encodedValue.dropFirst(), radix: 16)
+            } else {
+                number = UInt32(encodedValue, radix: 10)
+            }
+            guard let number, let scalar = UnicodeScalar(number) else {
+                break
+            }
+            result.replaceSubrange(fullRange, with: String(Character(scalar)))
+        }
+        return result
+    }
+
+    static func displayTitle(_ value: String, removingArtist artist: String) -> String {
+        var result = displayTitle(value)
+        guard !artist.isEmpty else {
+            return result
+        }
+        if let separator = result.range(
+            of: #"\s[-–—]\s"#,
+            options: .regularExpression
+        ) {
+            let prefix = String(result[..<separator.lowerBound])
+            if text(prefix) == text(artist) {
+                return result[separator.upperBound...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        let escapedArtist = NSRegularExpression.escapedPattern(for: artist)
+        result = result.replacingOccurrences(
+            of: "(?i)^\\s*\(escapedArtist)\\s*[-–—:|]\\s*",
+            with: "",
+            options: .regularExpression
+        )
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func removingFeaturedArtistCredit(from value: String) -> String {
+        var result = value.replacingOccurrences(
+            of: #"(?i)\s*[\(\[]\s*(?:ft\.?|feat\.?|featuring)\s+.+[\)\]]\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(
+            of: #"(?i)\s+(?:ft\.?|feat\.?|featuring)\s+.+$"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(
+            of: #"(?i)\s*[\(\[]\s*with\s+.+[\)\]]\s*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func removingTrailingProductionCredit(from value: String) -> String {
+        value.replacingOccurrences(
+            of: #"(?i)\s*[\(\[]\s*(?:prod\.?|produced\s+by)\s+[^\)\]]+[\)\]]\s*$"#,
+            with: "",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func text(_ value: String) -> String {
+        humanReadable(value)
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
             .unicodeScalars
@@ -187,11 +1001,39 @@ struct RecommendationService {
             .joined(separator: " ")
     }
 
-    private func cleanedQueryComponent(_ value: String) -> String {
-        normalizedText(value)
+    static func baseTitle(_ value: String, removingArtist artist: String? = nil) -> String {
+        var cleaned = removingFeaturedArtistCredit(from: displayTitle(value))
+        let alternatives = versionMarkers.joined(separator: "|")
+        let patterns = [
+            "(?i)\\s*[\\(\\[]\\s*(?:\(alternatives))(?:\\s+version)?\\s*[\\)\\]]\\s*$",
+            "(?i)\\s*[-–—|]\\s*(?:\(alternatives))(?:\\s+version)?\\s*$"
+        ]
+        for pattern in patterns {
+            cleaned = cleaned.replacingOccurrences(
+                of: pattern,
+                with: "",
+                options: .regularExpression
+            )
+        }
+        if let artist {
+            cleaned = displayTitle(cleaned, removingArtist: artist)
+        }
+        return text(cleaned)
     }
 
-    private func normalizedVideoID(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    static func meaningfulTokens(_ value: String) -> Set<String> {
+        Set(text(value).split(separator: " ").map(String.init)).subtracting([
+            "the", "a", "an", "and", "feat", "ft", "featuring",
+            "official", "music", "video", "audio", "lyrics", "lyric"
+        ])
+    }
+
+    static func containsVersionMarker(_ normalizedTitle: String) -> Bool {
+        versionMarkers.contains { marker in
+            normalizedTitle == marker
+                || normalizedTitle.hasPrefix("\(marker) ")
+                || normalizedTitle.hasSuffix(" \(marker)")
+                || normalizedTitle.contains(" \(marker) ")
+        }
     }
 }

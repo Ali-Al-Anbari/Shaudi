@@ -10,8 +10,19 @@
 		B8DE65533054869B0008FE7A /* YouTubeKit in Frameworks */ = {isa = PBXBuildFile; productRef = B8DE65523054869B0008FE7A /* YouTubeKit */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		C10000023000000000000002 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B85C1CE730526E760000701D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B85C1CEE30526E770000701D;
+			remoteInfo = Shaudi;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		B85C1CEF30526E770000701D /* Shaudi.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Shaudi.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C10000013000000000000001 /* ShaudiTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ShaudiTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -33,6 +44,11 @@
 			path = Shaudi;
 			sourceTree = "<group>";
 		};
+		C10000033000000000000003 /* ShaudiTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ShaudiTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -44,6 +60,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C10000043000000000000004 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -51,6 +74,7 @@
 			isa = PBXGroup;
 			children = (
 				B85C1CF130526E770000701D /* Shaudi */,
+				C10000033000000000000003 /* ShaudiTests */,
 				B85C1CF030526E770000701D /* Products */,
 			);
 			sourceTree = "<group>";
@@ -59,6 +83,7 @@
 			isa = PBXGroup;
 			children = (
 				B85C1CEF30526E770000701D /* Shaudi.app */,
+				C10000013000000000000001 /* ShaudiTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -89,6 +114,29 @@
 			productReference = B85C1CEF30526E770000701D /* Shaudi.app */;
 			productType = "com.apple.product-type.application";
 		};
+		C10000053000000000000005 /* ShaudiTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C10000063000000000000006 /* Build configuration list for PBXNativeTarget "ShaudiTests" */;
+			buildPhases = (
+				C10000073000000000000007 /* Sources */,
+				C10000043000000000000004 /* Frameworks */,
+				C10000083000000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C10000093000000000000009 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				C10000033000000000000003 /* ShaudiTests */,
+			);
+			name = ShaudiTests;
+			packageProductDependencies = (
+			);
+			productName = ShaudiTests;
+			productReference = C10000013000000000000001 /* ShaudiTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -101,6 +149,10 @@
 				TargetAttributes = {
 					B85C1CEE30526E770000701D = {
 						CreatedOnToolsVersion = 26.6;
+					};
+					C10000053000000000000005 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = B85C1CEE30526E770000701D;
 					};
 				};
 			};
@@ -122,12 +174,20 @@
 			projectRoot = "";
 			targets = (
 				B85C1CEE30526E770000701D /* Shaudi */,
+				C10000053000000000000005 /* ShaudiTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		B85C1CED30526E770000701D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C10000083000000000000008 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -144,7 +204,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		C10000073000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C10000093000000000000009 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B85C1CEE30526E770000701D /* Shaudi */;
+			targetProxy = C10000023000000000000002 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		B85C1CF830526E820000701D /* Debug */ = {
@@ -377,6 +452,50 @@
 			};
 			name = Release;
 		};
+		C100000A300000000000000A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JFBQ8947T6;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = Ali.ShaudiTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Shaudi.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Shaudi";
+			};
+			name = Debug;
+		};
+		C100000B300000000000000B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JFBQ8947T6;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = Ali.ShaudiTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Shaudi.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Shaudi";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -394,6 +513,15 @@
 			buildConfigurations = (
 				B85C1CFB30526E820000701D /* Debug */,
 				B85C1CFC30526E820000701D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C10000063000000000000006 /* Build configuration list for PBXNativeTarget "ShaudiTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				C100000A300000000000000A /* Debug */,
+				C100000B300000000000000B /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

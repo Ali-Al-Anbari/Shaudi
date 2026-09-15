@@ -20,6 +20,19 @@ enum PlaybackOrigin: Equatable {
     case recommendations
 }
 
+enum RecommendationSessionValidity {
+    static func accepts(
+        expectedToken: UUID,
+        activeToken: UUID?,
+        origin: PlaybackOrigin?
+    ) -> Bool {
+        guard expectedToken == activeToken else {
+            return false
+        }
+        return origin == .search || origin == .recommendations
+    }
+}
+
 private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
     weak var value: Value?
 
@@ -75,8 +88,9 @@ struct PlayableTrack: Identifiable, Hashable {
 @MainActor
 final class PlaybackManager: ObservableObject {
     private let streamLookaheadCount = 10
-    private let recommendationUpcomingLimit = 6
-    private let recommendationHistoryLimit = 6
+    private let recommendationUpcomingLimit = RecommendationRadioPolicy.upcomingQueueLimit
+    private let recommendationHistoryLimit = RecommendationRadioPolicy.historyQueueLimit
+    private let recommendationUpcomingWatermark = RecommendationRadioPolicy.targetUpcomingCount
     private let recommendationService = RecommendationService()
     private let metadataClient = YouTubeMetadataClient()
 
@@ -193,6 +207,8 @@ final class PlaybackManager: ObservableObject {
     private var playlistWarmupTask: Task<Void, Never>?
     private var nextItemPrerollTask: Task<Void, Never>?
     private var recommendationTasks: [String: Task<Void, Never>] = [:]
+    private var recommendationRefillTask: Task<Void, Never>?
+    private var recommendationRefillID: UUID?
     private var recommendationMetadataTasks: [String: Task<Void, Never>] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
@@ -217,7 +233,11 @@ final class PlaybackManager: ObservableObject {
     private var suspendedPlaybackContext: SuspendedPlaybackContext?
     private var recommendationSessionID: UUID?
     private var recommendationSeenVideoIDs: Set<String> = []
-    private var recommendationGeneratedSeedIDs: Set<String> = []
+    private var recommendationSeenVideoIDOrder: [String] = []
+    private var recommendationSeenSongIdentities: Set<RecommendationSongIdentity> = []
+    private var recommendationTransportMetadata: [String: RecommendationTransportMetadata] = [:]
+    private var recommendationManualSeeds: [String: RecommendationSeed] = [:]
+    private var recommendationRadioSession: RecommendationRadioSession?
     private var recommendationMetadataRequestedIDs: Set<String> = []
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
@@ -414,7 +434,15 @@ final class PlaybackManager: ObservableObject {
     func play(_ track: PlayableTrack) {
         endActiveTrimPreviewIfNeeded()
 
-        startRecommendationSession(seedVideoID: track.youtubeVideoID)
+        let manualSeed = RecommendationSeed(
+            youtubeVideoID: normalizedVideoID(track.youtubeVideoID),
+            rawTitle: track.title,
+            displayedArtist: track.channelTitle,
+            sourceChannel: track.channelTitle,
+            userArtistOverride: nil
+        )
+        startRecommendationSession(anchor: manualSeed)
+        recommendationManualSeeds[normalizedVideoID(track.youtubeVideoID)] = manualSeed
 
         pauseSpeculativeWarmupsForPlayback(
             requestedVideoID: normalizedVideoID(track.youtubeVideoID)
@@ -427,7 +455,16 @@ final class PlaybackManager: ObservableObject {
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
-        startPlaybackContext(track, persistentTrack: nil)
+        let displayTrack = PlayableTrack(
+            youtubeVideoID: track.youtubeVideoID,
+            title: manualSeed.cleanedTitle,
+            channelTitle: manualSeed.cleanedArtist,
+            thumbnailURL: track.thumbnailURL,
+            duration: track.duration,
+            playbackStartTime: track.playbackStartTime,
+            playbackEndTime: track.playbackEndTime
+        )
+        startPlaybackContext(displayTrack, persistentTrack: nil)
     }
 
     func prepareForManualSearchPlayback() {
@@ -1466,6 +1503,7 @@ final class PlaybackManager: ObservableObject {
 
                 playbackTask = nil
                 if case StreamResolutionError.noPlayableStream = error {
+                    invalidateRecommendationVideoResolutionIfNeeded(videoID: videoID)
                     state = .failed(
                         "YouTube did not provide an audio-only stream this iPhone can play."
                     )
@@ -1475,6 +1513,19 @@ final class PlaybackManager: ObservableObject {
                     )
                 }
             }
+        }
+    }
+
+    private func invalidateRecommendationVideoResolutionIfNeeded(videoID: String) {
+        guard
+            playbackOrigin == .recommendations,
+            let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity
+        else {
+            return
+        }
+        let service = recommendationService
+        Task {
+            await service.invalidateVideoResolution(for: identity)
         }
     }
 
@@ -3423,14 +3474,19 @@ final class PlaybackManager: ObservableObject {
 #endif
     }
 
-    private func startRecommendationSession(seedVideoID: String) {
+    private func startRecommendationSession(anchor: RecommendationSeed) {
         endRecommendationSession(reason: "new Search playback")
 
-        let seedVideoID = normalizedVideoID(seedVideoID)
-        recommendationSessionID = UUID()
+        let seedVideoID = normalizedVideoID(anchor.youtubeVideoID)
+        let session = RecommendationRadioSession(anchor: anchor)
+        recommendationSessionID = session.id
+        recommendationRadioSession = session
         recommendationSeenVideoIDs = seedVideoID.isEmpty ? [] : [seedVideoID]
-        recommendationGeneratedSeedIDs = []
-        recommendationLog("session started seed=\(seedVideoID)")
+        recommendationSeenVideoIDOrder = seedVideoID.isEmpty ? [] : [seedVideoID]
+        recommendationSeenSongIdentities = [anchor.songIdentity]
+        recommendationTransportMetadata = [:]
+        recommendationManualSeeds = [:]
+        recommendationLog("session started token=\(session.id) seed=\(seedVideoID)")
     }
 
     private func endRecommendationSession(reason: String) {
@@ -3444,11 +3500,18 @@ final class PlaybackManager: ObservableObject {
         for task in recommendationMetadataTasks.values {
             task.cancel()
         }
+        recommendationRefillTask?.cancel()
         recommendationTasks = [:]
+        recommendationRefillTask = nil
+        recommendationRefillID = nil
         recommendationMetadataTasks = [:]
         recommendationSessionID = nil
+        recommendationRadioSession = nil
         recommendationSeenVideoIDs = []
-        recommendationGeneratedSeedIDs = []
+        recommendationSeenVideoIDOrder = []
+        recommendationSeenSongIdentities = []
+        recommendationTransportMetadata = [:]
+        recommendationManualSeeds = [:]
         recommendationMetadataRequestedIDs = []
         recommendationLog("mode ended for \(reason)")
     }
@@ -3480,8 +3543,6 @@ final class PlaybackManager: ObservableObject {
                     recommendationMetadataTasks[videoID] = nil
                 }
 
-                track.title = metadata.title
-                track.channelTitle = metadata.channelTitle ?? track.channelTitle
                 track.thumbnailURL = metadata.thumbnailURL ?? track.thumbnailURL
                 track.duration = metadata.duration
                 track.metadataLastRefreshed = .now
@@ -3524,94 +3585,302 @@ final class PlaybackManager: ObservableObject {
         sourceTrack: Track?,
         origin: PlaybackOrigin
     ) {
+        guard origin == .search || origin == .recommendations else {
+            recommendationLog("wrong playback origin=\(String(describing: origin))")
+            return
+        }
         guard
-            origin == .search || origin == .recommendations,
             let sessionID = recommendationSessionID,
-            let playableTrack
+            var radioSession = recommendationRadioSession,
+            radioSession.id == sessionID
         else {
+            recommendationLog("queue insertion skipped=missing recommendation session")
+            return
+        }
+        guard let playableTrack else {
+            recommendationLog("queue insertion skipped=missing confirmed playable track")
             return
         }
 
         let seedVideoID = normalizedVideoID(playableTrack.youtubeVideoID)
-        guard
-            !seedVideoID.isEmpty,
-            recommendationGeneratedSeedIDs.insert(seedVideoID).inserted,
-            recommendationTasks[seedVideoID] == nil
-        else {
+        guard !seedVideoID.isEmpty else {
+            recommendationLog("queue insertion skipped=blank seed video ID")
+            return
+        }
+        recordSeenRecommendationVideoID(seedVideoID)
+        let seed = recommendationSeed(
+            videoID: seedVideoID,
+            playableTrack: playableTrack,
+            sourceTrack: sourceTrack
+        )
+        recommendationSeenSongIdentities.insert(seed.songIdentity)
+        radioSession.recordSeen(seed.songIdentity)
+
+        if origin == .search {
+            recommendationRadioSession = radioSession
+            beginRecommendationEpoch(
+                anchor: radioSession.epoch.anchor,
+                epochID: radioSession.epoch.id,
+                sessionID: sessionID,
+                seedTrack: playableTrack
+            )
             return
         }
 
-        recommendationSeenVideoIDs.insert(seedVideoID)
-        let seed = RecommendationSeed(
-            youtubeVideoID: seedVideoID,
-            title: playableTrack.title,
-            displayedArtist: playableTrack.channelTitle,
-            sourceChannel: sourceTrack?.channelTitle ?? playableTrack.channelTitle
+        let action = radioSession.confirmedRecommendationPlayback(seed: seed)
+        recommendationRadioSession = radioSession
+        switch action {
+        case .ignore:
+            recommendationLog("playback progress skipped=already consumed")
+        case .replenish(let epochID):
+            recommendationLog(
+                "epoch progress=\(radioSession.epoch.consumedRecommendationCount)"
+            )
+            beginRecommendationReservoirRefill(
+                sessionID: sessionID,
+                epochID: epochID,
+                seed: playableTrack
+            )
+        case .startNewEpoch(let epochID, let anchor):
+            recommendationLog(
+                "epoch transition anchor=\(anchor.cleanedArtist) - \(anchor.cleanedTitle)"
+            )
+            recommendationRefillTask?.cancel()
+            recommendationRefillTask = nil
+            recommendationRefillID = nil
+            for task in recommendationTasks.values {
+                task.cancel()
+            }
+            recommendationTasks = [:]
+            beginRecommendationEpoch(
+                anchor: anchor,
+                epochID: epochID,
+                sessionID: sessionID,
+                seedTrack: playableTrack
+            )
+        }
+    }
+
+    private func recommendationSeed(
+        videoID: String,
+        playableTrack: PlayableTrack,
+        sourceTrack: Track?
+    ) -> RecommendationSeed {
+        if let metadata = recommendationTransportMetadata[videoID] {
+            return RecommendationSeed(
+                youtubeVideoID: videoID,
+                canonicalIdentity: metadata.canonicalIdentity,
+                youtubeTitle: metadata.youtubeTitle,
+                youtubeChannel: metadata.youtubeChannel
+            )
+        }
+        if let manualSeed = recommendationManualSeeds[videoID] {
+            return manualSeed
+        }
+        return RecommendationSeed(
+            youtubeVideoID: videoID,
+            rawTitle: sourceTrack?.title ?? playableTrack.title,
+            displayedArtist: sourceTrack?.displayArtist ?? playableTrack.channelTitle,
+            sourceChannel: sourceTrack?.channelTitle ?? playableTrack.channelTitle,
+            userArtistOverride: sourceTrack?.userArtistOverride
         )
+    }
+
+    private func beginRecommendationEpoch(
+        anchor: RecommendationSeed,
+        epochID: UUID,
+        sessionID: UUID,
+        seedTrack: PlayableTrack
+    ) {
+        let taskKey = epochID.uuidString
+        guard
+            recommendationTasks[taskKey] == nil,
+            recommendationRadioSession?.markEpochCandidateRequestStarted(epochID: epochID) == true
+        else {
+            recommendationLog("generation skipped=epoch request already active")
+            return
+        }
         let excludedVideoIDs = recommendationSeenVideoIDs
+        let excludedSongIdentities = recommendationSeenSongIdentities
         let service = recommendationService
 
-        recommendationLog("seed=\(seedVideoID)")
-        recommendationLog("searching")
-        recommendationTasks[seedVideoID] = Task { [weak self] in
+        recommendationLog(
+            "epoch request anchor=\(anchor.cleanedArtist) - \(anchor.cleanedTitle)"
+        )
+        recommendationTasks[taskKey] = Task { [weak self] in
             do {
-                let results = try await service.recommendations(
-                    for: seed,
-                    excluding: excludedVideoIDs
+                let batch = try await service.recommendations(
+                    for: anchor,
+                    excludingVideoIDs: excludedVideoIDs,
+                    excludingSongIdentities: excludedSongIdentities
                 )
                 guard let self else {
                     return
                 }
-                if recommendationSessionID == sessionID {
-                    recommendationTasks[seedVideoID] = nil
-                }
-
-                guard
-                    recommendationSessionID == sessionID,
-                    playbackOrigin == .search || playbackOrigin == .recommendations
-                else {
-                    recommendationLog("ignored stale result")
+                recommendationTasks[taskKey] = nil
+                guard isCurrentRecommendationEpoch(sessionID: sessionID, epochID: epochID) else {
+                    recommendationLog("stale epoch result ignored")
                     return
                 }
-
-                appendRecommendations(results, seed: playableTrack)
+                _ = recommendationRadioSession?.replaceReservoir(
+                    batch.reservoirCandidates,
+                    epochID: epochID
+                )
+                recommendationLog(
+                    "reservoir available=\(recommendationRadioSession?.reservoirCount ?? 0)"
+                )
+                appendRecommendations(batch.recommendations, seed: seedTrack)
+                beginRecommendationReservoirRefill(
+                    sessionID: sessionID,
+                    epochID: epochID,
+                    seed: seedTrack
+                )
             } catch is CancellationError {
                 guard let self else {
                     return
                 }
-                if recommendationSessionID == sessionID {
-                    recommendationTasks[seedVideoID] = nil
-                }
-                recommendationLog("ignored stale result")
+                recommendationTasks[taskKey] = nil
+                recommendationLog("stale epoch result ignored")
             } catch {
                 guard let self else {
                     return
                 }
-                if recommendationSessionID == sessionID {
-                    recommendationTasks[seedVideoID] = nil
-                }
+                recommendationTasks[taskKey] = nil
                 recommendationLog(
-                    "search failed seed=\(seedVideoID) error=\(error.localizedDescription)"
+                    "epoch request failed anchor=\(anchor.youtubeVideoID) "
+                        + "error=\(error.localizedDescription)"
                 )
             }
         }
     }
 
-    private func appendRecommendations(
-        _ results: [YouTubeSearchResult],
+    private func beginRecommendationReservoirRefill(
+        sessionID: UUID,
+        epochID: UUID,
         seed: PlayableTrack
     ) {
+        let neededCount = max(
+            0,
+            recommendationUpcomingWatermark - recommendationUpcomingCount
+        )
+        recommendationLog("upcomingCount=\(recommendationUpcomingCount)")
+        guard
+            neededCount > 0,
+            recommendationRefillTask == nil,
+            var radioSession = recommendationRadioSession,
+            radioSession.id == sessionID
+        else {
+            return
+        }
+
+        let candidates = radioSession.takeReservoirCandidates(upTo: 8, epochID: epochID)
+        recommendationRadioSession = radioSession
+        guard !candidates.isEmpty else {
+            return
+        }
+        recommendationLog(
+            "reservoir available=\(radioSession.reservoirCount + candidates.count) used=\(candidates.count)"
+        )
+
+        let service = recommendationService
+        let excludedVideoIDs = recommendationSeenVideoIDs
+        let excludedSongIdentities = recommendationSeenSongIdentities
+        let refillID = UUID()
+        recommendationRefillID = refillID
+        recommendationRefillTask = Task { [weak self] in
+            do {
+                let resolution = try await service.resolveReservoirCandidates(
+                    candidates,
+                    desiredCount: neededCount,
+                    excludingVideoIDs: excludedVideoIDs,
+                    excludingSongIdentities: excludedSongIdentities
+                )
+                guard let self else {
+                    return
+                }
+                if recommendationRefillID == refillID {
+                    recommendationRefillTask = nil
+                    recommendationRefillID = nil
+                }
+                guard isCurrentRecommendationEpoch(sessionID: sessionID, epochID: epochID) else {
+                    recommendationLog("stale reservoir result ignored")
+                    return
+                }
+                _ = recommendationRadioSession?.returnUnusedReservoirCandidates(
+                    resolution.unusedCandidates,
+                    epochID: epochID
+                )
+                appendRecommendations(resolution.recommendations, seed: seed)
+            } catch is CancellationError {
+                guard let self else {
+                    return
+                }
+                if recommendationRefillID == refillID {
+                    recommendationRefillTask = nil
+                    recommendationRefillID = nil
+                }
+                recommendationLog("stale reservoir result ignored")
+            } catch {
+                guard let self else {
+                    return
+                }
+                if recommendationRefillID == refillID {
+                    recommendationRefillTask = nil
+                    recommendationRefillID = nil
+                }
+                recommendationLog("reservoir resolution failed=\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func isCurrentRecommendationEpoch(sessionID: UUID, epochID: UUID) -> Bool {
+        RecommendationSessionValidity.accepts(
+            expectedToken: sessionID,
+            activeToken: recommendationSessionID,
+            origin: playbackOrigin
+        ) && recommendationRadioSession?.epoch.id == epochID
+    }
+
+    private var recommendationUpcomingCount: Int {
+        guard let currentIndex, queue.indices.contains(currentIndex) else {
+            return 0
+        }
+        return max(0, queue.count - currentIndex - 1)
+    }
+
+    private func appendRecommendations(
+        _ results: [ResolvedRecommendation],
+        seed: PlayableTrack
+    ) {
+        let queueCountBeforeInsertion = queue.count
+        recommendationLog("queue before=\(queueCountBeforeInsertion)")
         let uniqueResults = results.filter { result in
-            let videoID = normalizedVideoID(result.youtubeVideoID)
-            guard !videoID.isEmpty else {
+            let videoID = normalizedVideoID(result.youtubeResult.youtubeVideoID)
+            guard
+                !videoID.isEmpty,
+                !recommendationSeenVideoIDs.contains(videoID),
+                !recommendationSeenSongIdentities.contains(result.songIdentity)
+            else {
                 return false
             }
-            return recommendationSeenVideoIDs.insert(videoID).inserted
+            recordSeenRecommendationVideoID(videoID)
+            recommendationSeenSongIdentities.insert(result.songIdentity)
+            return true
         }
         let newTracks = uniqueResults.map(transientRecommendationTrack(for:))
+        for result in uniqueResults {
+            let videoID = normalizedVideoID(result.youtubeResult.youtubeVideoID)
+            recommendationTransportMetadata[videoID] = result.transportMetadata
+            recommendationRadioSession?.recordSeen(result.songIdentity)
+        }
+        if let radioSession = recommendationRadioSession {
+            recommendationSeenSongIdentities = radioSession.globalPlayedSongIdentities
+        }
 
         guard !newTracks.isEmpty else {
-            recommendationLog("selected=")
+            recommendationLog("queue insertion skipped=no unique resolved recommendations")
+            recommendationLog("queue after=\(queue.count)")
+            recommendationLog("hasNextTrack=\(hasNextTrack)")
             return
         }
 
@@ -3621,6 +3890,7 @@ final class PlaybackManager: ObservableObject {
         }
 
         guard let currentIndex, queue.indices.contains(currentIndex) else {
+            recommendationLog("queue insertion skipped=invalid current queue index")
             return
         }
 
@@ -3639,25 +3909,43 @@ final class PlaybackManager: ObservableObject {
 
         queue = history + upcoming
         self.currentIndex = history.count - 1
+        let retainedVideoIDs = Set(queue.map { normalizedVideoID($0.youtubeVideoID) })
+        recommendationTransportMetadata = recommendationTransportMetadata.filter {
+            retainedVideoIDs.contains($0.key)
+        }
         playbackOrigin = .recommendations
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
         refreshQueuePredictionsAfterMutation()
         recommendationLog(
-            "selected=\(uniqueResults.map(\.youtubeVideoID).joined(separator: ","))"
+            "selected=\(uniqueResults.map(\.youtubeResult.youtubeVideoID).joined(separator: ","))"
         )
+        recommendationLog("queue after=\(queue.count)")
+        recommendationLog("hasNextTrack=\(hasNextTrack)")
+        recommendationLog("upcomingCount=\(recommendationUpcomingCount)")
+    }
+
+    private func recordSeenRecommendationVideoID(_ videoID: String) {
+        let videoID = normalizedVideoID(videoID)
+        guard !videoID.isEmpty, recommendationSeenVideoIDs.insert(videoID).inserted else {
+            return
+        }
+        recommendationSeenVideoIDOrder.append(videoID)
+        while recommendationSeenVideoIDOrder.count > RecommendationRadioPolicy.sessionIdentityLimit {
+            recommendationSeenVideoIDs.remove(recommendationSeenVideoIDOrder.removeFirst())
+        }
     }
 
     private func transientRecommendationTrack(
-        for result: YouTubeSearchResult
+        for result: ResolvedRecommendation
     ) -> Track {
         Track(
             title: result.title,
-            youtubeURL: youtubeWatchURL(for: result.youtubeVideoID),
-            youtubeVideoID: result.youtubeVideoID,
-            channelTitle: result.channelTitle,
-            thumbnailURL: result.thumbnailURL,
+            youtubeURL: youtubeWatchURL(for: result.youtubeResult.youtubeVideoID),
+            youtubeVideoID: result.youtubeResult.youtubeVideoID,
+            channelTitle: result.artist,
+            thumbnailURL: result.youtubeResult.thumbnailURL,
             metadataLastRefreshed: .now
         )
     }
