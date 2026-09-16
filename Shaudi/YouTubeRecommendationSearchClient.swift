@@ -347,13 +347,14 @@ final class YouTubeRecommendationResolver {
     }
 
     init(
-        webSearchClient: YouTubeWebSearchClient? = nil,
+        structuredSearchClient: YouTubeStructuredSearchClient? = nil,
         dataAPIClient: YouTubeMetadataClient? = nil
     ) {
-        let webSearchClient = webSearchClient ?? YouTubeWebSearchClient()
+        let structuredSearchClient = structuredSearchClient
+            ?? YouTubeStructuredSearchClient()
         let dataAPIClient = dataAPIClient ?? YouTubeMetadataClient()
         primarySearch = { query in
-            try await webSearchClient.search(query: query)
+            try await structuredSearchClient.search(query: query).map(\.searchResult)
         }
         dataAPISearch = { query in
             try await dataAPIClient.search(query: query).results
@@ -406,7 +407,7 @@ final class YouTubeRecommendationResolver {
 #endif
         }
 #if DEBUG
-        print("[RecommendationResolver] source=YouTubeWeb target=\(query)")
+        print("[IDResolver] source=structured target=\(query)")
 #endif
         do {
             let results = try await primarySearch(query)
@@ -445,7 +446,7 @@ final class YouTubeRecommendationResolver {
                 openWebCircuit(for: RecommendationRadioPolicy.webCircuitCooldown)
             }
 #if DEBUG
-            print("[RecommendationResolver] YouTubeWeb failed=\(error.localizedDescription)")
+            print("[IDResolver] structuredFailure=\(error.localizedDescription)")
 #endif
             switch failureKind {
             case .blocking: return .blocked
@@ -471,6 +472,18 @@ final class YouTubeRecommendationResolver {
     }
 
     private static func webFailureKind(for error: Error) -> WebFailureKind {
+        if let structuredError = error as? YouTubeStructuredSearchClient.ClientError {
+            switch structuredError {
+            case .httpStatus(let statusCode):
+                return statusCode == 403 || statusCode == 429
+                    ? .blocking
+                    : .transient
+            case .network:
+                return .transient
+            case .invalidRequest, .invalidResponse, .malformedResponse:
+                return .parser
+            }
+        }
         if let searchError = error as? YouTubeWebSearchClient.SearchError {
             switch searchError {
             case .tooManyHTTPRedirects, .abuseChallenge:

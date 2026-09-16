@@ -112,6 +112,18 @@ struct RecommendationSeed {
     var songIdentity: RecommendationSongIdentity {
         RecommendationSongIdentity(artist: cleanedArtist, title: cleanedTitle)
     }
+
+    var confidentSongIdentityForCaching: SongIdentity? {
+        guard !cleanedArtist.isEmpty, !cleanedTitle.isEmpty else {
+            return nil
+        }
+        switch artistSource {
+        case .lastFM, .userOverride, .titlePrefix, .topicChannel:
+            return songIdentity
+        case .channelFallback:
+            return nil
+        }
+    }
 }
 
 enum RecommendationSeedArtistSource: String {
@@ -910,7 +922,7 @@ struct RecommendationService {
         if let cachedResult {
 #if DEBUG
             print(
-                "[RecommendationResolver] cacheHit=true "
+                "[IDResolver] source=cache "
                     + "target=\(target.artist) - \(target.title)"
             )
 #endif
@@ -952,15 +964,44 @@ struct RecommendationService {
 #if DEBUG
             print("[YouTubeResolver] resolved=\(best.youtubeVideoID)")
 #endif
-            await resolutionCache.store(best, for: identity, now: .now)
+            let source: YouTubeResolutionKnowledgeSource
+            switch attempt {
+            case .primaryOnly:
+                source = .structured
+#if DEBUG
+                print(
+                    "[IDResolver] source=structured resolved=\(best.youtubeVideoID) "
+                        + "target=\(query)"
+                )
+#endif
+            case .officialFallback:
+                source = .officialAPI
+#if DEBUG
+                print("[IDResolver] source=officialAPI target=\(query)")
+#endif
+            case .cacheOnly:
+                source = .legacy
+            }
+            await resolutionCache.learn(
+                identity,
+                videoID: best.youtubeVideoID,
+                metadata: YouTubeResolutionMetadata(best),
+                source: source,
+                now: .now
+            )
             return .resolved(resolvedRecommendation(target: target, result: best))
         }
 #if DEBUG
         if case .primaryOnly = attempt {
-            print("[RecommendationResolver] webMiss reason=candidateSpecificMiss target=\(query)")
+            let reason = results.isEmpty ? "zeroExtractedCandidates" : "noConfidentMatch"
+            print(
+                "[RecommendationResolver] structuredMiss reason=\(reason) "
+                    + "candidates=\(results.count) target=\(query)"
+            )
         } else if case .officialFallback = attempt {
             print("[YouTubeResolver] no canonical match target=\(target.artist) - \(target.title)")
         }
+        print("[IDResolver] unresolved target=\(query)")
 #endif
         return .candidateMiss
     }
@@ -975,8 +1016,20 @@ struct RecommendationService {
     ) -> YouTubeSearchResult? {
         results.compactMap { result -> RankedYouTubeResult? in
             guard let score = youtubeScore(result, target: target) else {
+#if DEBUG
+                print(
+                    "[IDResolver] candidateScore=rejected target=\(target.artist) - \(target.title) "
+                        + "candidate=\(result.title) videoID=\(result.youtubeVideoID)"
+                )
+#endif
                 return nil
             }
+#if DEBUG
+            print(
+                "[IDResolver] candidateScore=\(score) target=\(target.artist) - \(target.title) "
+                    + "candidate=\(result.title) videoID=\(result.youtubeVideoID)"
+            )
+#endif
             return RankedYouTubeResult(result: result, score: score)
         }.sorted { lhs, rhs in
             lhs.score == rhs.score
@@ -1016,6 +1069,14 @@ struct RecommendationService {
     func youtubeScore(
         _ result: YouTubeSearchResult,
         target: LastFMSimilarTrack
+    ) -> Int? {
+        youtubeScore(result, target: target, expectedDuration: nil)
+    }
+
+    func youtubeScore(
+        _ result: YouTubeSearchResult,
+        target: LastFMSimilarTrack,
+        expectedDuration: TimeInterval?
     ) -> Int? {
         let resultText = SongNormalization.text(result.title)
         let channel = SongNormalization.text(result.channelTitle)
@@ -1087,7 +1148,20 @@ struct RecommendationService {
         if resultText.contains("lyric") || resultText.contains("lyrics") {
             score -= 12
         }
-        return score
+        if let expectedDuration,
+           expectedDuration > 0,
+           let candidateDuration = result.duration,
+           candidateDuration > 0 {
+            let difference = abs(expectedDuration - candidateDuration)
+            if difference <= 4 {
+                score += 30
+            } else if difference <= 12 {
+                score += 15
+            } else if difference >= 60 {
+                score -= 35
+            }
+        }
+        return score >= 220 ? score : nil
     }
 
     private func normalizedVideoID(_ value: String) -> String {

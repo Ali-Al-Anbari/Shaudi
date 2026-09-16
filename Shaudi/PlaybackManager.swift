@@ -1514,11 +1514,14 @@ final class PlaybackManager: ObservableObject {
 
                 playbackTask = nil
                 if case StreamResolutionError.noPlayableStream = error {
-                    invalidateRecommendationVideoResolutionIfNeeded(videoID: videoID)
+                    invalidateVideoResolutionIfNeeded(videoID: videoID)
                     state = .failed(
                         "YouTube did not provide an audio-only stream this iPhone can play."
                     )
                 } else {
+                    if Self.provesVideoIsUnplayable(error) {
+                        invalidateVideoResolutionIfNeeded(videoID: videoID)
+                    }
                     state = .failed(
                         "YouTube stream extraction failed: \(Self.errorMessage(for: error))"
                     )
@@ -1527,16 +1530,30 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
-    private func invalidateRecommendationVideoResolutionIfNeeded(videoID: String) {
-        guard
-            playbackOrigin == .recommendations,
-            let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity
-        else {
+    private func invalidateVideoResolutionIfNeeded(videoID: String) {
+        guard let identity = cachedSongIdentity(for: videoID) else {
             return
         }
         let service = recommendationService
         Task {
             await service.invalidateVideoResolution(for: identity)
+#if DEBUG
+            print("[IDResolver] cacheEvicted reason=unplayable")
+#endif
+        }
+    }
+
+    private static func provesVideoIsUnplayable(_ error: Error) -> Bool {
+        guard let error = error as? YouTubeKitError else {
+            return false
+        }
+        switch error {
+        case .videoUnavailable, .videoPrivate, .recordingUnavailable,
+             .membersOnly, .videoRegionBlocked, .videoAgeRestricted:
+            return true
+        case .maxRetriesExceeded, .htmlParseError, .extractError,
+             .regexMatchError, .liveStreamError:
+            return false
         }
     }
 
@@ -3478,6 +3495,11 @@ final class PlaybackManager: ObservableObject {
             trackID: videoID
         )
 
+        learnCurrentVideoResolution(
+            videoID: videoID,
+            origin: playbackOrigin
+        )
+
         handleConfirmedRecommendationPlaybackStart(
             playableTrack: currentPlayableTrack,
             sourceTrack: currentTrack,
@@ -3489,6 +3511,79 @@ final class PlaybackManager: ObservableObject {
             print("[PlaybackContext] playlist=\(playlistID)")
         }
 #endif
+    }
+
+    private func learnCurrentVideoResolution(
+        videoID: String,
+        origin: PlaybackOrigin
+    ) {
+        guard
+            let playableTrack = currentPlayableTrack,
+            normalizedVideoID(playableTrack.youtubeVideoID) == normalizedVideoID(videoID)
+        else {
+            return
+        }
+        let metadata = YouTubeResolutionMetadata(
+            title: playableTrack.title,
+            channel: playableTrack.channelTitle,
+            thumbnailURL: playableTrack.thumbnailURL,
+            duration: playableTrack.duration
+        )
+        if let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity {
+            Task {
+                await YouTubeResolutionKnowledgeTeacher.learnAuthoritative(
+                    identity: identity,
+                    videoID: videoID,
+                    metadata: metadata,
+                    source: .lastFMRecommendation
+                )
+            }
+            return
+        }
+
+        let source: YouTubeResolutionKnowledgeSource
+        switch origin {
+        case .search, .recommendations:
+            source = .manualSearch
+        case .library:
+            source = .library
+        case .playlist:
+            source = .playlist
+        }
+        let track = currentTrack
+        Task {
+            await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+                videoID: videoID,
+                rawTitle: track?.title ?? playableTrack.title,
+                displayedArtist: track?.displayArtist ?? playableTrack.channelTitle,
+                sourceChannel: track?.channelTitle ?? playableTrack.channelTitle,
+                userArtistOverride: track?.userArtistOverride,
+                metadata: metadata,
+                source: source
+            )
+        }
+    }
+
+    private func cachedSongIdentity(for videoID: String) -> SongIdentity? {
+        if let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity {
+            return identity
+        }
+        if let manual = recommendationManualSeeds[videoID] {
+            return manual.confidentSongIdentityForCaching
+        }
+        guard
+            let playableTrack = currentPlayableTrack,
+            normalizedVideoID(playableTrack.youtubeVideoID) == normalizedVideoID(videoID)
+        else {
+            return nil
+        }
+        return RecommendationSeed(
+            youtubeVideoID: videoID,
+            rawTitle: currentTrack?.title ?? playableTrack.title,
+            displayedArtist: currentTrack?.displayArtist ?? playableTrack.channelTitle,
+            sourceChannel: currentTrack?.channelTitle ?? playableTrack.channelTitle,
+            userArtistOverride: currentTrack?.userArtistOverride
+        ).confidentSongIdentityForCaching
     }
 
     private func startRecommendationSession(anchor: RecommendationSeed) {
@@ -4050,6 +4145,7 @@ final class PlaybackManager: ObservableObject {
             youtubeVideoID: result.youtubeResult.youtubeVideoID,
             channelTitle: result.artist,
             thumbnailURL: result.youtubeResult.thumbnailURL,
+            duration: result.youtubeResult.duration,
             metadataLastRefreshed: .now
         )
     }

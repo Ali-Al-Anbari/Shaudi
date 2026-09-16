@@ -598,6 +598,11 @@ struct SearchView: View {
                 )
                 searchLog("Playing transient result \(result.youtubeVideoID)")
                 playbackManager.play(playableTrack)
+                teachResolution(
+                    result: result,
+                    metadata: metadata,
+                    source: .manualSearch
+                )
             } catch is CancellationError {
                 return
             } catch {
@@ -629,6 +634,7 @@ struct SearchView: View {
                 let track = makeTrack(for: result, metadata: metadata)
                 modelContext.insert(track)
                 try modelContext.save()
+                teachResolution(result: result, metadata: metadata, source: .library)
                 noticeMessage = "Added “\(track.displayTitle)” to Library"
                 searchLog("Created Library track \(result.youtubeVideoID)")
             } catch {
@@ -667,6 +673,7 @@ struct SearchView: View {
 
                 playlist.tracks.append(track)
                 try modelContext.save()
+                teachResolution(result: result, metadata: metadata, source: .playlist)
                 noticeMessage = "Added “\(track.displayTitle)” to \(playlist.name)"
 
                 if reusedLibraryTrack {
@@ -720,6 +727,29 @@ struct SearchView: View {
             duration: metadata.duration,
             metadataLastRefreshed: .now
         )
+    }
+
+    private func teachResolution(
+        result: YouTubeSearchResult,
+        metadata: YouTubeMetadata,
+        source: YouTubeResolutionKnowledgeSource
+    ) {
+        Task {
+            await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+                videoID: result.youtubeVideoID,
+                rawTitle: metadata.title,
+                displayedArtist: metadata.channelTitle,
+                sourceChannel: metadata.channelTitle,
+                userArtistOverride: nil,
+                metadata: YouTubeResolutionMetadata(
+                    title: metadata.title,
+                    channel: metadata.channelTitle,
+                    thumbnailURL: metadata.thumbnailURL ?? result.thumbnailURL,
+                    duration: metadata.duration
+                ),
+                source: source
+            )
+        }
     }
 }
 

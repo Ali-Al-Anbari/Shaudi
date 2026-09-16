@@ -29,6 +29,7 @@ struct YouTubeSearchResult: Identifiable, Hashable {
     let title: String
     let channelTitle: String
     let thumbnailURL: URL?
+    let duration: TimeInterval?
 
     var id: String {
         youtubeVideoID
@@ -40,10 +41,27 @@ struct YouTubeSearchResult: Identifiable, Hashable {
         channelTitle: String,
         thumbnailURL: URL?
     ) {
+        self.init(
+            youtubeVideoID: youtubeVideoID,
+            title: title,
+            channelTitle: channelTitle,
+            thumbnailURL: thumbnailURL,
+            duration: nil
+        )
+    }
+
+    init(
+        youtubeVideoID: String,
+        title: String,
+        channelTitle: String,
+        thumbnailURL: URL?,
+        duration: TimeInterval?
+    ) {
         self.youtubeVideoID = youtubeVideoID
         self.title = MusicMetadataText.decoded(title)
         self.channelTitle = MusicMetadataText.decoded(channelTitle)
         self.thumbnailURL = thumbnailURL
+        self.duration = duration
     }
 }
 

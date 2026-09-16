@@ -1038,14 +1038,11 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(cache.removeCount, 1)
     }
 
-    func testPersistentVideoCacheReloadsExpiresAndEvictsLRU() async throws {
+    func testPersistentVideoCacheReloadsRetainsLongTermAndEvictsLRU() async throws {
         let fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("shaudi-cache-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: fileURL) }
-        let policy = PersistentYouTubeResolutionCache.Policy(
-            timeToLive: 100,
-            maximumEntryCount: 2
-        )
+        let policy = PersistentYouTubeResolutionCache.Policy(maximumEntryCount: 2)
         let baseDate = Date(timeIntervalSince1970: 1_000)
         let first = SongIdentity(artist: "Artist 1", title: "Song 1")
         let second = SongIdentity(artist: "Artist 2", title: "Song 2")
@@ -1071,11 +1068,11 @@ final class RecommendationPipelineTests: XCTestCase {
         let reloaded = PersistentYouTubeResolutionCache(fileURL: fileURL, policy: policy)
         let evicted = await reloaded.result(for: first, now: baseDate.addingTimeInterval(3))
         let retained = await reloaded.result(for: third, now: baseDate.addingTimeInterval(3))
-        let expired = await reloaded.result(for: third, now: baseDate.addingTimeInterval(200))
+        let longTerm = await reloaded.result(for: third, now: baseDate.addingTimeInterval(200))
 
         XCTAssertNil(evicted)
         XCTAssertEqual(retained?.youtubeVideoID, "persist0003")
-        XCTAssertNil(expired)
+        XCTAssertEqual(longTerm?.youtubeVideoID, "persist0003")
     }
 
     func testCandidateResolutionFailureAdvancesToNextReservoirCandidate() async throws {
@@ -1499,6 +1496,647 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(reservoir.count, 1)
     }
 
+    func testStructuredSearchDecodesTypedMusicCandidateFixture() throws {
+        let candidates = try YouTubeStructuredSearchClient.candidates(
+            from: structuredSearchFixtureData()
+        )
+
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.videoID, "struct00001")
+        XCTAssertEqual(candidates.first?.title, "Example Song")
+        XCTAssertEqual(candidates.first?.artistOrChannel, "Example Artist")
+        XCTAssertEqual(candidates.first?.duration, 225)
+        XCTAssertEqual(candidates.first?.resultType, .song)
+    }
+
+    func testStructuredClientUsesTypedPOSTRequestWithoutLiveNetwork() async throws {
+        var capturedRequest: URLRequest?
+        let responseURL = try XCTUnwrap(URL(string: "https://music.youtube.com"))
+        let client = YouTubeStructuredSearchClient { request in
+            capturedRequest = request
+            return (
+                self.structuredSearchFixtureData(),
+                HTTPURLResponse(
+                    url: responseURL,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
+            )
+        }
+
+        let candidates = try await client.search(query: "Example Artist Example Song")
+
+        XCTAssertEqual(candidates.first?.videoID, "struct00001")
+        XCTAssertEqual(capturedRequest?.httpMethod, "POST")
+        XCTAssertEqual(capturedRequest?.url?.host, "music.youtube.com")
+        XCTAssertEqual(
+            capturedRequest?.value(forHTTPHeaderField: "Origin"),
+            "https://music.youtube.com"
+        )
+        let bodyData = try XCTUnwrap(capturedRequest?.httpBody)
+        let body = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: bodyData) as? [String: Any]
+        )
+        XCTAssertEqual(body["params"] as? String, "EgWKAQIIAWoMEA4QChADEAQQCRAF")
+        let context = try XCTUnwrap(body["context"] as? [String: Any])
+        let requestClient = try XCTUnwrap(context["client"] as? [String: Any])
+        XCTAssertEqual(requestClient["clientName"] as? String, "WEB_REMIX")
+        XCTAssertEqual(requestClient["clientVersion"] as? String, "1.20231204.01.00")
+    }
+
+    func testStructuredParserFindsPlayableMusicCardShelfTopResult() throws {
+        let data = try structuredFixture(
+            contents: [
+                "musicCardShelfRenderer": structuredCard(
+                    videoID: "cardtop0001",
+                    title: "Basket Case",
+                    artist: "Green Day"
+                )
+            ]
+        )
+
+        let parsed = try YouTubeStructuredSearchClient.parse(data)
+
+        XCTAssertEqual(parsed.diagnostics.cardShelves, 1)
+        XCTAssertEqual(parsed.candidates.first?.videoID, "cardtop0001")
+        XCTAssertEqual(parsed.candidates.first?.artistOrChannel, "Green Day")
+    }
+
+    func testStructuredParserFindsResponsiveRowInsideItemSection() throws {
+        let data = try structuredFixture(
+            contents: [
+                "itemSectionRenderer": [
+                    "contents": [[
+                        "musicResponsiveListItemRenderer": structuredRow(
+                            videoID: "itemsect001",
+                            placement: .navigation,
+                            title: "Jaded",
+                            artist: "Green Day"
+                        )
+                    ]]
+                ]
+            ]
+        )
+
+        let parsed = try YouTubeStructuredSearchClient.parse(data)
+
+        XCTAssertEqual(parsed.diagnostics.itemSections, 1)
+        XCTAssertEqual(parsed.diagnostics.responsiveRows, 1)
+        XCTAssertEqual(parsed.candidates.first?.videoID, "itemsect001")
+    }
+
+    func testStructuredParserFindsDirectMusicShelf() throws {
+        let data = try structuredFixture(
+            contents: [
+                "musicShelfRenderer": [
+                    "contents": [[
+                        "musicResponsiveListItemRenderer": structuredRow(
+                            videoID: "shelfdir001",
+                            placement: .playlistItemData,
+                            title: "Fat Lip",
+                            artist: "Sum 41"
+                        )
+                    ]]
+                ]
+            ]
+        )
+
+        let parsed = try YouTubeStructuredSearchClient.parse(data)
+
+        XCTAssertEqual(parsed.diagnostics.musicShelves, 1)
+        XCTAssertEqual(parsed.candidates.first?.videoID, "shelfdir001")
+    }
+
+    func testStructuredParserExtractsAllDocumentedVideoIDPaths() throws {
+        let placements: [(StructuredVideoIDPlacement, String)] = [
+            (.playlistItemData, "playlist001"),
+            (.navigation, "navpath0001"),
+            (.flexColumn, "flexpath001"),
+            (.overlay, "overlay0001")
+        ]
+
+        for (placement, videoID) in placements {
+            let data = try structuredFixture(
+                contents: [
+                    "musicShelfRenderer": [
+                        "contents": [[
+                            "musicResponsiveListItemRenderer": structuredRow(
+                                videoID: videoID,
+                                placement: placement,
+                                title: "Ocean Avenue",
+                                artist: "Yellowcard"
+                            )
+                        ]]
+                    ]
+                ]
+            )
+
+            let candidates = try YouTubeStructuredSearchClient.candidates(from: data)
+            XCTAssertEqual(candidates.first?.videoID, videoID, "placement=\(placement)")
+        }
+    }
+
+    func testStructuredParserDeduplicatesVideoIDs() throws {
+        let first = structuredRow(
+            videoID: "duplicate01",
+            placement: .playlistItemData,
+            title: "All the Small Things",
+            artist: "blink-182"
+        )
+        let duplicate = structuredRow(
+            videoID: "duplicate01",
+            placement: .overlay,
+            title: "All the Small Things",
+            artist: "blink-182"
+        )
+        let data = try structuredFixture(
+            contents: [
+                "itemSectionRenderer": [
+                    "contents": [
+                        ["musicResponsiveListItemRenderer": first],
+                        ["musicResponsiveListItemRenderer": duplicate]
+                    ]
+                ]
+            ]
+        )
+
+        let candidates = try YouTubeStructuredSearchClient.candidates(from: data)
+
+        XCTAssertEqual(candidates.map(\.videoID), ["duplicate01"])
+    }
+
+    func testFamousStructuredSongCandidateReachesExistingScoring() throws {
+        let data = try structuredFixture(
+            contents: [
+                "musicCardShelfRenderer": structuredCard(
+                    videoID: "basketcase1",
+                    title: "Basket Case",
+                    artist: "Green Day"
+                )
+            ]
+        )
+        let result = try XCTUnwrap(
+            YouTubeStructuredSearchClient.candidates(from: data).first?.searchResult
+        )
+
+        let score = RecommendationService().youtubeScore(
+            result,
+            target: candidate("Green Day", "Basket Case")
+        )
+
+        XCTAssertNotNil(score)
+    }
+
+    func testNormalStudioCandidateBeatsRejectedVariants() async throws {
+        let target = candidate("Green Day", "Basket Case")
+        let results = [
+            YouTubeSearchResult(
+                youtubeVideoID: "livevers001",
+                title: "Green Day - Basket Case (Live)",
+                channelTitle: "Green Day",
+                thumbnailURL: nil
+            ),
+            YouTubeSearchResult(
+                youtubeVideoID: "slowedver01",
+                title: "Green Day - Basket Case (Slowed)",
+                channelTitle: "Green Day",
+                thumbnailURL: nil
+            ),
+            YouTubeSearchResult(
+                youtubeVideoID: "basketcase1",
+                title: "Basket Case",
+                channelTitle: "Green Day - Topic",
+                thumbnailURL: nil
+            )
+        ]
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: YouTubeRecommendationResolver(
+                primarySearch: { _ in results },
+                dataAPISearch: { _ in [] }
+            ),
+            resolutionCache: MemoryYouTubeResolutionCache()
+        )
+
+        let resolved = try await service.resolveOnYouTube(target)
+
+        XCTAssertEqual(resolved?.youtubeResult.youtubeVideoID, "basketcase1")
+    }
+
+    func testStructuredParserReturnsCleanMissForValidEmptyResponse() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "contents": [
+                "tabbedSearchResultsRenderer": ["tabs": []]
+            ]
+        ])
+
+        let parsed = try YouTubeStructuredSearchClient.parse(data)
+
+        XCTAssertTrue(parsed.candidates.isEmpty)
+        XCTAssertEqual(parsed.diagnostics, .init())
+    }
+
+    func testStructuredParserRejectsMalformedOrChangedSchema() throws {
+        let malformed = Data("not json".utf8)
+        let changedSchema = try JSONSerialization.data(withJSONObject: [
+            "contents": ["unknownRenderer": [:]]
+        ])
+
+        XCTAssertThrowsError(try YouTubeStructuredSearchClient.candidates(from: malformed))
+        XCTAssertThrowsError(try YouTubeStructuredSearchClient.candidates(from: changedSchema))
+    }
+
+    func testLowConfidenceCandidateIsRejectedAndNotCached() async throws {
+        let target = candidate("Expected Artist", "Expected Song")
+        let wrong = YouTubeSearchResult(
+            youtubeVideoID: "wrongvid001",
+            title: "Unrelated Creator - Different Song",
+            channelTitle: "Unrelated Creator",
+            thumbnailURL: nil
+        )
+        let cache = MemoryYouTubeResolutionCache()
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: YouTubeRecommendationResolver(
+                primarySearch: { _ in [wrong] },
+                dataAPISearch: { _ in [] }
+            ),
+            resolutionCache: cache
+        )
+
+        let resolved = try await service.resolveOnYouTube(target)
+        let cached = await cache.peek(for: targetIdentity(target), now: .now)
+        XCTAssertNil(resolved)
+        XCTAssertNil(cached)
+        XCTAssertEqual(cache.storeCount, 0)
+    }
+
+    func testExactIdentityCandidateBeatsEarlierUnrelatedResult() async throws {
+        let target = candidate("Example Artist", "Example Song")
+        let unrelated = YouTubeSearchResult(
+            youtubeVideoID: "unrelated01",
+            title: "Different Artist - Different Song",
+            channelTitle: "Different Artist",
+            thumbnailURL: nil
+        )
+        let exact = youtubeResult(
+            videoID: "exactmat001",
+            artist: target.artist,
+            title: target.title
+        )
+        let service = RecommendationService(
+            similarTracks: { _, _, _ in [] },
+            videoResolver: YouTubeRecommendationResolver(
+                primarySearch: { _ in [unrelated, exact] },
+                dataAPISearch: { _ in [] }
+            ),
+            resolutionCache: MemoryYouTubeResolutionCache()
+        )
+
+        let resolved = try await service.resolveOnYouTube(target)
+
+        XCTAssertEqual(resolved?.youtubeResult.youtubeVideoID, "exactmat001")
+    }
+
+    func testLiveCoverAndSlowedVersionsAreRejected() {
+        let target = candidate("Example Artist", "Example Song")
+        for (index, marker) in ["Live", "Cover", "Slowed"].enumerated() {
+            let result = YouTubeSearchResult(
+                youtubeVideoID: String(format: "variant%04d", index),
+                title: "Example Artist - Example Song (\(marker))",
+                channelTitle: "Example Artist",
+                thumbnailURL: nil
+            )
+            XCTAssertNil(RecommendationService().youtubeScore(result, target: target))
+        }
+    }
+
+    func testDurationSimilarityRaisesCandidateConfidence() throws {
+        let target = candidate("Example Artist", "Example Song")
+        let close = YouTubeSearchResult(
+            youtubeVideoID: "duration001",
+            title: "Example Artist - Example Song (Official Audio)",
+            channelTitle: "Example Artist",
+            thumbnailURL: nil,
+            duration: 201
+        )
+        let far = YouTubeSearchResult(
+            youtubeVideoID: "duration002",
+            title: "Example Artist - Example Song (Official Audio)",
+            channelTitle: "Example Artist",
+            thumbnailURL: nil,
+            duration: 500
+        )
+        let service = RecommendationService()
+        let closeScore = try XCTUnwrap(
+            service.youtubeScore(close, target: target, expectedDuration: 200)
+        )
+        let farScore = try XCTUnwrap(
+            service.youtubeScore(far, target: target, expectedDuration: 200)
+        )
+
+        XCTAssertGreaterThan(closeScore, farScore)
+    }
+
+    func testAuthoritativeLastFMIdentityIsNeverReparsedFromUploadTitle() {
+        let identity = SongIdentity(artist: "Canonical Artist", title: "Canonical Song")
+        let seed = RecommendationSeed(
+            youtubeVideoID: "lastfm00001",
+            canonicalIdentity: identity,
+            youtubeTitle: "Uploader Name - Misleading Upload Title",
+            youtubeChannel: "Compilation Channel"
+        )
+
+        XCTAssertEqual(seed.songIdentity, identity)
+        XCTAssertEqual(seed.confidentSongIdentityForCaching, identity)
+    }
+
+    func testManualSearchSelectionTeachesCacheWhenIdentityIsConfident() async {
+        let cache = MemoryYouTubeResolutionCache()
+        let learned = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: "manual00001",
+            rawTitle: "Example Artist - Example Song (Official Video)",
+            displayedArtist: "Uploader",
+            sourceChannel: "Uploader",
+            userArtistOverride: nil,
+            metadata: YouTubeResolutionMetadata(
+                title: "Example Artist - Example Song (Official Video)",
+                channel: "Uploader"
+            ),
+            source: .manualSearch,
+            cache: cache
+        )
+
+        XCTAssertTrue(learned)
+        let cached = await cache.peek(
+            for: SongIdentity(artist: "Example Artist", title: "Example Song"),
+            now: .now
+        )
+        XCTAssertEqual(cached?.youtubeVideoID, "manual00001")
+    }
+
+    func testLibraryAndPlaylistKnownIDsTeachCacheWithConfidentIdentity() async {
+        let cache = MemoryYouTubeResolutionCache()
+        let libraryLearned = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: "library0001",
+            rawTitle: "Library Song",
+            displayedArtist: "Library Artist",
+            sourceChannel: "Uploader",
+            userArtistOverride: "Library Artist",
+            metadata: YouTubeResolutionMetadata(title: "Library Song", channel: "Uploader"),
+            source: .library,
+            cache: cache
+        )
+        let playlistLearned = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: "playlist001",
+            rawTitle: "Playlist Song",
+            displayedArtist: "Playlist Artist - Topic",
+            sourceChannel: "Playlist Artist - Topic",
+            userArtistOverride: nil,
+            metadata: YouTubeResolutionMetadata(
+                title: "Playlist Song",
+                channel: "Playlist Artist - Topic"
+            ),
+            source: .playlist,
+            cache: cache
+        )
+
+        XCTAssertTrue(libraryLearned)
+        XCTAssertTrue(playlistLearned)
+        XCTAssertEqual(cache.storeCount, 2)
+    }
+
+    func testUncertainUploaderIdentityDoesNotTeachCache() async {
+        let cache = MemoryYouTubeResolutionCache()
+
+        let learned = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: "uncertain01",
+            rawTitle: "A Song Without Artist Attribution",
+            displayedArtist: "Random Upload Channel",
+            sourceChannel: "Random Upload Channel",
+            userArtistOverride: nil,
+            metadata: YouTubeResolutionMetadata(
+                title: "A Song Without Artist Attribution",
+                channel: "Random Upload Channel"
+            ),
+            source: .manualSearch,
+            cache: cache
+        )
+
+        XCTAssertFalse(learned)
+        XCTAssertEqual(cache.storeCount, 0)
+    }
+
+    func testTemporaryStructuredFailureDoesNotDeleteKnownMapping() async throws {
+        let identity = SongIdentity(artist: "Example Artist", title: "Example Song")
+        let cache = MemoryYouTubeResolutionCache([
+            identity: youtubeResult(
+                videoID: "retain00001",
+                artist: identity.artist,
+                title: identity.title
+            )
+        ])
+        let resolver = YouTubeRecommendationResolver(
+            primarySearch: { _ in throw URLError(.timedOut) },
+            dataAPISearch: { _ in [] }
+        )
+
+        _ = try await resolver.primaryResults(query: "temporary failure")
+
+        let cached = await cache.peek(for: identity, now: .now)
+        XCTAssertEqual(cached?.youtubeVideoID, "retain00001")
+        XCTAssertEqual(cache.removeCount, 0)
+    }
+
+    func testPersistentCacheHandlesThousandsOfLongLivedMappings() async throws {
+        struct Fixture: Codable {
+            let videoID: String
+            let canonicalArtist: String
+            let canonicalTitle: String
+            let youtubeTitle: String
+            let channel: String
+            let thumbnailURL: URL?
+            let duration: TimeInterval?
+            let source: String
+            let resolvedAt: Date
+            let lastAccessedAt: Date
+            let lastValidatedAt: Date?
+        }
+
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shaudi-large-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        var fixture: [String: Fixture] = [:]
+        for index in 0..<2_000 {
+            let identity = SongIdentity(artist: "Artist \(index)", title: "Song \(index)")
+            fixture[identity.cacheKey] = Fixture(
+                videoID: String(format: "v%010d", index),
+                canonicalArtist: identity.artist,
+                canonicalTitle: identity.title,
+                youtubeTitle: "\(identity.artist) - \(identity.title)",
+                channel: identity.artist,
+                thumbnailURL: nil,
+                duration: 180,
+                source: "structured",
+                resolvedAt: now,
+                lastAccessedAt: now,
+                lastValidatedAt: now
+            )
+        }
+        try JSONEncoder().encode(fixture).write(to: fileURL, options: .atomic)
+        let cache = PersistentYouTubeResolutionCache(
+            fileURL: fileURL,
+            policy: .init(maximumEntryCount: 2_500)
+        )
+
+        let entryCount = await cache.entryCount()
+        let retained = await cache.peek(
+            for: SongIdentity(artist: "Artist 1999", title: "Song 1999"),
+            now: now.addingTimeInterval(365 * 24 * 60 * 60)
+        )
+        XCTAssertEqual(entryCount, 2_000)
+        XCTAssertEqual(retained?.youtubeVideoID, "v0000001999")
+    }
+
+    private func targetIdentity(_ target: LastFMSimilarTrack) -> SongIdentity {
+        SongIdentity(artist: target.artist, title: target.title)
+    }
+
+    private enum StructuredVideoIDPlacement: Equatable {
+        case playlistItemData
+        case navigation
+        case flexColumn
+        case overlay
+    }
+
+    private func structuredFixture(contents: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: ["contents": contents])
+    }
+
+    private func structuredCard(
+        videoID: String,
+        title: String,
+        artist: String
+    ) -> [String: Any] {
+        [
+            "title": ["runs": [["text": title]]],
+            "subtitle": [
+                "runs": [
+                    ["text": "Song"],
+                    ["text": " • "],
+                    ["text": artist],
+                    ["text": " • "],
+                    ["text": "Album"]
+                ]
+            ],
+            "navigationEndpoint": [
+                "watchEndpoint": ["videoId": videoID]
+            ]
+        ]
+    }
+
+    private func structuredRow(
+        videoID: String,
+        placement: StructuredVideoIDPlacement,
+        title: String,
+        artist: String
+    ) -> [String: Any] {
+        var titleRun: [String: Any] = ["text": title]
+        if placement == .flexColumn {
+            titleRun["navigationEndpoint"] = [
+                "watchEndpoint": ["videoId": videoID]
+            ]
+        }
+        var row: [String: Any] = [
+            "flexColumns": [
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": ["runs": [titleRun]]
+                    ]
+                ],
+                [
+                    "musicResponsiveListItemFlexColumnRenderer": [
+                        "text": [
+                            "runs": [
+                                ["text": "Song"],
+                                ["text": " • "],
+                                ["text": artist],
+                                ["text": " • "],
+                                ["text": "Album"]
+                            ]
+                        ]
+                    ]
+                ]
+            ],
+            "fixedColumns": [[
+                "musicResponsiveListItemFixedColumnRenderer": [
+                    "text": ["simpleText": "3:00"]
+                ]
+            ]]
+        ]
+        switch placement {
+        case .playlistItemData:
+            row["playlistItemData"] = ["videoId": videoID]
+        case .navigation:
+            row["navigationEndpoint"] = [
+                "watchEndpoint": ["videoId": videoID]
+            ]
+        case .flexColumn:
+            break
+        case .overlay:
+            row["overlay"] = [
+                "musicItemThumbnailOverlayRenderer": [
+                    "content": [
+                        "musicPlayButtonRenderer": [
+                            "playNavigationEndpoint": [
+                                "watchEndpoint": ["videoId": videoID]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        }
+        return row
+    }
+
+    private func structuredSearchFixtureData() -> Data {
+        Data(
+            #"""
+            {
+              "contents": {
+                "tabbedSearchResultsRenderer": {
+                  "tabs": [{
+                    "tabRenderer": {
+                      "content": {
+                        "sectionListRenderer": {
+                          "contents": [{
+                            "musicShelfRenderer": {
+                              "contents": [{
+                                "musicResponsiveListItemRenderer": {
+                                  "flexColumns": [
+                                    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Example Song","navigationEndpoint":{"watchEndpoint":{"videoId":"struct00001"}}}]}}},
+                                    {"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"Song"},{"text":" • "},{"text":"Example Artist"},{"text":" • "},{"text":"Example Album"}]}}}
+                                  ],
+                                  "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer":{"text":{"simpleText":"3:45"}}}],
+                                  "playlistItemData": {"videoId":"struct00001"},
+                                  "thumbnail": {"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://i.ytimg.com/vi/struct00001/default.jpg"}]}}}
+                                }
+                              }]
+                            }
+                          }]
+                        }
+                      }
+                    }
+                  }]
+                }
+              }
+            }
+            """#.utf8
+        )
+    }
+
     private func manualSeed(title: String, channel: String) -> RecommendationSeed {
         RecommendationSeed(
             youtubeVideoID: "abcdefghijk",
@@ -1646,6 +2284,27 @@ private final class MemoryYouTubeResolutionCache: YouTubeResolutionCaching {
 
     func peek(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult? {
         storage[identity]
+    }
+
+    func learn(
+        _ identity: SongIdentity,
+        videoID: String,
+        metadata: YouTubeResolutionMetadata,
+        source: YouTubeResolutionKnowledgeSource,
+        now: Date
+    ) async -> Bool {
+        guard videoID.count == 11 else {
+            return false
+        }
+        storeCount += 1
+        storage[identity] = YouTubeSearchResult(
+            youtubeVideoID: videoID,
+            title: metadata.title ?? identity.title,
+            channelTitle: metadata.channel ?? identity.artist,
+            thumbnailURL: metadata.thumbnailURL,
+            duration: metadata.duration
+        )
+        return true
     }
 
     func store(
