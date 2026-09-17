@@ -145,6 +145,7 @@ final class PlaybackManager: ObservableObject {
         case lookahead = "lookahead"
         case dashboardWarmup = "dashboard warmup"
         case playlistWarmup = "playlist warmup"
+        case searchPreResolve = "Search pre-resolution"
         case memoryCache = "in-memory cache"
     }
 
@@ -249,10 +250,14 @@ final class PlaybackManager: ObservableObject {
     private var nonSpeculativeStreamIDs: Set<String> = []
     private var dashboardSpeculativeStreamIDs: Set<String> = []
     private var playlistSpeculativeStreamIDs: Set<String> = []
+    private var searchSpeculativeStreamIDs: Set<String> = []
     private var activeDashboardWarmupID: UUID?
     private var activeDashboardResolutionVideoID: String?
     private var activePlaylistWarmupID: UUID?
     private var activePlaylistResolutionVideoID: String?
+    private var searchPreResolutionTask: Task<Void, Never>?
+    private var activeSearchPreResolutionID: UUID?
+    private var activeSearchResolutionVideoID: String?
 #if os(iOS)
     private var remoteCommandTargets: [Any] = []
     private var artworkTask: Task<Void, Never>?
@@ -480,6 +485,103 @@ final class PlaybackManager: ObservableObject {
 
     func prepareForManualSearchPlayback() {
         endRecommendationSession(reason: "new Search selection")
+    }
+
+    func preResolveSearchResults(_ results: [YouTubeSearchResult]) {
+        let candidates = SearchPreResolutionPlan.candidates(from: results)
+        let candidateVideoIDs = Set(candidates.map(\.videoID))
+
+        guard !candidates.isEmpty else {
+            replaceSearchPreResolution(with: [])
+            return
+        }
+
+        if
+            activeSearchPreResolutionID != nil,
+            searchSpeculativeStreamIDs == candidateVideoIDs
+        {
+            return
+        }
+
+        replaceSearchPreResolution(with: candidateVideoIDs)
+
+        let preResolutionID = UUID()
+        activeSearchPreResolutionID = preResolutionID
+        searchPreResolutionTask = Task(priority: .utility) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            defer {
+                if activeSearchPreResolutionID == preResolutionID {
+                    activeSearchPreResolutionID = nil
+                    activeSearchResolutionVideoID = nil
+                    searchPreResolutionTask = nil
+                }
+            }
+
+            for candidate in candidates {
+                guard
+                    !Task.isCancelled,
+                    activeSearchPreResolutionID == preResolutionID
+                else {
+                    return
+                }
+
+                let videoID = candidate.videoID
+                if resolvedStreamCache[videoID] != nil {
+                    searchPreResolveLog("cacheHit videoID=\(videoID)")
+                    continue
+                }
+
+                activeSearchResolutionVideoID = videoID
+                searchPreResolveLog("started videoID=\(videoID) rank=\(candidate.rank)")
+                let task = resolutionTask(for: videoID, source: .searchPreResolve)
+
+                do {
+                    _ = try await task.value
+                    try Task.checkCancellation()
+
+                    guard activeSearchPreResolutionID == preResolutionID else {
+                        return
+                    }
+
+                    let duration = candidate.duration.map {
+                        String(format: "%.0f", $0)
+                    } ?? "unknown"
+                    searchPreResolveLog("completed videoID=\(videoID) duration=\(duration)")
+                } catch is CancellationError {
+                    guard activeSearchPreResolutionID == preResolutionID else {
+                        return
+                    }
+                    searchPreResolveLog("cancelled videoID=\(videoID)")
+                    return
+                } catch {
+                    guard activeSearchPreResolutionID == preResolutionID else {
+                        return
+                    }
+
+                    searchPreResolveLog("failed videoID=\(videoID)")
+                }
+
+                if activeSearchPreResolutionID == preResolutionID {
+                    activeSearchResolutionVideoID = nil
+                }
+            }
+        }
+    }
+
+    func cancelSearchPreResolution() {
+        replaceSearchPreResolution(with: [])
+    }
+
+    func promoteSearchPreResolution(for videoID: String) {
+        let normalizedID = normalizedVideoID(videoID)
+        guard !normalizedID.isEmpty else {
+            return
+        }
+
+        markStreamAsNonSpeculative(normalizedID)
     }
 
     func warmDashboardPage(
@@ -1588,6 +1690,59 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
+    private func replaceSearchPreResolution(with candidateVideoIDs: Set<String>) {
+        _ = cancelSearchPreResolutionWork(
+            preserving: candidateVideoIDs,
+            cancelObsoleteResolution: true
+        )
+
+        let activePlaybackVideoIDs = Set(
+            searchSpeculativeStreamIDs.filter(isNeededByActivePlayback)
+        )
+        let obsoleteVideoIDs = SearchPreResolutionPlan.obsoleteVideoIDs(
+            previous: searchSpeculativeStreamIDs,
+            retaining: candidateVideoIDs,
+            nonSpeculative: nonSpeculativeStreamIDs,
+            activePlayback: activePlaybackVideoIDs
+        )
+        for videoID in obsoleteVideoIDs {
+            removeCachedStream(for: videoID)
+        }
+
+        let protectedVideoIDs = searchSpeculativeStreamIDs.subtracting(obsoleteVideoIDs)
+        for videoID in protectedVideoIDs where !candidateVideoIDs.contains(videoID) {
+            markStreamAsNonSpeculative(videoID)
+        }
+
+        searchSpeculativeStreamIDs.formIntersection(candidateVideoIDs)
+    }
+
+    @discardableResult
+    private func cancelSearchPreResolutionWork(
+        preserving preservedVideoIDs: Set<String> = [],
+        cancelObsoleteResolution: Bool = false
+    ) -> Bool {
+        let hadActivePreResolution = activeSearchPreResolutionID != nil
+        let activeVideoID = activeSearchResolutionVideoID
+        activeSearchPreResolutionID = nil
+        searchPreResolutionTask?.cancel()
+        searchPreResolutionTask = nil
+
+        if
+            cancelObsoleteResolution,
+            let activeVideoID,
+            !preservedVideoIDs.contains(activeVideoID),
+            !nonSpeculativeStreamIDs.contains(activeVideoID),
+            !isNeededByActivePlayback(activeVideoID)
+        {
+            inFlightResolutions[activeVideoID]?.task.cancel()
+            searchPreResolveLog("cancelled videoID=\(activeVideoID)")
+        }
+
+        activeSearchResolutionVideoID = nil
+        return hadActivePreResolution
+    }
+
     private func replaceDashboardWarmup(with candidateVideoIDs: Set<String>) {
         let hadActiveWarmup = cancelDashboardWarmupWork(
             preserving: candidateVideoIDs,
@@ -1777,12 +1932,21 @@ final class PlaybackManager: ObservableObject {
         }
         activePlaylistResolutionVideoID = nil
 
+        let hadActiveSearchPreResolution = cancelSearchPreResolutionWork(
+            preserving: [requestedVideoID],
+            cancelObsoleteResolution: true
+        )
+
         if hadActiveWarmup {
             dashboardLog("cancelled for foreground playback")
         }
 
         if hadActivePlaylistWarmup {
             playlistLog("cancelled for foreground playback")
+        }
+
+        if hadActiveSearchPreResolution {
+            searchPreResolveLog("cancelled for foreground playback")
         }
     }
 
@@ -1870,6 +2034,7 @@ final class PlaybackManager: ObservableObject {
         nonSpeculativeStreamIDs.insert(videoID)
         dashboardSpeculativeStreamIDs.remove(videoID)
         playlistSpeculativeStreamIDs.remove(videoID)
+        searchSpeculativeStreamIDs.remove(videoID)
     }
 
     private func removeCachedStream(for videoID: String) {
@@ -1877,6 +2042,7 @@ final class PlaybackManager: ObservableObject {
         resolvedStreamDiagnostics.removeValue(forKey: videoID)
         dashboardSpeculativeStreamIDs.remove(videoID)
         playlistSpeculativeStreamIDs.remove(videoID)
+        searchSpeculativeStreamIDs.remove(videoID)
         nonSpeculativeStreamIDs.remove(videoID)
     }
 
@@ -1904,6 +2070,10 @@ final class PlaybackManager: ObservableObject {
         case .playlistWarmup:
             if !nonSpeculativeStreamIDs.contains(videoID) {
                 playlistSpeculativeStreamIDs.insert(videoID)
+            }
+        case .searchPreResolve:
+            if !nonSpeculativeStreamIDs.contains(videoID) {
+                searchSpeculativeStreamIDs.insert(videoID)
             }
         case .foreground, .preResolution, .lookahead, .memoryCache:
             markStreamAsNonSpeculative(videoID)
@@ -4452,6 +4622,12 @@ final class PlaybackManager: ObservableObject {
     private func playlistLog(_ message: String) {
 #if DEBUG
         print("[PlaylistWarmup] \(message)")
+#endif
+    }
+
+    private func searchPreResolveLog(_ message: String) {
+#if DEBUG
+        print("[SearchPreResolve] \(message)")
 #endif
     }
 

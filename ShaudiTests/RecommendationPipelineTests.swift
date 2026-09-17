@@ -1509,6 +1509,68 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(candidates.first?.resultType, .song)
     }
 
+    func testSearchPreResolutionLimitsToFirstThreeUniquePlayableResults() {
+        let results = (0..<10).map { index in
+            YouTubeSearchResult(
+                youtubeVideoID: index == 1 ? "search00000" : String(format: "s%010d", index),
+                title: "Song \(index)",
+                channelTitle: "Artist",
+                thumbnailURL: nil,
+                duration: TimeInterval(180 + index)
+            )
+        }
+
+        let candidates = SearchPreResolutionPlan.candidates(from: results)
+
+        XCTAssertEqual(candidates.count, 3)
+        XCTAssertEqual(candidates.map(\.videoID), ["s0000000000", "search00000", "s0000000002"])
+        XCTAssertEqual(candidates.map(\.rank), [1, 2, 3])
+    }
+
+    func testSearchPreResolutionSkipsBlankAndDuplicateVideoIDs() {
+        let results = [
+            YouTubeSearchResult(
+                youtubeVideoID: "   ",
+                title: "Blank",
+                channelTitle: "Artist",
+                thumbnailURL: nil
+            ),
+            YouTubeSearchResult(
+                youtubeVideoID: "shared00001",
+                title: "First",
+                channelTitle: "Artist",
+                thumbnailURL: nil
+            ),
+            YouTubeSearchResult(
+                youtubeVideoID: " shared00001 ",
+                title: "Duplicate",
+                channelTitle: "Artist",
+                thumbnailURL: nil
+            ),
+            YouTubeSearchResult(
+                youtubeVideoID: "second00001",
+                title: "Second",
+                channelTitle: "Artist",
+                thumbnailURL: nil
+            )
+        ]
+
+        let candidates = SearchPreResolutionPlan.candidates(from: results)
+
+        XCTAssertEqual(candidates.map(\.videoID), ["shared00001", "second00001"])
+    }
+
+    func testSearchPreResolutionQueryReplacementPreservesPromotedAndActivePlayback() {
+        let obsolete = SearchPreResolutionPlan.obsoleteVideoIDs(
+            previous: ["old00000001", "promoted001", "playing0001", "shared00001"],
+            retaining: ["shared00001", "new00000001"],
+            nonSpeculative: ["promoted001"],
+            activePlayback: ["playing0001"]
+        )
+
+        XCTAssertEqual(obsolete, ["old00000001"])
+    }
+
     func testStructuredClientUsesTypedPOSTRequestWithoutLiveNetwork() async throws {
         var capturedRequest: URLRequest?
         let responseURL = try XCTUnwrap(URL(string: "https://music.youtube.com"))
