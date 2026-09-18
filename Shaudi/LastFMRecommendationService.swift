@@ -12,6 +12,11 @@ struct LastFMSimilarTrack: Hashable {
     let url: URL?
 }
 
+struct LastFMTopTrack: Hashable {
+    let artist: String
+    let title: String
+}
+
 struct LastFMRecommendationService: GenreTagFetching {
     enum ServiceError: LocalizedError {
         case missingAPIKey
@@ -55,10 +60,14 @@ struct LastFMRecommendationService: GenreTagFetching {
     func similarTracks(
         artist: String,
         title: String,
-        limit: Int = RecommendationRadioPolicy.candidatePoolSize
+        limit: Int = RecommendationRadioPolicy.candidatePoolSize,
+        isFallback: Bool = false
     ) async throws -> [LastFMSimilarTrack] {
 #if DEBUG
-        print("[LastFM] request artist=\(artist) track=\(title) autocorrect=true")
+        print(
+            "[LastFM] request artist=\(artist) track=\(title) "
+                + "fallback=\(isFallback) autocorrect=true"
+        )
 #endif
         let data = try await request(method: "track.getSimilar", queryItems: [
             URLQueryItem(name: "artist", value: artist),
@@ -103,6 +112,40 @@ struct LastFMRecommendationService: GenreTagFetching {
 
 #if DEBUG
         print("[LastFM] candidates received=\(tracks.count)")
+#endif
+        return tracks
+    }
+
+    func topTracks(
+        artist: String,
+        limit: Int
+    ) async throws -> [LastFMTopTrack] {
+        let data = try await request(method: "artist.getTopTracks", queryItems: [
+            URLQueryItem(name: "artist", value: artist),
+            URLQueryItem(name: "autocorrect", value: "1"),
+            URLQueryItem(name: "limit", value: String(limit))
+        ])
+
+        let response: TopTracksResponse
+        do {
+            response = try JSONDecoder().decode(TopTracksResponse.self, from: data)
+        } catch {
+#if DEBUG
+            print("[LastFM] request failed=artist.getTopTracks response decoding")
+#endif
+            throw ServiceError.malformedResponse
+        }
+
+        let tracks = response.toptracks.track.compactMap { item -> LastFMTopTrack? in
+            let artist = item.artist.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !artist.isEmpty, !title.isEmpty else {
+                return nil
+            }
+            return LastFMTopTrack(artist: artist, title: title)
+        }
+#if DEBUG
+        print("[LastFM] topTracks received=\(tracks.count)")
 #endif
         return tracks
     }
@@ -299,6 +342,23 @@ private struct TopTagsResponse: Decodable {
             case name
             case count
         }
+    }
+}
+
+private struct TopTracksResponse: Decodable {
+    let toptracks: TopTracks
+
+    struct TopTracks: Decodable {
+        let track: [Item]
+    }
+
+    struct Item: Decodable {
+        let name: String
+        let artist: Artist
+    }
+
+    struct Artist: Decodable {
+        let name: String
     }
 }
 

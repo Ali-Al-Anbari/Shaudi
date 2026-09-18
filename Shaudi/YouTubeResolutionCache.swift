@@ -46,6 +46,7 @@ struct YouTubeResolutionMetadata {
 
 @MainActor
 protocol YouTubeResolutionCaching {
+    func learnedIdentity(forVideoID videoID: String) async -> SongIdentity?
     func peek(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult?
     func result(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult?
     @discardableResult
@@ -65,6 +66,10 @@ protocol YouTubeResolutionCaching {
 }
 
 extension YouTubeResolutionCaching {
+    func learnedIdentity(forVideoID videoID: String) async -> SongIdentity? {
+        nil
+    }
+
     func store(
         _ result: YouTubeSearchResult,
         for identity: SongIdentity,
@@ -218,6 +223,34 @@ final class PersistentYouTubeResolutionCache: YouTubeResolutionCaching {
         return entry.searchResult
     }
 
+    func learnedIdentity(forVideoID videoID: String) async -> SongIdentity? {
+        loadIfNeeded()
+        let normalizedVideoID = videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedVideoID.isEmpty else { return nil }
+        let matches = entries.values
+            .filter { $0.videoID == normalizedVideoID }
+            .sorted { lhs, rhs in
+                let lhsPriority = Self.knowledgePriority(lhs.source)
+                let rhsPriority = Self.knowledgePriority(rhs.source)
+                if lhsPriority != rhsPriority {
+                    return lhsPriority > rhsPriority
+                }
+                let lhsIdentity = SongIdentity(
+                    artist: lhs.canonicalArtist,
+                    title: lhs.canonicalTitle
+                )
+                let rhsIdentity = SongIdentity(
+                    artist: rhs.canonicalArtist,
+                    title: rhs.canonicalTitle
+                )
+                return lhsIdentity.cacheKey < rhsIdentity.cacheKey
+            }
+        guard let best = matches.first else {
+            return nil
+        }
+        return SongIdentity(artist: best.canonicalArtist, title: best.canonicalTitle)
+    }
+
     func peek(for identity: SongIdentity, now: Date = .now) async -> YouTubeSearchResult? {
         loadIfNeeded()
         return entries[identity.cacheKey]?.searchResult
@@ -359,6 +392,18 @@ final class PersistentYouTubeResolutionCache: YouTubeResolutionCaching {
         ) != nil
     }
 
+    private static func knowledgePriority(
+        _ source: YouTubeResolutionKnowledgeSource?
+    ) -> Int {
+        switch source {
+        case .lastFMRecommendation: 6
+        case .structured, .officialAPI: 5
+        case .library, .playlist, .pastedURL: 4
+        case .manualSearch: 3
+        case .legacy, .none: 1
+        }
+    }
+
     private static func nonempty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
@@ -376,6 +421,7 @@ enum YouTubeResolutionKnowledgeTeacher {
         userArtistOverride: String?,
         metadata: YouTubeResolutionMetadata,
         source: YouTubeResolutionKnowledgeSource,
+        searchQuery: String? = nil,
         cache suppliedCache: (any YouTubeResolutionCaching)? = nil
     ) async -> Bool {
         let cache = suppliedCache ?? PersistentYouTubeResolutionCache.shared
@@ -384,9 +430,16 @@ enum YouTubeResolutionKnowledgeTeacher {
             rawTitle: rawTitle,
             displayedArtist: displayedArtist,
             sourceChannel: sourceChannel,
-            userArtistOverride: userArtistOverride
+            userArtistOverride: userArtistOverride,
+            searchQuery: searchQuery
         )
         guard let identity = seed.confidentSongIdentityForCaching else {
+            return false
+        }
+        if let learned = await cache.learnedIdentity(forVideoID: videoID), learned != identity {
+#if DEBUG
+            print("[IDResolver] cached=false reason=trustedIdentityConflict")
+#endif
             return false
         }
         return await cache.learn(

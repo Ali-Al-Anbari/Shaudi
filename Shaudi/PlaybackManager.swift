@@ -447,16 +447,32 @@ final class PlaybackManager: ObservableObject {
         play(firstPlayableTrack, in: normalOrder, origin: .playlist(playlistID))
     }
 
-    func play(_ track: PlayableTrack) {
+    func play(
+        _ track: PlayableTrack,
+        canonicalIdentity: SongIdentity? = nil,
+        searchQuery: String? = nil
+    ) {
         endActiveTrimPreviewIfNeeded()
 
-        let manualSeed = RecommendationSeed(
-            youtubeVideoID: normalizedVideoID(track.youtubeVideoID),
-            rawTitle: track.title,
-            displayedArtist: track.channelTitle,
-            sourceChannel: track.channelTitle,
-            userArtistOverride: nil
-        )
+        let manualSeed: RecommendationSeed
+        if let canonicalIdentity {
+            manualSeed = RecommendationSeed(
+                youtubeVideoID: normalizedVideoID(track.youtubeVideoID),
+                canonicalIdentity: canonicalIdentity,
+                youtubeTitle: track.title,
+                youtubeChannel: track.channelTitle ?? "",
+                authoritativeSource: .learnedCache
+            )
+        } else {
+            manualSeed = RecommendationSeed(
+                youtubeVideoID: normalizedVideoID(track.youtubeVideoID),
+                rawTitle: track.title,
+                displayedArtist: track.channelTitle,
+                sourceChannel: track.channelTitle,
+                userArtistOverride: nil,
+                searchQuery: searchQuery
+            )
+        }
         startRecommendationSession(anchor: manualSeed)
         recommendationManualSeeds[normalizedVideoID(track.youtubeVideoID)] = manualSeed
 

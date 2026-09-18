@@ -233,6 +233,217 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(seed.cleanedTitle, "Bandit")
     }
 
+    func testRealDeviceWainedSongFirstIdentityRejectsUploader() {
+        let seed = manualSeed(
+            title: "wained // lana del rey",
+            channel: "melancholia"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.cleanedTitle, "wained")
+        XCTAssertEqual(seed.artistSource, .titleSongArtist)
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
+    func testRealDeviceWayamayaCompactDashIdentityRejectsUploader() {
+        let seed = manualSeed(
+            title: "Lana Del Rey- Wayamaya",
+            channel: "zumra del rey"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.cleanedTitle, "Wayamaya")
+        XCTAssertEqual(seed.artistSource, .titleArtistSong)
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
+    func testArtistFirstDashSpacingVariants() {
+        for title in [
+            "Lana Del Rey - Wayamaya",
+            "Lana Del Rey- Wayamaya",
+            "Lana Del Rey -Wayamaya",
+            "Lana Del Rey-Wayamaya"
+        ] {
+            let seed = manualSeed(title: title, channel: "Archive Uploader")
+            XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey", title)
+            XCTAssertEqual(seed.cleanedTitle, "Wayamaya", title)
+        }
+    }
+
+    func testArtistFirstUnicodeDashVariants() {
+        for title in [
+            "Lana Del Rey – Wayamaya",
+            "Lana Del Rey–Wayamaya",
+            "Lana Del Rey — Wayamaya",
+            "Lana Del Rey—Wayamaya"
+        ] {
+            let seed = manualSeed(title: title, channel: "Archive Uploader")
+            XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey", title)
+            XCTAssertEqual(seed.cleanedTitle, "Wayamaya", title)
+        }
+    }
+
+    func testHyphenatedArtistNamesUseStructuralBoundary() {
+        let blink = manualSeed(
+            title: "blink-182 - All the Small Things",
+            channel: "Fan Archive"
+        )
+        let jayZ = manualSeed(
+            title: "Jay-Z - 99 Problems",
+            channel: "Fan Archive"
+        )
+
+        XCTAssertEqual(blink.cleanedArtist, "blink-182")
+        XCTAssertEqual(blink.cleanedTitle, "All the Small Things")
+        XCTAssertEqual(jayZ.cleanedArtist, "Jay-Z")
+        XCTAssertEqual(jayZ.cleanedTitle, "99 Problems")
+    }
+
+    func testSongFirstSeparatorsResolveArtistOnRight() {
+        for title in [
+            "West Coast // Lana Del Rey",
+            "West Coast | Lana Del Rey",
+            "West Coast • Lana Del Rey",
+            "West Coast by Lana Del Rey"
+        ] {
+            let seed = manualSeed(title: title, channel: "melancholia")
+            XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey", title)
+            XCTAssertEqual(seed.cleanedTitle, "West Coast", title)
+            XCTAssertEqual(seed.artistSource, .titleSongArtist, title)
+        }
+    }
+
+    func testColonArtistFirstPattern() {
+        let seed = manualSeed(
+            title: "Lana Del Rey: West Coast",
+            channel: "Archive"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.cleanedTitle, "West Coast")
+    }
+
+    func testChannelAgreementCanResolveAmbiguousDashAsSongFirst() {
+        let seed = manualSeed(
+            title: "West Coast - Lana Del Rey",
+            channel: "Lana Del Rey"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.cleanedTitle, "West Coast")
+        XCTAssertEqual(seed.artistSource, .titleSongArtist)
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
+    func testStructuredArtistMetadataOutranksConflictingTitleAndUploader() {
+        let seed = RecommendationSeed(
+            youtubeVideoID: "structured1",
+            rawTitle: "Wrong Artist - West Coast",
+            displayedArtist: "Uploader",
+            sourceChannel: "Uploader",
+            userArtistOverride: nil,
+            structuredArtist: "Lana Del Rey"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.artistSource, .structuredArtist)
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
+    func testVEVOChannelProvidesConservativeHighConfidenceArtist() {
+        let seed = manualSeed(title: "West Coast", channel: "LanaDelReyVEVO")
+
+        XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey")
+        XCTAssertEqual(seed.cleanedTitle, "West Coast")
+        XCTAssertEqual(seed.artistSource, .vevoChannel)
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
+    func testFanUploaderDoesNotBecomeCanonicalArtist() {
+        let seed = manualSeed(title: "West Coast", channel: "melancholia")
+
+        XCTAssertEqual(seed.cleanedArtist, "")
+        XCTAssertEqual(seed.cleanedTitle, "West Coast")
+        XCTAssertEqual(seed.artistSource, .channelFallback)
+        XCTAssertEqual(seed.identityConfidence, .low)
+        XCTAssertNil(seed.confidentSongIdentityForCaching)
+    }
+
+    func testOfficialLabelsArePresentationOnlyDuringIdentityResolution() {
+        for title in [
+            "Lana Del Rey - West Coast (Official Audio)",
+            "Lana Del Rey - West Coast [Official Video]"
+        ] {
+            let seed = manualSeed(title: title, channel: "Uploader")
+            XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey", title)
+            XCTAssertEqual(seed.cleanedTitle, "West Coast", title)
+        }
+    }
+
+    func testFeatureAndProducerCreditsNeverBecomePrimaryArtist() {
+        let featured = manualSeed(
+            title: "Artist - Song (feat. Guest)",
+            channel: "Uploader"
+        )
+        let produced = manualSeed(
+            title: "Artist - Song (prod. Producer)",
+            channel: "Uploader"
+        )
+        let producedDash = manualSeed(
+            title: "Artist - Song - Produced by Producer",
+            channel: "Uploader"
+        )
+
+        XCTAssertEqual(featured.cleanedArtist, "Artist")
+        XCTAssertEqual(featured.cleanedTitle, "Song")
+        XCTAssertEqual(produced.cleanedArtist, "Artist")
+        XCTAssertEqual(produced.cleanedTitle, "Song")
+        XCTAssertEqual(producedDash.cleanedArtist, "Artist")
+        XCTAssertEqual(producedDash.cleanedTitle, "Song")
+    }
+
+    func testCollaborativeArtistStringsRemainIntact() {
+        for artist in ["Artist A & Artist B", "Artist A x Artist B"] {
+            let seed = manualSeed(title: "\(artist) - Song", channel: "Uploader")
+            XCTAssertEqual(seed.cleanedArtist, artist)
+            XCTAssertEqual(seed.cleanedTitle, "Song")
+        }
+    }
+
+    func testVersionMarkersDoNotCorruptArtistRecognition() {
+        for version in [
+            "Live", "Remix", "Demo", "Unreleased", "Leak", "Slowed", "Sped-Up"
+        ] {
+            let seed = manualSeed(
+                title: "Lana Del Rey - West Coast (\(version))",
+                channel: "Uploader"
+            )
+            XCTAssertEqual(seed.cleanedArtist, "Lana Del Rey", version)
+            XCTAssertTrue(seed.cleanedTitle.contains("West Coast"), version)
+        }
+    }
+
+    func testAmbiguousSingleWordDashIdentityIsNotPersistable() {
+        let seed = manualSeed(title: "Midnight - Phoenix", channel: "Archive")
+
+        XCTAssertEqual(seed.cleanedArtist, "Midnight")
+        XCTAssertEqual(seed.cleanedTitle, "Phoenix")
+        XCTAssertEqual(seed.identityConfidence, .medium)
+        XCTAssertNil(seed.confidentSongIdentityForCaching)
+    }
+
+    func testManualSearchQueryCanStrengthenCompactSingleWordBoundary() {
+        let seed = manualSeed(
+            title: "Artist-Song",
+            channel: "Archive",
+            searchQuery: "artist song"
+        )
+
+        XCTAssertEqual(seed.cleanedArtist, "Artist")
+        XCTAssertEqual(seed.cleanedTitle, "Song")
+        XCTAssertEqual(seed.identityConfidence, .high)
+    }
+
     func testFamousDexTrailingProductionCreditIsRemoved() {
         for credit in [
             "(Prod. JGramm)", "(prod. JGramm)",
@@ -1288,6 +1499,233 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(dataAPIRequests, 0)
     }
 
+    func testPrimarySimilarPoolSkipsArtistTopTracksFallback() async throws {
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { _, _, _ in
+                [
+                    self.candidate("Artist 1", "Song 1"),
+                    self.candidate("Artist 2", "Song 2"),
+                    self.candidate("Artist 3", "Song 3")
+                ]
+            },
+            topTracks: { _, _ in
+                topTrackCalls += 1
+                return []
+            }
+        )
+
+        let ranked = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: []
+        )
+
+        XCTAssertEqual(ranked.count, 3)
+        XCTAssertEqual(topTrackCalls, 0)
+    }
+
+    func testEmptyPrimaryUsesTopTrackAsSurrogateOnce() async throws {
+        var similarRequests: [(String, String)] = []
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { artist, title, _ in
+                similarRequests.append((artist, title))
+                guard title == "Lucid Dreams" else { return [] }
+                return [
+                    self.candidate("Artist 1", "Song 1"),
+                    self.candidate("Artist 2", "Song 2"),
+                    self.candidate("Artist 3", "Song 3")
+                ]
+            },
+            topTracks: { _, _ in
+                topTrackCalls += 1
+                return [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+
+        let ranked = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: []
+        )
+
+        XCTAssertEqual(topTrackCalls, 1)
+        XCTAssertEqual(similarRequests.map(\.1), ["Some Unreleased Song", "Lucid Dreams"])
+        XCTAssertEqual(ranked.count, 3)
+    }
+
+    func testSurrogateSelectionSkipsCurrentSongAtTopOfRanking() async throws {
+        var similarTitles: [String] = []
+        let service = fallbackTestService(
+            similarTracks: { _, title, _ in
+                similarTitles.append(title)
+                return title == "Lucid Dreams"
+                    ? [self.candidate("Artist", "Recommendation")]
+                    : []
+            },
+            topTracks: { _, _ in
+                [
+                    LastFMTopTrack(artist: "juice wrld", title: "Some Unreleased Song"),
+                    LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")
+                ]
+            }
+        )
+
+        _ = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: []
+        )
+
+        XCTAssertEqual(similarTitles, ["Some Unreleased Song", "Lucid Dreams"])
+    }
+
+    func testEmptyArtistTopTracksFailsGracefully() async throws {
+        var similarCallCount = 0
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { _, _, _ in similarCallCount += 1; return [] },
+            topTracks: { _, _ in topTrackCalls += 1; return [] }
+        )
+
+        let ranked = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: []
+        )
+
+        XCTAssertTrue(ranked.isEmpty)
+        XCTAssertEqual(similarCallCount, 1)
+        XCTAssertEqual(topTrackCalls, 1)
+    }
+
+    func testEmptySurrogateSimilarTracksDoesNotRecursivelyRetry() async throws {
+        var similarCallCount = 0
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { _, _, _ in similarCallCount += 1; return [] },
+            topTracks: { _, _ in
+                topTrackCalls += 1
+                return [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+
+        let ranked = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: []
+        )
+
+        XCTAssertTrue(ranked.isEmpty)
+        XCTAssertEqual(similarCallCount, 2)
+        XCTAssertEqual(topTrackCalls, 1)
+    }
+
+    func testReservoirRefillCannotRepeatSurrogateLookupInSameEpoch() async throws {
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { _, title, _ in
+                title == "Lucid Dreams"
+                    ? (1...5).map { self.candidate("Artist \($0)", "Song \($0)") }
+                    : []
+            },
+            topTracks: { _, _ in
+                topTrackCalls += 1
+                return [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+        var session = RecommendationRadioSession(anchor: unreleasedSeed())
+        let epochID = session.epoch.id
+
+        XCTAssertTrue(session.markEpochCandidateRequestStarted(epochID: epochID))
+        let ranked = try await service.rankedCandidates(
+            for: session.epoch.anchor,
+            excludingSongIdentities: session.globalPlayedSongIdentities
+        )
+        XCTAssertTrue(session.replaceReservoir(ranked.map(\.track), epochID: epochID))
+        _ = session.takeReservoirCandidates(upTo: 2, epochID: epochID)
+
+        XCTAssertFalse(session.markEpochCandidateRequestStarted(epochID: epochID))
+        XCTAssertEqual(topTrackCalls, 1)
+    }
+
+    func testNewEpochMayEvaluateSurrogateFallbackAgain() async throws {
+        var topTrackCalls = 0
+        let service = fallbackTestService(
+            similarTracks: { _, title, _ in
+                title == "Lucid Dreams"
+                    ? (1...3).map { self.candidate("Artist \($0)", "Song \($0)") }
+                    : []
+            },
+            topTracks: { _, _ in
+                topTrackCalls += 1
+                return [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+        var session = RecommendationRadioSession(anchor: unreleasedSeed())
+
+        XCTAssertTrue(session.markEpochCandidateRequestStarted(epochID: session.epoch.id))
+        _ = try await service.rankedCandidates(
+            for: session.epoch.anchor,
+            excludingSongIdentities: session.globalPlayedSongIdentities
+        )
+        for index in 1...RecommendationRadioPolicy.epochLength {
+            _ = session.confirmedRecommendationPlayback(seed: canonicalSeed(index: index))
+        }
+        XCTAssertTrue(session.markEpochCandidateRequestStarted(epochID: session.epoch.id))
+        _ = try await service.rankedCandidates(
+            for: session.epoch.anchor,
+            excludingSongIdentities: session.globalPlayedSongIdentities
+        )
+
+        XCTAssertEqual(topTrackCalls, 2)
+    }
+
+    func testSurrogateFallbackDoesNotChangeActualEpochAnchor() async throws {
+        let actualSeed = unreleasedSeed()
+        let session = RecommendationRadioSession(anchor: actualSeed)
+        let service = fallbackTestService(
+            similarTracks: { _, title, _ in
+                title == "Lucid Dreams"
+                    ? [self.candidate("Artist", "Recommendation")]
+                    : []
+            },
+            topTracks: { _, _ in
+                [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+
+        _ = try await service.rankedCandidates(
+            for: session.epoch.anchor,
+            excludingSongIdentities: session.globalPlayedSongIdentities
+        )
+
+        XCTAssertEqual(session.epoch.anchor.songIdentity, actualSeed.songIdentity)
+        XCTAssertEqual(session.epoch.anchor.youtubeVideoID, actualSeed.youtubeVideoID)
+    }
+
+    func testSurrogateCandidatesStillHonorSessionCanonicalDedupe() async throws {
+        let played = SongIdentity(artist: "Played Artist", title: "Played Song")
+        let service = fallbackTestService(
+            similarTracks: { _, title, _ in
+                guard title == "Lucid Dreams" else { return [] }
+                return [
+                    self.candidate(played.artist, played.title),
+                    self.candidate("Fresh 1", "Song 1"),
+                    self.candidate("Fresh 2", "Song 2"),
+                    self.candidate("Fresh 3", "Song 3")
+                ]
+            },
+            topTracks: { _, _ in
+                [LastFMTopTrack(artist: "Juice WRLD", title: "Lucid Dreams")]
+            }
+        )
+
+        let ranked = try await service.rankedCandidates(
+            for: unreleasedSeed(),
+            excludingSongIdentities: [played]
+        )
+
+        XCTAssertFalse(ranked.map(\.identity).contains(played))
+        XCTAssertEqual(ranked.count, 3)
+    }
+
     func testAnchoredEpochDoesNotReseedRecommendationsOneThroughTwenty() {
         var session = RecommendationRadioSession(anchor: banditSeed())
         var lastFMCallCount = session.markEpochCandidateRequestStarted(
@@ -1990,6 +2428,43 @@ final class RecommendationPipelineTests: XCTestCase {
         XCTAssertEqual(cache.storeCount, 0)
     }
 
+    func testLowConfidenceUploaderCannotReplaceLearnedIdentity() async {
+        let cache = MemoryYouTubeResolutionCache()
+        let videoID = "identity001"
+        let trusted = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: videoID,
+            rawTitle: "Lana Del Rey- Wayamaya",
+            displayedArtist: "zumra del rey",
+            sourceChannel: "zumra del rey",
+            userArtistOverride: nil,
+            metadata: YouTubeResolutionMetadata(
+                title: "Lana Del Rey- Wayamaya",
+                channel: "zumra del rey"
+            ),
+            source: .manualSearch,
+            cache: cache
+        )
+        let lowConfidence = await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
+            videoID: videoID,
+            rawTitle: "Wayamaya",
+            displayedArtist: "zumra del rey",
+            sourceChannel: "zumra del rey",
+            userArtistOverride: nil,
+            metadata: YouTubeResolutionMetadata(
+                title: "Wayamaya",
+                channel: "zumra del rey"
+            ),
+            source: .manualSearch,
+            cache: cache
+        )
+
+        XCTAssertTrue(trusted)
+        XCTAssertFalse(lowConfidence)
+        XCTAssertEqual(cache.storeCount, 1)
+        let learned = await cache.learnedIdentity(forVideoID: videoID)
+        XCTAssertEqual(learned, SongIdentity(artist: "Lana Del Rey", title: "Wayamaya"))
+    }
+
     func testTemporaryStructuredFailureDoesNotDeleteKnownMapping() async throws {
         let identity = SongIdentity(artist: "Example Artist", title: "Example Song")
         let cache = MemoryYouTubeResolutionCache([
@@ -2199,13 +2674,18 @@ final class RecommendationPipelineTests: XCTestCase {
         )
     }
 
-    private func manualSeed(title: String, channel: String) -> RecommendationSeed {
+    private func manualSeed(
+        title: String,
+        channel: String,
+        searchQuery: String? = nil
+    ) -> RecommendationSeed {
         RecommendationSeed(
             youtubeVideoID: "abcdefghijk",
             rawTitle: title,
             displayedArtist: channel,
             sourceChannel: channel,
-            userArtistOverride: nil
+            userArtistOverride: nil,
+            searchQuery: searchQuery
         )
     }
 
@@ -2219,6 +2699,37 @@ final class RecommendationPipelineTests: XCTestCase {
             canonicalIdentity: SongIdentity(artist: "Juice WRLD", title: "Bandit"),
             youtubeTitle: "Juice WRLD - Bandit (Official Music Video)",
             youtubeChannel: "Lyrical Lemonade"
+        )
+    }
+
+    private func unreleasedSeed() -> RecommendationSeed {
+        RecommendationSeed(
+            youtubeVideoID: "unreleased1",
+            canonicalIdentity: SongIdentity(
+                artist: "Juice WRLD",
+                title: "Some Unreleased Song"
+            ),
+            youtubeTitle: "Juice WRLD - Some Unreleased Song",
+            youtubeChannel: "Juice WRLD"
+        )
+    }
+
+    private func fallbackTestService(
+        similarTracks: @escaping (
+            String,
+            String,
+            Int
+        ) async throws -> [LastFMSimilarTrack],
+        topTracks: @escaping (String, Int) async throws -> [LastFMTopTrack]
+    ) -> RecommendationService {
+        RecommendationService(
+            similarTracks: similarTracks,
+            topTracks: topTracks,
+            videoResolver: YouTubeRecommendationResolver(
+                primarySearch: { _ in [] },
+                dataAPISearch: { _ in [] }
+            ),
+            resolutionCache: MemoryYouTubeResolutionCache()
         )
     }
 
@@ -2338,6 +2849,10 @@ private final class MemoryYouTubeResolutionCache: YouTubeResolutionCaching {
 
     init(_ storage: [SongIdentity: YouTubeSearchResult]) {
         self.storage = storage
+    }
+
+    func learnedIdentity(forVideoID videoID: String) async -> SongIdentity? {
+        storage.first { $0.value.youtubeVideoID == videoID }?.key
     }
 
     func result(for identity: SongIdentity, now: Date) async -> YouTubeSearchResult? {

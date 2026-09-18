@@ -47,13 +47,16 @@ struct RecommendationSeed {
     let cleanedTitle: String
     let fallbackTitle: String?
     let artistSource: RecommendationSeedArtistSource
+    let identityConfidence: RecommendationIdentityConfidence
 
     init(
         youtubeVideoID: String,
         rawTitle: String,
         displayedArtist: String?,
         sourceChannel: String?,
-        userArtistOverride: String?
+        userArtistOverride: String?,
+        structuredArtist: String? = nil,
+        searchQuery: String? = nil
     ) {
         self.youtubeVideoID = youtubeVideoID
         self.rawTitle = rawTitle
@@ -65,21 +68,37 @@ struct RecommendationSeed {
             rawTitle: rawTitle,
             displayedArtist: displayedArtist,
             channel: sourceChannel,
-            userArtistOverride: userArtistOverride
+            userArtistOverride: userArtistOverride,
+            structuredArtist: structuredArtist,
+            searchQuery: searchQuery
         )
         cleanedArtist = identity.artist
         cleanedTitle = identity.title
         fallbackTitle = identity.fallbackTitle
         artistSource = identity.artistSource
+        identityConfidence = identity.confidence
 
 #if DEBUG
         print(
-            "[RecommendationIdentity] source=manualSearch rawTitle=\(rawTitle) "
+            "[RecommendationIdentity] rawTitle=\(rawTitle) "
                 + "rawChannel=\(sourceChannel ?? "")"
         )
         print(
-            "[RecommendationIdentity] canonicalArtist=\(identity.artist) "
-                + "canonicalTitle=\(identity.title) artistSource=\(identity.artistSource.rawValue)"
+            "[RecommendationIdentity] candidate artist=\(identity.artist) "
+                + "title=\(identity.title) source=\(identity.artistSource.rawValue) "
+                + "confidence=\(identity.confidence.rawValue)"
+        )
+        if let sourceChannel, !sourceChannel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let channelConfidence = identity.artistSource == .topicChannel
+                || identity.artistSource == .vevoChannel ? "high" : "low"
+            print(
+                "[RecommendationIdentity] channelCandidate=\(sourceChannel) "
+                    + "confidence=\(channelConfidence)"
+            )
+        }
+        print(
+            "[RecommendationIdentity] selected artist=\(identity.artist) "
+                + "title=\(identity.title) source=\(identity.artistSource.rawValue)"
         )
 #endif
     }
@@ -88,7 +107,8 @@ struct RecommendationSeed {
         youtubeVideoID: String,
         canonicalIdentity: SongIdentity,
         youtubeTitle: String,
-        youtubeChannel: String
+        youtubeChannel: String,
+        authoritativeSource: RecommendationSeedArtistSource = .lastFM
     ) {
         self.youtubeVideoID = youtubeVideoID
         rawTitle = youtubeTitle
@@ -98,11 +118,12 @@ struct RecommendationSeed {
         cleanedArtist = canonicalIdentity.artist
         cleanedTitle = canonicalIdentity.title
         fallbackTitle = nil
-        artistSource = .lastFM
+        artistSource = authoritativeSource
+        identityConfidence = .authoritative
 
 #if DEBUG
         print(
-            "[RecommendationIdentity] source=lastFM "
+            "[RecommendationIdentity] source=\(authoritativeSource.rawValue) "
                 + "canonicalArtist=\(canonicalIdentity.artist) "
                 + "canonicalTitle=\(canonicalIdentity.title) reparseSkipped=true"
         )
@@ -117,21 +138,42 @@ struct RecommendationSeed {
         guard !cleanedArtist.isEmpty, !cleanedTitle.isEmpty else {
             return nil
         }
-        switch artistSource {
-        case .lastFM, .userOverride, .titlePrefix, .topicChannel:
-            return songIdentity
-        case .channelFallback:
-            return nil
-        }
+        guard identityConfidence >= .high else { return nil }
+        return songIdentity
     }
 }
 
 enum RecommendationSeedArtistSource: String {
     case lastFM
+    case learnedCache
     case userOverride
-    case titlePrefix
+    case structuredArtist
+    case titleArtistSong
+    case titleSongArtist
     case topicChannel
+    case vevoChannel
     case channelFallback
+    case unknown
+}
+
+enum RecommendationIdentityConfidence: String, Comparable {
+    case low
+    case medium
+    case high
+    case authoritative
+
+    private var rank: Int {
+        switch self {
+        case .low: 0
+        case .medium: 1
+        case .high: 2
+        case .authoritative: 3
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rank < rhs.rank
+    }
 }
 
 private struct RecommendationSeedIdentity {
@@ -139,41 +181,72 @@ private struct RecommendationSeedIdentity {
     let title: String
     let fallbackTitle: String?
     let artistSource: RecommendationSeedArtistSource
+    let confidence: RecommendationIdentityConfidence
 }
 
 private enum RecommendationSeedIdentityResolver {
+    private struct ParsedTitleIdentity {
+        let artist: String
+        let title: String
+        let source: RecommendationSeedArtistSource
+        let confidence: RecommendationIdentityConfidence
+    }
+
     static func resolve(
         rawTitle: String,
         displayedArtist: String?,
         channel: String?,
-        userArtistOverride: String?
+        userArtistOverride: String?,
+        structuredArtist: String? = nil,
+        searchQuery: String? = nil
     ) -> RecommendationSeedIdentity {
         let cleanedRawTitle = SongNormalization.displayTitle(rawTitle)
-        let parsedTitle = parsedArtistAndTitle(from: cleanedRawTitle)
+        let structuralTitle = SongNormalization.removingTrailingProductionCredit(
+            from: cleanedRawTitle
+        )
         let override = nonempty(userArtistOverride).map { SongNormalization.artist($0) }
         let cleanedChannel = nonempty(channel).map { SongNormalization.artist($0) }
-        let cleanedDisplayArtist = nonempty(displayedArtist).map {
-            SongNormalization.artist($0)
-        }
+        let explicitArtist = nonempty(structuredArtist).map { SongNormalization.artist($0) }
+        let topicArtist = channel.flatMap { isTopicChannel($0) ? cleanedChannel : nil }
+        let vevoArtist = channel.flatMap { SongNormalization.vevoArtist($0) }
+        let parsedTitle = parsedArtistAndTitle(
+            from: structuralTitle,
+            supportingArtist: topicArtist ?? vevoArtist ?? cleanedChannel,
+            searchQuery: searchQuery
+        )
 
         let artist: String
         let artistSource: RecommendationSeedArtistSource
+        let confidence: RecommendationIdentityConfidence
         if let override, !override.isEmpty {
             artist = override
             artistSource = .userOverride
+            confidence = .authoritative
+        } else if let explicitArtist, !explicitArtist.isEmpty {
+            artist = explicitArtist
+            artistSource = .structuredArtist
+            confidence = .high
+        } else if let topicArtist, !topicArtist.isEmpty {
+            artist = topicArtist
+            artistSource = .topicChannel
+            confidence = .high
         } else if let parsedTitle {
             artist = parsedTitle.artist
-            artistSource = .titlePrefix
-        } else if let channel, isTopicChannel(channel), let cleanedChannel {
-            artist = cleanedChannel
-            artistSource = .topicChannel
+            artistSource = parsedTitle.source
+            confidence = parsedTitle.confidence
+        } else if let vevoArtist, !vevoArtist.isEmpty {
+            artist = vevoArtist
+            artistSource = .vevoChannel
+            confidence = .high
         } else {
-            artist = cleanedDisplayArtist ?? cleanedChannel ?? ""
-            artistSource = .channelFallback
+            _ = displayedArtist
+            artist = ""
+            artistSource = cleanedChannel == nil ? .unknown : .channelFallback
+            confidence = .low
         }
 
         let titleWithFeatures: String
-        if override != nil {
+        if override != nil || explicitArtist != nil || topicArtist != nil || vevoArtist != nil {
             titleWithFeatures = SongNormalization.displayTitle(
                 cleanedRawTitle,
                 removingArtist: artist
@@ -204,37 +277,165 @@ private enum RecommendationSeedIdentityResolver {
             artist: artist,
             title: canonicalTitle,
             fallbackTitle: fallbackTitle,
-            artistSource: artistSource
+            artistSource: artistSource,
+            confidence: confidence
         )
     }
 
     private static func parsedArtistAndTitle(
-        from value: String
-    ) -> (artist: String, title: String)? {
-        guard let separatorRange = value.range(
-            of: #"\s[-–—]\s"#,
+        from value: String,
+        supportingArtist: String?,
+        searchQuery: String?
+    ) -> ParsedTitleIdentity? {
+        for separator in ["//", "|", "•"] {
+            if let split = split(value, separator: separator),
+               isPlausibleArtist(split.right),
+               isPlausibleTitle(split.left) {
+                return ParsedTitleIdentity(
+                    artist: canonicalArtistDisplay(split.right),
+                    title: split.left,
+                    source: .titleSongArtist,
+                    confidence: .high
+                )
+            }
+        }
+
+        if let range = value.range(of: #"(?i)\s+by\s+"#, options: .regularExpression) {
+            let song = trimmed(value[..<range.lowerBound])
+            let artist = trimmed(value[range.upperBound...])
+            if isPlausibleArtist(artist), isPlausibleTitle(song) {
+                return ParsedTitleIdentity(
+                    artist: canonicalArtistDisplay(artist),
+                    title: song,
+                    source: .titleSongArtist,
+                    confidence: .high
+                )
+            }
+        }
+
+        if let range = value.range(of: #"\s*:\s+"#, options: .regularExpression),
+           let candidate = dashCandidate(
+               value: value,
+               range: range,
+               supportingArtist: supportingArtist,
+               searchQuery: searchQuery,
+               compact: false
+           ) {
+            return candidate
+        }
+
+        if let range = value.range(
+            of: #"(?:\s+[-–—]\s*|[-–—]\s+)"#,
             options: .regularExpression
-        ) else {
-            return nil
+        ), let candidate = dashCandidate(
+            value: value,
+            range: range,
+            supportingArtist: supportingArtist,
+            searchQuery: searchQuery,
+            compact: false
+        ) {
+            return candidate
         }
 
-        let artist = value[..<separatorRange.lowerBound]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = value[separatorRange.upperBound...]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let artistWordCount = artist.split(whereSeparator: \.isWhitespace).count
+        for index in value.indices where "-–—".contains(value[index]) {
+            let next = value.index(after: index)
+            let range = index..<next
+            if let candidate = dashCandidate(
+                value: value,
+                range: range,
+                supportingArtist: supportingArtist,
+                searchQuery: searchQuery,
+                compact: true
+            ) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func dashCandidate(
+        value: String,
+        range: Range<String.Index>,
+        supportingArtist: String?,
+        searchQuery: String?,
+        compact: Bool
+    ) -> ParsedTitleIdentity? {
+        let left = trimmed(value[..<range.lowerBound])
+        let right = trimmed(value[range.upperBound...])
+        guard isPlausibleArtist(left), isPlausibleTitle(right) else { return nil }
+
+        let support = SongNormalization.text(supportingArtist ?? "")
+        let leftKey = SongNormalization.text(left)
+        let rightKey = SongNormalization.text(right)
+        if !support.isEmpty, support == rightKey, isPlausibleArtist(right) {
+            return ParsedTitleIdentity(
+                artist: canonicalArtistDisplay(right),
+                title: left,
+                source: .titleSongArtist,
+                confidence: .high
+            )
+        }
+
+        let query = SongNormalization.text(searchQuery ?? "")
+        let querySupportsLeft = !query.isEmpty
+            && query.hasPrefix(leftKey)
+            && query.contains(rightKey)
+        let leftWordCount = left.split(whereSeparator: \.isWhitespace).count
+        let hasStrongLeftShape = leftWordCount >= 2
+            || left.contains(" & ")
+            || left.localizedCaseInsensitiveContains(" feat. ")
+            || left.localizedCaseInsensitiveContains(" feat ")
+            || left.contains(" x ")
+            || left.contains(",")
+
+        if compact, !hasStrongLeftShape, support != leftKey, !querySupportsLeft {
+            return nil
+        }
+        let confidence: RecommendationIdentityConfidence =
+            support == leftKey || querySupportsLeft || hasStrongLeftShape ? .high : .medium
+        return ParsedTitleIdentity(
+            artist: canonicalArtistDisplay(left),
+            title: right,
+            source: .titleArtistSong,
+            confidence: confidence
+        )
+    }
+
+    private static func split(
+        _ value: String,
+        separator: String
+    ) -> (left: String, right: String)? {
+        guard let range = value.range(of: separator) else { return nil }
+        return (trimmed(value[..<range.lowerBound]), trimmed(value[range.upperBound...]))
+    }
+
+    private static func isPlausibleArtist(_ value: String) -> Bool {
+        let wordCount = value.split(whereSeparator: \.isWhitespace).count
+        return !value.isEmpty
+            && value.count <= 80
+            && (1...10).contains(wordCount)
+            && value.rangeOfCharacter(from: .alphanumerics) != nil
+    }
+
+    private static func isPlausibleTitle(_ value: String) -> Bool {
+        !value.isEmpty && value.rangeOfCharacter(from: .alphanumerics) != nil
+    }
+
+    private static func canonicalArtistDisplay(_ value: String) -> String {
+        let artist = SongNormalization.artist(value)
+        let letters = artist.unicodeScalars.filter(CharacterSet.letters.contains)
         guard
-            !artist.isEmpty,
-            !title.isEmpty,
-            artist.count <= 80,
-            (1...10).contains(artistWordCount),
-            artist.rangeOfCharacter(from: .alphanumerics) != nil,
-            title.rangeOfCharacter(from: .alphanumerics) != nil
+            artist.split(whereSeparator: \.isWhitespace).count >= 2,
+            !letters.isEmpty,
+            letters.allSatisfy({ CharacterSet.lowercaseLetters.contains($0) })
         else {
-            return nil
+            return artist
         }
+        return artist.localizedCapitalized
+    }
 
-        return (SongNormalization.artist(artist), title)
+    private static func trimmed(_ value: String.SubSequence) -> String {
+        String(value).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func isTopicChannel(_ value: String) -> Bool {
@@ -346,7 +547,7 @@ struct RecommendationCandidateReservoir {
 
 @MainActor
 struct RecommendationService {
-    private struct RankedSong {
+    struct RankedSong {
         let track: LastFMSimilarTrack
         let identity: RecommendationSongIdentity
 
@@ -363,36 +564,56 @@ struct RecommendationService {
     typealias SimilarTracksOperation = (
         _ artist: String,
         _ title: String,
-        _ limit: Int
+        _ limit: Int,
+        _ isFallback: Bool
     ) async throws -> [LastFMSimilarTrack]
 
+    typealias TopTracksOperation = (
+        _ artist: String,
+        _ limit: Int
+    ) async throws -> [LastFMTopTrack]
+
     private let similarTracksOperation: SimilarTracksOperation
+    private let topTracksOperation: TopTracksOperation
     private let videoResolver: YouTubeRecommendationResolver
     private let resolutionCache: any YouTubeResolutionCaching
     private let resultLimit = RecommendationRadioPolicy.targetUpcomingCount
     private let candidatePoolLimit = RecommendationRadioPolicy.candidatePoolSize
     private let youtubeResolutionLimit = 12
     private let reservoirCandidateLimit = RecommendationRadioPolicy.candidatePoolSize
+    private let topTrackAnchorLimit = 10
 
     init() {
         let lastFMService = LastFMRecommendationService()
-        similarTracksOperation = { artist, title, limit in
+        similarTracksOperation = { artist, title, limit, isFallback in
             try await lastFMService.similarTracks(
                 artist: artist,
                 title: title,
-                limit: limit
+                limit: limit,
+                isFallback: isFallback
             )
+        }
+        topTracksOperation = { artist, limit in
+            try await lastFMService.topTracks(artist: artist, limit: limit)
         }
         videoResolver = YouTubeRecommendationResolver()
         resolutionCache = PersistentYouTubeResolutionCache.shared
     }
 
     init(
-        similarTracks: @escaping SimilarTracksOperation,
+        similarTracks: @escaping (
+            _ artist: String,
+            _ title: String,
+            _ limit: Int
+        ) async throws -> [LastFMSimilarTrack],
+        topTracks: @escaping TopTracksOperation = { _, _ in [] },
         videoResolver: YouTubeRecommendationResolver,
         resolutionCache: any YouTubeResolutionCaching
     ) {
-        similarTracksOperation = similarTracks
+        similarTracksOperation = { artist, title, limit, _ in
+            try await similarTracks(artist, title, limit)
+        }
+        topTracksOperation = topTracks
         self.videoResolver = videoResolver
         self.resolutionCache = resolutionCache
     }
@@ -411,14 +632,12 @@ struct RecommendationService {
         }
 
 #if DEBUG
-        print("[Recommendations] seed=\(seedArtist) - \(seedTitle)")
+        print("[Recommendations] primaryAnchor=\(seedArtist) - \(seedTitle)")
 #endif
-        let candidates = try await similarTracks(for: seed)
-        let ranked = filteredCandidates(
-            candidates,
-            seed: seed,
-            excluding: excludingSongIdentities
-        ).sorted(by: rankedSongOrder)
+        let ranked = try await rankedCandidates(
+            for: seed,
+            excludingSongIdentities: excludingSongIdentities
+        )
 #if DEBUG
         print("[Recommendations] candidates after diversity=\(ranked.count)")
 #endif
@@ -757,14 +976,86 @@ struct RecommendationService {
         )
     }
 
-    private func similarTracks(
+    func rankedCandidates(
+        for seed: RecommendationSeed,
+        excludingSongIdentities: Set<RecommendationSongIdentity>
+    ) async throws -> [RankedSong] {
+        let primary = try await primarySimilarTracks(for: seed)
+        let primaryRanked = filteredCandidates(
+            primary,
+            seed: seed,
+            excluding: excludingSongIdentities
+        ).sorted(by: rankedSongOrder)
+        guard primaryRanked.count < resultLimit else {
+            return primaryRanked
+        }
+
+#if DEBUG
+        if primaryRanked.isEmpty {
+            print("[LastFM] trackSimilarEmpty artist=\(seed.cleanedArtist) track=\(seed.cleanedTitle)")
+        } else {
+            print(
+                "[LastFM] trackSimilarInsufficient artist=\(seed.cleanedArtist) "
+                    + "track=\(seed.cleanedTitle) usable=\(primaryRanked.count)"
+            )
+        }
+        print("[Recommendations] surrogateFallback requested artist=\(seed.cleanedArtist)")
+#endif
+        let topTracks: [LastFMTopTrack]
+        do {
+            topTracks = try await topTracksOperation(seed.cleanedArtist, topTrackAnchorLimit)
+        } catch {
+#if DEBUG
+            print("[Recommendations] surrogateFallback unavailable reason=topTracksFailed")
+#endif
+            return primaryRanked
+        }
+        guard let surrogate = surrogateAnchor(from: topTracks, excluding: seed.songIdentity) else {
+#if DEBUG
+            print("[Recommendations] surrogateFallback unavailable reason=noTopTracks")
+#endif
+            return primaryRanked
+        }
+
+#if DEBUG
+        print("[Recommendations] surrogateAnchor=\(surrogate.artist) - \(surrogate.title)")
+#endif
+        let surrogateCandidates: [LastFMSimilarTrack]
+        do {
+            surrogateCandidates = try await similarTracksOperation(
+                surrogate.artist,
+                surrogate.title,
+                candidatePoolLimit,
+                true
+            )
+        } catch {
+#if DEBUG
+            print("[Recommendations] surrogateCandidates received=0")
+#endif
+            return primaryRanked
+        }
+#if DEBUG
+        print("[Recommendations] surrogateCandidates received=\(surrogateCandidates.count)")
+#endif
+        guard !surrogateCandidates.isEmpty else {
+            return primaryRanked
+        }
+        return filteredCandidates(
+            primary + surrogateCandidates,
+            seed: seed,
+            excluding: excludingSongIdentities
+        ).sorted(by: rankedSongOrder)
+    }
+
+    private func primarySimilarTracks(
         for seed: RecommendationSeed
     ) async throws -> [LastFMSimilarTrack] {
         do {
             let primary = try await similarTracksOperation(
                 seed.cleanedArtist,
                 seed.cleanedTitle,
-                candidatePoolLimit
+                candidatePoolLimit,
+                false
             )
             guard primary.isEmpty, let fallbackTitle = usableFallbackTitle(for: seed) else {
                 return primary
@@ -777,13 +1068,17 @@ struct RecommendationService {
             return try await similarTracksOperation(
                 seed.cleanedArtist,
                 fallbackTitle,
-                candidatePoolLimit
+                candidatePoolLimit,
+                false
             )
         } catch let error as LastFMRecommendationService.ServiceError {
             guard
                 error.permitsAlternateSeedRetry,
                 let fallbackTitle = usableFallbackTitle(for: seed)
             else {
+                if error.permitsAlternateSeedRetry {
+                    return []
+                }
                 throw error
             }
 
@@ -791,11 +1086,33 @@ struct RecommendationService {
             print("[LastFM] primary seed failed reason=\(error.localizedDescription)")
             print("[LastFM] retry artist=\(seed.cleanedArtist) track=\(fallbackTitle)")
 #endif
-            return try await similarTracksOperation(
-                seed.cleanedArtist,
-                fallbackTitle,
-                candidatePoolLimit
-            )
+            do {
+                return try await similarTracksOperation(
+                    seed.cleanedArtist,
+                    fallbackTitle,
+                    candidatePoolLimit,
+                    false
+                )
+            } catch let fallbackError as LastFMRecommendationService.ServiceError
+                where fallbackError.permitsAlternateSeedRetry {
+                return []
+            }
+        }
+    }
+
+    private func surrogateAnchor(
+        from tracks: [LastFMTopTrack],
+        excluding seedIdentity: RecommendationSongIdentity
+    ) -> LastFMTopTrack? {
+        tracks.first { track in
+            let artist = SongNormalization.humanReadable(track.artist)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = SongNormalization.humanReadable(track.title)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !artist.isEmpty, !title.isEmpty else {
+                return false
+            }
+            return RecommendationSongIdentity(artist: artist, title: title) != seedIdentity
         }
     }
 
@@ -1183,8 +1500,10 @@ enum SongNormalization {
         "audio", "hd", "4k"
     ]
     private static let versionMarkers = [
-        "live", "remix", "acoustic", "sped up", "speed up", "slowed",
-        "cover", "karaoke", "instrumental"
+        "live", "remix", "acoustic", "demo", "unreleased", "leak", "leaked",
+        "snippet", "slowed", "slowed reverb", "slowed + reverb", "sped up",
+        "speed up", "nightcore", "cover", "karaoke", "instrumental", "remaster",
+        "remastered", "alternate version", "version"
     ]
 
     static func artist(_ value: String) -> String {
@@ -1200,6 +1519,25 @@ enum SongNormalization {
             options: .regularExpression
         )
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func vevoArtist(_ value: String) -> String? {
+        let channel = humanReadable(value).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            channel.range(of: #"(?i)^[\p{L}\p{N}][\p{L}\p{N}.'’_-]{2,}vevo$"#,
+                          options: .regularExpression) != nil
+        else {
+            return nil
+        }
+        var base = String(channel.dropLast(4))
+        base = base.replacingOccurrences(
+            of: #"(?<=[\p{Ll}\p{N}])(?=\p{Lu})"#,
+            with: " ",
+            options: .regularExpression
+        )
+        base = base.replacingOccurrences(of: "_", with: " ")
+        let cleaned = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.rangeOfCharacter(from: .letters) == nil ? nil : cleaned
     }
 
     static func displayTitle(_ value: String) -> String {
@@ -1275,11 +1613,17 @@ enum SongNormalization {
     }
 
     static func removingTrailingProductionCredit(from value: String) -> String {
-        value.replacingOccurrences(
+        var result = value.replacingOccurrences(
             of: #"(?i)\s*[\(\[]\s*(?:prod\.?|produced\s+by)\s+[^\)\]]+[\)\]]\s*$"#,
             with: "",
             options: .regularExpression
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        result = result.replacingOccurrences(
+            of: #"(?i)\s*[-–—]\s*(?:prod\.?|produced\s+by)\s+.+$"#,
+            with: "",
+            options: .regularExpression
+        )
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func text(_ value: String) -> String {

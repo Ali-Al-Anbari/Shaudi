@@ -267,6 +267,7 @@ struct SearchView: View {
     @State private var noticeMessage: String?
     @State private var errorMessage: String?
     @State private var isShowingManualTrackAdd = false
+    @State private var playlistResult: YouTubeSearchResult?
 
     var body: some View {
         NavigationStack {
@@ -312,6 +313,17 @@ struct SearchView: View {
         .tint(appearanceSettings.primaryColor)
         .sheet(isPresented: $isShowingManualTrackAdd) {
             ManualTrackAdditionView()
+        }
+        .overlay {
+            if let playlistResult {
+                ShaudiAddToPlaylistModal(
+                    isPresented: Binding(
+                        get: { self.playlistResult != nil },
+                        set: { if !$0 { self.playlistResult = nil } }
+                    ),
+                    transientTrack: trackForPlaylist(playlistResult)
+                )
+            }
         }
         .onChange(of: viewModel.query) {
             noticeMessage = nil
@@ -550,25 +562,11 @@ struct SearchView: View {
             }
             .disabled(isInLibrary(result))
 
-            Menu("Add to Playlist", systemImage: "text.badge.plus") {
-                if playlists.isEmpty {
-                    Text("No Playlists")
-                } else {
-                    ForEach(playlists) { playlist in
-                        Button {
-                            add(result, to: playlist)
-                        } label: {
-                            if contains(result, in: playlist) {
-                                Label(playlist.name, systemImage: "checkmark")
-                            } else {
-                                Text(playlist.name)
-                            }
-                        }
-                        .disabled(contains(result, in: playlist))
-                    }
-                }
+            Button {
+                playlistResult = result
+            } label: {
+                Label("Add to Playlist", systemImage: "text.badge.plus")
             }
-            .disabled(playlists.isEmpty)
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.title3)
@@ -579,6 +577,7 @@ struct SearchView: View {
     }
 
     private func play(_ result: YouTubeSearchResult) {
+        let searchQuery = viewModel.trimmedQuery
         playbackManager.prepareForManualSearchPlayback()
         playbackManager.promoteSearchPreResolution(for: result.youtubeVideoID)
         let requestID = UUID()
@@ -601,12 +600,19 @@ struct SearchView: View {
                     thumbnailURL: metadata.thumbnailURL ?? result.thumbnailURL,
                     duration: metadata.duration
                 )
+                let learnedIdentity = await PersistentYouTubeResolutionCache.shared
+                    .learnedIdentity(forVideoID: result.youtubeVideoID)
                 searchLog("Playing transient result \(result.youtubeVideoID)")
-                playbackManager.play(playableTrack)
+                playbackManager.play(
+                    playableTrack,
+                    canonicalIdentity: learnedIdentity,
+                    searchQuery: searchQuery
+                )
                 teachResolution(
                     result: result,
                     metadata: metadata,
-                    source: .manualSearch
+                    source: .manualSearch,
+                    searchQuery: searchQuery
                 )
             } catch is CancellationError {
                 return
@@ -716,6 +722,20 @@ struct SearchView: View {
         playlist.tracks.contains { $0.youtubeVideoID == result.youtubeVideoID }
     }
 
+    private func trackForPlaylist(_ result: YouTubeSearchResult) -> Track {
+        var components = URLComponents(string: "https://www.youtube.com/watch")!
+        components.queryItems = [URLQueryItem(name: "v", value: result.youtubeVideoID)]
+        return Track(
+            title: result.title,
+            youtubeURL: components.url!,
+            youtubeVideoID: result.youtubeVideoID,
+            channelTitle: result.channelTitle,
+            thumbnailURL: result.thumbnailURL,
+            duration: result.duration,
+            metadataLastRefreshed: .now
+        )
+    }
+
     private func makeTrack(
         for result: YouTubeSearchResult,
         metadata: YouTubeMetadata
@@ -737,7 +757,8 @@ struct SearchView: View {
     private func teachResolution(
         result: YouTubeSearchResult,
         metadata: YouTubeMetadata,
-        source: YouTubeResolutionKnowledgeSource
+        source: YouTubeResolutionKnowledgeSource,
+        searchQuery: String? = nil
     ) {
         Task {
             await YouTubeResolutionKnowledgeTeacher.learnIfConfident(
@@ -752,7 +773,8 @@ struct SearchView: View {
                     thumbnailURL: metadata.thumbnailURL ?? result.thumbnailURL,
                     duration: metadata.duration
                 ),
-                source: source
+                source: source,
+                searchQuery: searchQuery
             )
         }
     }
