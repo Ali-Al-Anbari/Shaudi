@@ -36,6 +36,7 @@ struct LibraryView: View {
     @State private var infoTrack: Track?
     @State private var editingTrack: Track?
     @State private var trimmingTrack: Track?
+    @State private var playlistTrack: Track?
     private let loveMessages = ["made with love", "For my little macaroon", "love lives here", "don't forget bf!!", "you're my favorite", "♡"]
     private let playlistPageSize = 6
     private let playlistColumnSpacing: CGFloat = 12
@@ -144,6 +145,17 @@ struct LibraryView: View {
             }
             .onChange(of: appearanceSettings.bannerRevision) {
                 loadBannerImage()
+            }
+        }
+        .overlay {
+            if let playlistTrack {
+                ShaudiAddToPlaylistModal(
+                    isPresented: Binding(
+                        get: { self.playlistTrack != nil },
+                        set: { if !$0 { self.playlistTrack = nil } }
+                    ),
+                    transientTrack: playlistTrack
+                )
             }
         }
         .tint(appearanceSettings.primaryColor)
@@ -388,6 +400,9 @@ struct LibraryView: View {
             edit: {
                 editingTrack = track
             },
+            addToPlaylist: {
+                playlistTrack = track
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -541,6 +556,7 @@ private struct CollectionView: View {
     @State private var infoTrack: Track?
     @State private var editingTrack: Track?
     @State private var trimmingTrack: Track?
+    @State private var playlistTrack: Track?
     @State private var searchText = ""
     @State private var sortOption: SortOption = .mostPlayed
     @State private var filterOption: FilterOption = .allSongs
@@ -615,6 +631,17 @@ private struct CollectionView: View {
         )) {
             if let trimmingTrack {
                 TrackTrimEditorView(track: trimmingTrack)
+            }
+        }
+        .overlay {
+            if let playlistTrack {
+                ShaudiAddToPlaylistModal(
+                    isPresented: Binding(
+                        get: { self.playlistTrack != nil },
+                        set: { if !$0 { self.playlistTrack = nil } }
+                    ),
+                    transientTrack: playlistTrack
+                )
             }
         }
         .alert(
@@ -753,6 +780,9 @@ private struct CollectionView: View {
             edit: {
                 editingTrack = track
             },
+            addToPlaylist: {
+                playlistTrack = track
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -886,6 +916,7 @@ private struct LibraryTrackRow: View {
     let showInfo: () -> Void
     let trim: () -> Void
     let edit: () -> Void
+    let addToPlaylist: () -> Void
     let delete: () -> Void
 
     var body: some View {
@@ -945,6 +976,10 @@ private struct LibraryTrackRow: View {
 
                     Button(action: edit) {
                         Label("Edit Song", systemImage: "pencil")
+                    }
+
+                    Button(action: addToPlaylist) {
+                        Label("Add to Playlist", systemImage: "text.badge.plus")
                     }
 
                     Button(role: .destructive) {
@@ -1637,7 +1672,7 @@ struct TrackDetailView: View {
                 if isChangingVideo,
                    libraryTracks.contains(where: {
                        $0 !== track && $0.youtubeVideoID == request.youtubeVideo.id
-                   }) {
+        }) {
                     return "This YouTube video is already represented by another Library track."
                 }
 
