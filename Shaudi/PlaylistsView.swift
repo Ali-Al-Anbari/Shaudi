@@ -21,10 +21,12 @@ struct PlaylistsView: View {
         NavigationStack {
             playlistList
             .navigationBarTitleDisplayMode(.inline)
-            .sheet(isPresented: $isShowingNewPlaylist) {
-                PlaylistNameEditor(
-                    title: "New Playlist",
-                    actionTitle: "Create"
+        }
+        .overlay {
+            if isShowingNewPlaylist {
+                ShaudiPlaylistNameModal(
+                    title: "Create Playlist",
+                    isPresented: $isShowingNewPlaylist
                 ) { name in
                     modelContext.insert(Playlist(name: name))
                 }
@@ -160,6 +162,246 @@ struct PlaylistNameEditor: View {
     }
 }
 
+struct ShaudiPlaylistNameModal: View {
+    let title: String
+    @Binding var isPresented: Bool
+    let onCreate: (String) -> Void
+
+    @State private var name = ""
+    @FocusState private var isNameFocused: Bool
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.48)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: dismiss)
+
+            VStack(alignment: .leading, spacing: 18) {
+                Text(title)
+                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
+                    .foregroundStyle(.white)
+
+                TextField("Playlist Name", text: $name)
+                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
+                    .textInputAutocapitalization(.words)
+                    .focused($isNameFocused)
+                    .padding(.horizontal, 14)
+                    .frame(minHeight: 46)
+                    .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 13))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 13)
+                            .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
+                    }
+
+                HStack {
+                    Button("Cancel", action: dismiss)
+                        .foregroundStyle(.white.opacity(0.76))
+
+                    Spacer()
+
+                    Button("Create") {
+                        guard !trimmedName.isEmpty else { return }
+                        onCreate(trimmedName)
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(trimmedName.isEmpty)
+                }
+                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
+            }
+            .padding(22)
+            .frame(maxWidth: 340)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+            .background(ShaudiTheme.lavender.opacity(0.18), in: RoundedRectangle(cornerRadius: 24))
+            .overlay {
+                RoundedRectangle(cornerRadius: 24)
+                    .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
+            }
+            .shadow(color: ShaudiTheme.accent.opacity(0.32), radius: 22, y: 8)
+            .padding(.horizontal, 28)
+            .contentShape(RoundedRectangle(cornerRadius: 24))
+            .onTapGesture {}
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        .onAppear { isNameFocused = true }
+    }
+
+    private func dismiss() {
+        isNameFocused = false
+        isPresented = false
+    }
+}
+
+struct ShaudiAddToPlaylistModal: View {
+    @Environment(\.modelContext) private var modelContext
+
+    @Query(sort: \Playlist.dateCreated, order: .reverse)
+    private var playlists: [Playlist]
+    @Query(sort: \Track.dateAdded, order: .reverse)
+    private var libraryTracks: [Track]
+
+    @Binding var isPresented: Bool
+    let transientTrack: Track?
+    let playableTrack: PlayableTrack?
+
+    @State private var isShowingNewPlaylist = false
+
+    init(
+        isPresented: Binding<Bool>,
+        transientTrack: Track? = nil,
+        playableTrack: PlayableTrack? = nil
+    ) {
+        _isPresented = isPresented
+        self.transientTrack = transientTrack
+        self.playableTrack = playableTrack
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.48)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture(perform: dismiss)
+
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Add to Playlist")
+                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
+                    .foregroundStyle(.white)
+
+                Button {
+                    isShowingNewPlaylist = true
+                } label: {
+                    Label("New Playlist", systemImage: "plus")
+                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body).weight(.semibold))
+                        .foregroundStyle(ShaudiTheme.accent)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+
+                if playlists.isEmpty {
+                    Text("Create a playlist to add this song.")
+                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                        .foregroundStyle(.white.opacity(0.72))
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(playlists) { playlist in
+                                Button {
+                                    addCurrentTrack(to: playlist)
+                                } label: {
+                                    HStack {
+                                        Text(playlist.name)
+                                            .foregroundStyle(.white)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Image(systemName: containsCurrentTrack(in: playlist)
+                                            ? "checkmark.circle.fill" : "plus.circle")
+                                            .foregroundStyle(ShaudiTheme.accent)
+                                    }
+                                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
+                                    .padding(.vertical, 8)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(containsCurrentTrack(in: playlist))
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 250)
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Done", action: dismiss)
+                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body).weight(.semibold))
+                        .foregroundStyle(ShaudiTheme.accent)
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: 340)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
+            .background(ShaudiTheme.lavender.opacity(0.18), in: RoundedRectangle(cornerRadius: 24))
+            .overlay {
+                RoundedRectangle(cornerRadius: 24)
+                    .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
+            }
+            .shadow(color: ShaudiTheme.accent.opacity(0.32), radius: 22, y: 8)
+            .padding(.horizontal, 28)
+            .contentShape(RoundedRectangle(cornerRadius: 24))
+            .onTapGesture {}
+
+            if isShowingNewPlaylist {
+                ShaudiPlaylistNameModal(
+                    title: "Create Playlist",
+                    isPresented: $isShowingNewPlaylist
+                ) { name in
+                    let playlist = Playlist(name: name)
+                    modelContext.insert(playlist)
+                    addCurrentTrack(to: playlist)
+                    dismiss()
+                }
+            }
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+    }
+
+    private var currentVideoID: String? {
+        let videoID = playableTrack?.youtubeVideoID
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? transientTrack?.youtubeVideoID ?? ""
+        return videoID.isEmpty ? nil : videoID
+    }
+
+    private func containsCurrentTrack(in playlist: Playlist) -> Bool {
+        guard let currentVideoID else { return false }
+        return playlist.tracks.contains { $0.youtubeVideoID == currentVideoID }
+    }
+
+    private func addCurrentTrack(to playlist: Playlist) {
+        guard !containsCurrentTrack(in: playlist), let track = persistentCurrentTrack() else {
+            return
+        }
+        playlist.tracks.append(track)
+        try? modelContext.save()
+    }
+
+    private func persistentCurrentTrack() -> Track? {
+        guard let currentVideoID else { return nil }
+        if let existing = libraryTracks.first(where: { $0.youtubeVideoID == currentVideoID }) {
+            return existing
+        }
+        if let transientTrack {
+            modelContext.insert(transientTrack)
+            return transientTrack
+        }
+        guard let playableTrack,
+              let url = URL(string: "https://www.youtube.com/watch?v=\(currentVideoID)") else {
+            return nil
+        }
+        let track = Track(
+            title: playableTrack.title,
+            youtubeURL: url,
+            youtubeVideoID: currentVideoID,
+            channelTitle: playableTrack.channelTitle,
+            thumbnailURL: playableTrack.thumbnailURL,
+            duration: playableTrack.duration,
+            metadataLastRefreshed: .now,
+            playbackStartTime: playableTrack.playbackStartTime,
+            playbackEndTime: playableTrack.playbackEndTime
+        )
+        modelContext.insert(track)
+        return track
+    }
+
+    private func dismiss() {
+        isShowingNewPlaylist = false
+        isPresented = false
+    }
+}
+
 struct PlaylistDetailView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
@@ -177,6 +419,7 @@ struct PlaylistDetailView: View {
     @State private var infoTrack: Track?
     @State private var editingTrack: Track?
     @State private var trimmingTrack: Track?
+    @State private var playlistTrack: Track?
 
     private let warmupTrackLimit = 10
 
@@ -440,6 +683,17 @@ struct PlaylistDetailView: View {
                 }
             }
         }
+        .overlay {
+            if let playlistTrack {
+                ShaudiAddToPlaylistModal(
+                    isPresented: Binding(
+                        get: { self.playlistTrack != nil },
+                        set: { if !$0 { self.playlistTrack = nil } }
+                    ),
+                    transientTrack: playlistTrack
+                )
+            }
+        }
     }
 
     private var playlistControlStrip: some View {
@@ -595,6 +849,12 @@ struct PlaylistDetailView: View {
                     editingTrack = track
                 } label: {
                     Label("Edit Song", systemImage: "pencil")
+                }
+
+                Button {
+                    playlistTrack = track
+                } label: {
+                    Label("Add to Playlist", systemImage: "text.badge.plus")
                 }
 
                 Button(role: .destructive) {

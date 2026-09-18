@@ -8,15 +8,6 @@ enum LoveLetterPolicy {
     nonisolated static let visibleDuration: TimeInterval = 5
 }
 
-enum LoveLetterPosition: CaseIterable, Hashable {
-    case upperLeft
-    case upperRight
-    case middleLeft
-    case middleRight
-    case lowerLeft
-    case lowerRight
-}
-
 enum LoveLetterScheduler {
     static let messages = [
         "you make ordinary days feel special",
@@ -62,10 +53,9 @@ enum LoveLetterScheduler {
 
     static func canSchedule(
         isEnabled: Bool,
-        isAppActive: Bool,
-        isSuppressed: Bool
+        isAppActive: Bool
     ) -> Bool {
-        isEnabled && isAppActive && !isSuppressed && !messages.isEmpty
+        isEnabled && isAppActive && !messages.isEmpty
     }
 }
 
@@ -74,22 +64,18 @@ final class AmbientLoveLetterCoordinator: ObservableObject {
     struct Letter: Identifiable {
         let id = UUID()
         let message: String
-        let position: LoveLetterPosition
     }
 
     @Published private(set) var visibleLetter: Letter?
     private(set) var isPresentationScheduled = false
 
     private var lastMessageIndex: Int?
-    private var lastPosition: LoveLetterPosition?
     private var pendingTask: Task<Void, Never>?
     private var dismissalTask: Task<Void, Never>?
     private var isEnabled = true
     private var isAppActive = true
-    private var isSuppressed = false
     private let delayProvider: () -> TimeInterval
     private let messageIndexProvider: (Int) -> Int
-    private let positionIndexProvider: (Int) -> Int
     private let fadeDuration: TimeInterval
     private let visibleDuration: TimeInterval
 
@@ -98,26 +84,22 @@ final class AmbientLoveLetterCoordinator: ObservableObject {
             Double.random(in: LoveLetterPolicy.minimumDelay...LoveLetterPolicy.maximumDelay)
         },
         messageIndexProvider: @escaping (Int) -> Int = { Int.random(in: 0..<$0) },
-        positionIndexProvider: @escaping (Int) -> Int = { Int.random(in: 0..<$0) },
         fadeDuration: TimeInterval = LoveLetterPolicy.fadeDuration,
         visibleDuration: TimeInterval = LoveLetterPolicy.visibleDuration
     ) {
         self.delayProvider = delayProvider
         self.messageIndexProvider = messageIndexProvider
-        self.positionIndexProvider = positionIndexProvider
         self.fadeDuration = fadeDuration
         self.visibleDuration = visibleDuration
     }
 
-    func update(isEnabled: Bool, isAppActive: Bool, isSuppressed: Bool) {
+    func update(isEnabled: Bool, isAppActive: Bool) {
         self.isEnabled = isEnabled
         self.isAppActive = isAppActive
-        self.isSuppressed = isSuppressed
 
         guard LoveLetterScheduler.canSchedule(
             isEnabled: isEnabled,
-            isAppActive: isAppActive,
-            isSuppressed: isSuppressed
+            isAppActive: isAppActive
         ) else {
             cancelAndHide()
             return
@@ -134,8 +116,7 @@ final class AmbientLoveLetterCoordinator: ObservableObject {
             isPresentationScheduled,
             LoveLetterScheduler.canSchedule(
                 isEnabled: isEnabled,
-                isAppActive: isAppActive,
-                isSuppressed: isSuppressed
+                isAppActive: isAppActive
             ),
             let messageIndex = LoveLetterScheduler.nextMessageIndex(
                 count: LoveLetterScheduler.messages.count,
@@ -150,17 +131,10 @@ final class AmbientLoveLetterCoordinator: ObservableObject {
         pendingTask = nil
         isPresentationScheduled = false
         lastMessageIndex = messageIndex
-        let positions = LoveLetterPosition.allCases
-        var position = positions[positionIndexProvider(positions.count) % positions.count]
-        if positions.count > 1, position == lastPosition {
-            position = positions[(positions.firstIndex(of: position)! + 1) % positions.count]
-        }
-        lastPosition = position
 
         withAnimation(.easeInOut(duration: fadeDuration)) {
             visibleLetter = Letter(
-                message: LoveLetterScheduler.messages[messageIndex],
-                position: position
+                message: LoveLetterScheduler.messages[messageIndex]
             )
         }
 
@@ -218,25 +192,27 @@ final class AmbientLoveLetterCoordinator: ObservableObject {
 }
 
 struct AmbientLoveLetterOverlay: View {
+    @ObservedObject var coordinator: AmbientLoveLetterCoordinator
     let isEnabled: Bool
     let isAppActive: Bool
-    let isSuppressed: Bool
     let accentColor: Color
-
-    @StateObject private var coordinator = AmbientLoveLetterCoordinator()
 
     var body: some View {
         GeometryReader { proxy in
             if let letter = coordinator.visibleLetter {
-                Text(letter.message)
-                    .font(.custom("SnellRoundhand", size: 26, relativeTo: .title2))
-                    .foregroundStyle(accentColor.opacity(0.78))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .frame(width: min(230, proxy.size.width * 0.56))
-                    .shadow(color: .black.opacity(0.16), radius: 3, y: 1)
-                    .position(position(for: letter.position, in: proxy))
-                    .transition(.opacity)
+                VStack {
+                    loveLetterBanner(
+                        letter,
+                        maxWidth: min(340, proxy.size.width - 32)
+                    )
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.top, proxy.safeAreaInsets.top + 10)
+                .transition(.asymmetric(
+                    insertion: .move(edge: .top).combined(with: .opacity),
+                    removal: .move(edge: .top).combined(with: .opacity)
+                ))
             }
         }
         .allowsHitTesting(false)
@@ -244,35 +220,41 @@ struct AmbientLoveLetterOverlay: View {
         .onAppear(perform: refresh)
         .onChange(of: isEnabled) { _, _ in refresh() }
         .onChange(of: isAppActive) { _, _ in refresh() }
-        .onChange(of: isSuppressed) { _, _ in refresh() }
     }
 
     private func refresh() {
         coordinator.update(
             isEnabled: isEnabled,
-            isAppActive: isAppActive,
-            isSuppressed: isSuppressed
+            isAppActive: isAppActive
         )
     }
 
-    private func position(
-        for position: LoveLetterPosition,
-        in proxy: GeometryProxy
-    ) -> CGPoint {
-        let xInset = min(125, proxy.size.width * 0.28)
-        let top = proxy.safeAreaInsets.top + 105
-        let middle = proxy.size.height * 0.43
-        let lower = max(top + 80, proxy.size.height - 185)
-        let left = xInset
-        let right = proxy.size.width - xInset
+    private func loveLetterBanner(
+        _ letter: AmbientLoveLetterCoordinator.Letter,
+        maxWidth: CGFloat
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Love Letter", systemImage: "heart.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary.opacity(0.82))
 
-        switch position {
-        case .upperLeft: return CGPoint(x: left, y: top)
-        case .upperRight: return CGPoint(x: right, y: top)
-        case .middleLeft: return CGPoint(x: left, y: middle)
-        case .middleRight: return CGPoint(x: right, y: middle)
-        case .lowerLeft: return CGPoint(x: left, y: lower)
-        case .lowerRight: return CGPoint(x: right, y: lower)
+            Text(letter.message)
+                .font(.custom("SnellRoundhand", size: 23, relativeTo: .title3))
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+                .lineLimit(2)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: maxWidth, alignment: .leading)
+        .background(.ultraThinMaterial, in: .rect(cornerRadius: 20))
+        .background(accentColor.opacity(0.22), in: .rect(cornerRadius: 20))
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(accentColor.opacity(0.42), lineWidth: 1)
+        }
+        .shadow(color: accentColor.opacity(0.30), radius: 14, y: 5)
+        .shadow(color: .black.opacity(0.20), radius: 8, y: 3)
+        .padding(.horizontal, 16)
     }
 }

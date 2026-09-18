@@ -74,6 +74,7 @@ struct ContentView: View {
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
     @State private var selectedTab: RootTab = .library
     @State private var isShowingNowPlaying = false
+    @StateObject private var loveLetterCoordinator = AmbientLoveLetterCoordinator()
 
     var body: some View {
         ZStack {
@@ -108,15 +109,24 @@ struct ContentView: View {
             }
 
             AmbientLoveLetterOverlay(
+                coordinator: loveLetterCoordinator,
                 isEnabled: appearanceSettings.loveLettersEnabled,
                 isAppActive: scenePhase == .active,
-                isSuppressed: isShowingNowPlaying || playbackManager.isTrimPreviewActive,
                 accentColor: appearanceSettings.primaryColor
             )
         }
         .fullScreenCover(isPresented: $isShowingNowPlaying) {
-            NowPlayingView(playbackManager: playbackManager)
-                .presentationBackground(.clear)
+            ZStack {
+                NowPlayingView(playbackManager: playbackManager)
+
+                AmbientLoveLetterOverlay(
+                    coordinator: loveLetterCoordinator,
+                    isEnabled: appearanceSettings.loveLettersEnabled,
+                    isAppActive: scenePhase == .active,
+                    accentColor: appearanceSettings.primaryColor
+                )
+            }
+            .presentationBackground(.clear)
         }
         // This is the surface behind every tab and its NavigationStack.  Keeping it
         // safe-area-filling prevents transparent navigation regions from revealing
@@ -319,6 +329,15 @@ private struct MiniPlayerView: View {
         )
         .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
             resetMiniPlayerGesture()
+#if DEBUG
+            if let track = playbackManager.currentPlayableTrack {
+                let artist = playbackManager.currentTrack?.displayArtist ?? track.channelTitle ?? ""
+                let source = playbackManager.currentTrack?.displayArtist?.isEmpty == false
+                    ? "savedTrack"
+                    : "playableTrack"
+                print("[MiniPlayer] videoID=\(track.youtubeVideoID) title=\(track.title) artist=\(artist) artistSource=\(source)")
+            }
+#endif
         }
     }
 
@@ -350,7 +369,9 @@ private struct MiniPlayerView: View {
         }
         return PageContent(
             title: track.title,
-            artist: track.channelTitle,
+            // A saved Track can carry an explicit artist override. Prefer that
+            // display identity over the transient playback channel value.
+            artist: playbackManager.currentTrack?.displayArtist ?? track.channelTitle,
             thumbnailURL: track.thumbnailURL
         )
     }
@@ -380,21 +401,30 @@ private struct MiniPlayerView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(content.title)
-                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+                    .font(.custom("SnellRoundhand", size: 17, relativeTo: .headline))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
 
-                if let artist = content.artist, !artist.isEmpty {
+                if let artist = miniPlayerArtist(content.artist) {
                     Text(artist)
-                        .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                        .font(ShaudiTheme.bodyFont(size: 12, relativeTo: .caption))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .layoutPriority(1)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
 
             Spacer(minLength: 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func miniPlayerArtist(_ artist: String?) -> String? {
+        let trimmed = artist?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func artwork(thumbnailURL: URL?) -> some View {
@@ -653,11 +683,14 @@ private struct NowPlayingView: View {
             selection: $selectedCover,
             matching: .images
         )
-        .sheet(isPresented: $isShowingPlaylistPicker) {
-            NowPlayingPlaylistPicker(
-                transientTrack: currentTrack,
-                playableTrack: playbackManager.currentPlayableTrack
-            )
+        .overlay {
+            if isShowingPlaylistPicker {
+                ShaudiAddToPlaylistModal(
+                    isPresented: $isShowingPlaylistPicker,
+                    transientTrack: currentTrack,
+                    playableTrack: playbackManager.currentPlayableTrack
+                )
+            }
         }
         .onAppear {
             resetGestureState()
@@ -711,72 +744,72 @@ private struct NowPlayingView: View {
     }
 
     private var topBar: some View {
-        HStack {
-            Button {
-                dismiss()
-            } label: {
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 19, weight: .bold))
-                    .frame(width: 44, height: 44)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss Now Playing")
-            .nowPlayingControlRegion()
+        ZStack {
+            HStack {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 19, weight: .bold))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss Now Playing")
+                .nowPlayingControlRegion()
 
-            Spacer()
+                Spacer()
+
+                HStack(spacing: 0) {
+                    Button {
+                        isShowingPlaylistPicker = true
+                    } label: {
+                        Image(
+                            systemName: isCurrentTrackInAPlaylist
+                                ? "checkmark.rectangle.stack"
+                                : "plus.rectangle.on.folder"
+                        )
+                        .font(.system(size: 18, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(playbackManager.currentPlayableTrack == nil)
+                    .accessibilityLabel(
+                        isCurrentTrackInAPlaylist
+                            ? "Manage playlists"
+                            : "Add to playlist"
+                    )
+                    .nowPlayingControlRegion()
+
+                    Menu {
+                        Button {
+                            isShowingCoverPicker = true
+                        } label: {
+                            Label("Change Cover", systemImage: "photo.on.rectangle")
+                        }
+                        .disabled(currentTrack == nil)
+
+                        if customCoverMedia != nil {
+                            Button(role: .destructive) {
+                                removeCustomCover()
+                            } label: {
+                                Label("Remove Custom Cover", systemImage: "trash")
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 19, weight: .bold))
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Now Playing options")
+                    .nowPlayingControlRegion()
+                }
+            }
 
             Text("NOW PLAYING")
                 .font(ShaudiTheme.bodyFont(size: 13, relativeTo: .caption).weight(.semibold))
                 .tracking(1.4)
                 .foregroundStyle(.white.opacity(0.76))
-
-            Spacer()
-
-            HStack(spacing: 0) {
-                Button {
-                    isShowingPlaylistPicker = true
-                } label: {
-                    Image(
-                        systemName: isCurrentTrackInAPlaylist
-                            ? "checkmark.rectangle.stack"
-                            : "plus.rectangle.on.folder"
-                    )
-                    .font(.system(size: 18, weight: .semibold))
-                    .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .disabled(playbackManager.currentPlayableTrack == nil)
-                .accessibilityLabel(
-                    isCurrentTrackInAPlaylist
-                        ? "Manage playlists"
-                        : "Add to playlist"
-                )
-                .nowPlayingControlRegion()
-
-                Menu {
-                    Button {
-                        isShowingCoverPicker = true
-                    } label: {
-                        Label("Change Cover", systemImage: "photo.on.rectangle")
-                    }
-                    .disabled(currentTrack == nil)
-
-                    if customCoverMedia != nil {
-                        Button(role: .destructive) {
-                            removeCustomCover()
-                        } label: {
-                            Label("Remove Custom Cover", systemImage: "trash")
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 19, weight: .bold))
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Now Playing options")
-                .nowPlayingControlRegion()
-            }
         }
         .foregroundStyle(.white)
     }
@@ -1404,15 +1437,16 @@ private struct NowPlayingPlaylistPicker: View {
                     }
                 }
             }
-            .sheet(isPresented: $isShowingNewPlaylist) {
-                PlaylistNameEditor(
-                    title: "New Playlist",
-                    actionTitle: "Create"
-                ) { name in
-                    let playlist = Playlist(name: name)
-                    modelContext.insert(playlist)
-                    addCurrentTrack(to: playlist)
-                    isShowingNewPlaylist = false
+            .overlay {
+                if isShowingNewPlaylist {
+                    ShaudiPlaylistNameModal(
+                        title: "Create Playlist",
+                        isPresented: $isShowingNewPlaylist
+                    ) { name in
+                        let playlist = Playlist(name: name)
+                        modelContext.insert(playlist)
+                        addCurrentTrack(to: playlist)
+                    }
                 }
             }
         }
