@@ -98,7 +98,7 @@ final class PlaybackManager: ObservableObject {
     private let genreTagService = LastFMRecommendationService()
     private let genreLookupCoordinator = GenreLookupCoordinator()
 
-    enum PlaybackState {
+    enum PlaybackState: Equatable {
         case idle
         case resolving
         case loading
@@ -244,6 +244,8 @@ final class PlaybackManager: ObservableObject {
     private var timeControlStatusObservation: NSKeyValueObservation?
     private var nextItemStatusObservation: NSKeyValueObservation?
     private var playbackEndObserver: NSObjectProtocol?
+    private var playbackFailedToEndObserver: NSObjectProtocol?
+    private var playbackStalledObserver: NSObjectProtocol?
     private var playbackBoundaryObserver: Any?
     private var trimPreviewTimeObserver: (player: AVPlayer, token: Any)?
     private var listeningCheckpointObserver: (player: AVPlayer, token: Any)?
@@ -262,6 +264,21 @@ final class PlaybackManager: ObservableObject {
     private var personalizationProfileNeedsRefresh = true
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
+
+    struct InterruptionContext: Equatable {
+        let requestID: UUID
+        var wasPlaying: Bool
+    }
+    private(set) var activeInterruptionContext: InterruptionContext?
+
+    var isAudioInterrupted: Bool {
+        activeInterruptionContext != nil
+    }
+
+    var wasPlayingBeforeInterruption: Bool {
+        activeInterruptionContext?.wasPlaying == true
+    }
+
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
     private var pendingTrimPreviewStartTime: (track: Track, time: TimeInterval)?
     private var suspendedPlaybackContext: SuspendedPlaybackContext?
@@ -292,11 +309,33 @@ final class PlaybackManager: ObservableObject {
     private var artworkTask: Task<Void, Never>?
     private var cachedArtworkURL: URL?
     private var cachedArtwork: MPMediaItemArtwork?
+    private var audioSessionInterruptionObserver: NSObjectProtocol?
+    private var audioSessionRouteChangeObserver: NSObjectProtocol?
+    private var audioSessionResetObserver: NSObjectProtocol?
+    private var audioSessionLostObserver: NSObjectProtocol?
 #endif
 
     init() {
 #if os(iOS)
         configureRemoteCommands()
+        configureAudioSessionDiagnostics()
+#endif
+    }
+
+    deinit {
+#if os(iOS)
+        if let audioSessionInterruptionObserver {
+            NotificationCenter.default.removeObserver(audioSessionInterruptionObserver)
+        }
+        if let audioSessionRouteChangeObserver {
+            NotificationCenter.default.removeObserver(audioSessionRouteChangeObserver)
+        }
+        if let audioSessionResetObserver {
+            NotificationCenter.default.removeObserver(audioSessionResetObserver)
+        }
+        if let audioSessionLostObserver {
+            NotificationCenter.default.removeObserver(audioSessionLostObserver)
+        }
 #endif
     }
 
@@ -1137,10 +1176,12 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func advanceToNextTrack(reason: PlaybackAdvanceReason) {
+        advanceLog("advanceToNextTrack(reason: \(reason.logLabel)) requested, currentIndex=\(String(describing: currentIndex)), queueCount=\(queue.count), manualQueueCount=\(manualQueueCount)")
         guard
             let currentIndex,
             let nextIndex = nextQueueIndex(after: currentIndex)
         else {
+            advanceLog("advanceToNextTrack aborted: currentIndex=\(String(describing: currentIndex)), nextQueueIndex=\(String(describing: currentIndex.flatMap { nextQueueIndex(after: $0) }))")
             return
         }
 
@@ -1164,6 +1205,7 @@ final class PlaybackManager: ObservableObject {
             manualQueueCount -= 1
             queueLog("manualQueueCount consumed=1 remaining=\(manualQueueCount)")
         }
+        advanceLog("advancing from index=\(currentIndex) to index=\(nextIndex) (\(videoID)), preparedPlayback=\(preparedPlayback != nil)")
         self.currentIndex = nextIndex
         pendingListeningHistoryOutcome = reason.historyOutcome
 #if os(iOS)
@@ -1345,6 +1387,7 @@ final class PlaybackManager: ObservableObject {
         activeRequestID = requestID
         currentTrack = persistentTrack
         currentPlayableTrack = playableTrack
+        lifecycleLog("startPlaybackContext videoID=\(videoID) title=\"\(playableTrack.title)\" origin=\(String(describing: playbackOrigin)) duration=\(playableTrack.duration.map { "\($0)s" } ?? "nil") requestID=\(requestID)")
 #if os(iOS)
         if !isTrimPreviewActive {
             publishNowPlaying(playableTrack, requestID: requestID)
@@ -1447,6 +1490,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     func pause() {
+        activeInterruptionContext = nil
+
         if isTrimPreviewActive {
             pauseActiveTrimPreview()
             return
@@ -1701,6 +1746,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     func resume() {
+        activeInterruptionContext = nil
+
         if isTrimPreviewActive {
             guard let track = trimPreviewRange?.track else {
                 return
@@ -1764,6 +1811,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     func stop() {
+        activeInterruptionContext = nil
+        lifecycleLog("stop called: currentIndex=\(String(describing: currentIndex)), queueCount=\(queue.count), origin=\(String(describing: playbackOrigin))")
         if isTrimPreviewActive {
             endActiveTrimPreviewIfNeeded()
             return
@@ -2963,6 +3012,8 @@ final class PlaybackManager: ObservableObject {
         playbackRange: EffectivePlaybackRange,
         playbackStartTime: TimeInterval
     ) {
+        lifecycleLog("startPlayback with item videoID=\(videoID) requestID=\(requestID) cachedStream=\(usedCachedStream) range=\(playbackRange.startTime)...\(playbackRange.endTime.map { "\($0)s" } ?? "nil")")
+
         guard isActive(requestID) else {
             return
         }
@@ -3010,7 +3061,48 @@ final class PlaybackManager: ObservableObject {
                     return
                 }
 
+                let currentPos = self.player?.currentTime().seconds ?? -1
+                let dur = item.duration.seconds
+                self.endLog("AVPlayerItemDidPlayToEndTime fired for request=\(requestID) itemCurrentTime=\(currentPos)s itemDuration=\(dur)s isActive=\(self.isActive(requestID))")
                 self.handlePlaybackCompletion(for: item, requestID: requestID)
+            }
+        }
+
+        playbackFailedToEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [managerReference, itemReference] notification in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    let item = itemReference.value
+                else {
+                    return
+                }
+
+                let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+                let currentPos = self.player?.currentTime().seconds ?? -1
+                self.endLog("AVPlayerItemFailedToPlayToEndTime fired for request=\(requestID) error=\(String(describing: error?.localizedDescription)) itemCurrentTime=\(currentPos)s isActive=\(self.isActive(requestID))")
+            }
+        }
+
+        playbackStalledObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemPlaybackStalled,
+            object: item,
+            queue: .main
+        ) { [managerReference, itemReference] _ in
+            Task { @MainActor in
+                guard
+                    let self = managerReference.value,
+                    let item = itemReference.value
+                else {
+                    return
+                }
+
+                let currentPos = self.player?.currentTime().seconds ?? -1
+                let timeControl = self.player?.timeControlStatus.rawValue ?? -1
+                self.endLog("AVPlayerItemPlaybackStalled fired for request=\(requestID) itemCurrentTime=\(currentPos)s timeControlStatus=\(timeControl) isActive=\(self.isActive(requestID))")
             }
         }
 
@@ -3027,6 +3119,7 @@ final class PlaybackManager: ObservableObject {
 
                 switch item.status {
                 case .readyToPlay:
+                    self.lifecycleLog("itemStatus readyToPlay for \(videoID) requestID=\(requestID)")
                     self.logDurationDiagnostics(
                         for: item,
                         videoID: videoID,
@@ -3038,6 +3131,7 @@ final class PlaybackManager: ObservableObject {
 #endif
 
                 case .failed:
+                    self.lifecycleLog("itemStatus failed for \(videoID) error=\(String(describing: item.error?.localizedDescription)) requestID=\(requestID)")
                     self.handlePlayerFailure(
                         item,
                         videoID: videoID,
@@ -3047,6 +3141,7 @@ final class PlaybackManager: ObservableObject {
                     )
 
                 case .unknown:
+                    self.lifecycleLog("itemStatus unknown for \(videoID) requestID=\(requestID)")
                     break
 
                 @unknown default:
@@ -3066,12 +3161,24 @@ final class PlaybackManager: ObservableObject {
                     return
                 }
 
+                let statusName: String
+                switch player.timeControlStatus {
+                case .paused: statusName = "paused"
+                case .waitingToPlayAtSpecifiedRate: statusName = "waitingToPlay(\(player.reasonForWaitingToPlay?.rawValue ?? "none"))"
+                case .playing: statusName = "playing"
+                @unknown default: statusName = "unknown"
+                }
+                self.lifecycleLog("timeControlStatus=\(statusName) rate=\(player.rate) videoID=\(videoID) requestID=\(requestID)")
+
 #if os(iOS)
                 self.synchronizeNowPlayingPlaybackState()
 #endif
 
                 guard player.timeControlStatus == .playing else {
                     self.finishActiveListeningPeriod()
+                    if self.isAudioInterrupted {
+                        self.state = .paused
+                    }
                     return
                 }
 
@@ -3398,6 +3505,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handleRemotePauseCommand() -> MPRemoteCommandHandlerStatus {
+        activeInterruptionContext = nil
         guard !isTrimPreviewActive, currentPlayableTrack != nil else {
             return .noSuchContent
         }
@@ -3489,6 +3597,9 @@ final class PlaybackManager: ObservableObject {
         }
 
         let authoritativeDuration = validDuration(track.duration)
+        if authoritativeDuration == nil {
+            timingLog("effectivePlaybackRange: track \"\(track.title)\" (\(track.youtubeVideoID)) has nil or invalid duration: \(String(describing: track.duration))")
+        }
         let fullTrackRange = EffectivePlaybackRange(startTime: 0, endTime: authoritativeDuration)
         guard let authoritativeDuration else {
             return fullTrackRange
@@ -3626,6 +3737,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
+        timingLog("installing boundary observer at \(effectiveEndTime)s for request=\(requestID)")
         let managerReference = WeakReference(self)
         let itemReference = WeakReference(item)
         let boundaryTime = CMTime(seconds: effectiveEndTime, preferredTimescale: 600)
@@ -3641,6 +3753,8 @@ final class PlaybackManager: ObservableObject {
                     return
                 }
 
+                let currentPos = self.player?.currentTime().seconds ?? -1
+                self.endLog("boundary observer fired at \(effectiveEndTime)s for request=\(requestID) itemCurrentTime=\(currentPos)s isActive=\(self.isActive(requestID))")
                 self.handlePlaybackCompletion(for: item, requestID: requestID)
             }
         }
@@ -3724,24 +3838,30 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func handlePlaybackCompletion(for item: AVPlayerItem, requestID: UUID) {
+        endLog("handlePlaybackCompletion entered: requestID=\(requestID) isActive=\(isActive(requestID)) playerCurrentItemMatch=\(player?.currentItem === item)")
         guard isActive(requestID), player?.currentItem === item else {
+            endLog("handlePlaybackCompletion dropped: isActive=\(isActive(requestID)), currentItemMatch=\(player?.currentItem === item)")
             return
         }
 
         if isTrimPreviewActive {
+            lifecycleLog("pausing active trim preview at end")
             pauseActiveTrimPreview(atEnd: true)
             return
         }
 
         if repeatMode == .one {
+            advanceLog("repeatMode == .one, restarting current playback")
             queueLog("repeating current track")
             restartCurrentPlayback()
             return
         }
 
+        advanceLog("handlePlaybackCompletion checking advance: hasNextTrack=\(hasNextTrack), currentIndex=\(String(describing: currentIndex)), queueCount=\(queue.count), origin=\(String(describing: playbackOrigin))")
         if hasNextTrack {
             advanceToNextTrack(reason: .naturalCompletion)
         } else {
+            advanceLog("final item completed (hasNextTrack=false); stopping playback")
             log("Final item completed; stopping playback")
             pendingListeningHistoryOutcome = .naturalCompletion
             stop()
@@ -3769,6 +3889,13 @@ final class PlaybackManager: ObservableObject {
             }
 
             let assetDuration = assetTime.flatMap { self.validDuration($0.seconds) }
+            self.timingLog(
+                "Duration diagnostics for \(videoID): "
+                    + "Track.duration=\(self.durationDescription(trackDuration)), "
+                    + "AVPlayerItem.duration=\(self.durationDescription(itemDuration)), "
+                    + "asset.duration=\(self.durationDescription(assetDuration)), "
+                    + "seekableTimeRanges=\(seekableRanges)"
+            )
             log(
                 "Duration diagnostics for \(videoID): "
                     + "Track.duration=\(durationDescription(trackDuration)), "
@@ -3782,10 +3909,15 @@ final class PlaybackManager: ObservableObject {
                 let itemDuration,
                 abs(itemDuration - trackDuration) > 2
             {
+                self.timingLog(
+                    "Duration mismatch for \(videoID): Track.duration=\(self.durationDescription(trackDuration)) vs AVPlayerItem.duration=\(self.durationDescription(itemDuration))"
+                )
                 log(
                     "Duration mismatch for \(videoID); using Track.duration "
                         + "\(durationDescription(trackDuration)) as the playback boundary"
                 )
+            } else if trackDuration == nil {
+                self.timingLog("Track.duration is nil for \(videoID), relying entirely on item duration (\(self.durationDescription(itemDuration)))")
             }
         }
     }
@@ -4842,13 +4974,90 @@ final class PlaybackManager: ObservableObject {
         try audioSession.setActive(true)
     }
 
+    func handleAudioSessionInterruption(
+        type: AVAudioSession.InterruptionType,
+        options: AVAudioSession.InterruptionOptions = []
+    ) {
+        switch type {
+        case .began:
+            let wasPlaying = (state == .playing) || (player?.timeControlStatus == .playing)
+            let rate = player?.rate ?? 0
+            let timeControl = player?.timeControlStatus.rawValue ?? -1
+            let currentVideo = currentPlayableTrack?.youtubeVideoID ?? "none"
+
+            interruptionLog("type=began currentTrack=\(currentVideo) playerRate=\(rate) timeControlStatus=\(timeControl) managerState=\(state) wasPlaying=\(wasPlaying)")
+
+            if let activeRequestID {
+                activeInterruptionContext = InterruptionContext(
+                    requestID: activeRequestID,
+                    wasPlaying: wasPlaying
+                )
+            } else {
+                activeInterruptionContext = nil
+            }
+
+            finishActiveListeningPeriod()
+            state = .paused
+#if os(iOS)
+            synchronizeNowPlayingPlaybackState()
+#endif
+
+        case .ended:
+            let shouldResume = options.contains(.shouldResume)
+            let rate = player?.rate ?? 0
+            let timeControl = player?.timeControlStatus.rawValue ?? -1
+            let currentVideo = currentPlayableTrack?.youtubeVideoID ?? "none"
+
+            interruptionLog("type=ended shouldResume=\(shouldResume) currentTrack=\(currentVideo) playerRate=\(rate) timeControlStatus=\(timeControl) managerState=\(state) context=\(String(describing: activeInterruptionContext))")
+
+            guard
+                let context = activeInterruptionContext,
+                context.wasPlaying,
+                shouldResume,
+                let activeRequestID,
+                context.requestID == activeRequestID,
+                let player
+            else {
+                interruptionLog("Interruption ended without auto-resume (shouldResume=\(shouldResume), context=\(String(describing: activeInterruptionContext)), activeRequestID=\(String(describing: activeRequestID)))")
+                activeInterruptionContext = nil
+                return
+            }
+
+            activeInterruptionContext = nil
+
+            if let currentItem = player.currentItem, currentItem.status == .failed {
+                interruptionLog("Cannot resume: existing playerItem failed with error: \(String(describing: currentItem.error?.localizedDescription))")
+                state = .failed("Playback failed during audio interruption.")
+                return
+            }
+
+            do {
+                try activateAudioSession()
+                interruptionLog("Audio session reactivated successfully on interruption end")
+                state = .loading
+                player.play()
+#if os(iOS)
+                synchronizeNowPlayingPlaybackState()
+#endif
+                interruptionLog("player.play() invoked from current position \(player.currentTime().seconds)s")
+            } catch {
+                interruptionLog("Failed to reactivate audio session on interruption end: \(error.localizedDescription)")
+            }
+
+        @unknown default:
+            interruptionLog("type=unknown(\(type.rawValue))")
+        }
+    }
+
     private func invalidateCurrentRequest() {
         activeRequestID = nil
+        activeInterruptionContext = nil
         playbackTask?.cancel()
         playbackTask = nil
     }
 
     private func clearPlayer() {
+        lifecycleLog("clearPlayer called: activeRequestID=\(String(describing: activeRequestID)), hadPlayer=\(player != nil)")
         finishActiveListeningPeriod()
         if listeningHistoryRecorder?.finalize(
             requestID: activeRequestID,
@@ -4863,6 +5072,14 @@ final class PlaybackManager: ObservableObject {
         if let playbackEndObserver {
             NotificationCenter.default.removeObserver(playbackEndObserver)
             self.playbackEndObserver = nil
+        }
+        if let playbackFailedToEndObserver {
+            NotificationCenter.default.removeObserver(playbackFailedToEndObserver)
+            self.playbackFailedToEndObserver = nil
+        }
+        if let playbackStalledObserver {
+            NotificationCenter.default.removeObserver(playbackStalledObserver)
+            self.playbackStalledObserver = nil
         }
 
         itemStatusObservation = nil
@@ -4961,6 +5178,97 @@ final class PlaybackManager: ObservableObject {
         print("[Playback] \(message)")
     }
 
+#if DEBUG
+    private func lifecycleLog(_ message: String) {
+        print("[PlaybackLifecycle] \(message)")
+    }
+
+    private func endLog(_ message: String) {
+        print("[PlaybackEnd] \(message)")
+    }
+
+    private func timingLog(_ message: String) {
+        print("[PlaybackTiming] \(message)")
+    }
+
+    private func advanceLog(_ message: String) {
+        print("[PlaybackAdvance] \(message)")
+    }
+
+    private func interruptionLog(_ message: String) {
+        print("[AudioInterruption] \(message)")
+    }
+#else
+    private func lifecycleLog(_ message: String) {}
+    private func endLog(_ message: String) {}
+    private func timingLog(_ message: String) {}
+    private func advanceLog(_ message: String) {}
+    private func interruptionLog(_ message: String) {}
+#endif
+
+#if os(iOS)
+    private func configureAudioSessionDiagnostics() {
+        let center = NotificationCenter.default
+        let managerRef = WeakReference(self)
+
+        audioSessionInterruptionObserver = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [managerRef] notification in
+            Task { @MainActor in
+                guard let self = managerRef.value else { return }
+                guard let userInfo = notification.userInfo,
+                      let rawType = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      let type = AVAudioSession.InterruptionType(rawValue: rawType) else {
+                    self.interruptionLog("interruption notification without valid type: \(String(describing: notification.userInfo))")
+                    return
+                }
+
+                let rawOptions = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                let options = AVAudioSession.InterruptionOptions(rawValue: rawOptions)
+                self.handleAudioSessionInterruption(type: type, options: options)
+            }
+        }
+
+        audioSessionRouteChangeObserver = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [managerRef] notification in
+            Task { @MainActor in
+                guard let self = managerRef.value else { return }
+                let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+                let reason = AVAudioSession.RouteChangeReason(rawValue: rawReason)
+                let currentRoute = AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portName).joined(separator: ", ")
+                self.interruptionLog("routeChange reason=\(String(describing: reason)) currentOutputs=[\(currentRoute)] playerRate=\(self.player?.rate ?? 0)")
+            }
+        }
+
+        audioSessionResetObserver = center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [managerRef] _ in
+            Task { @MainActor in
+                guard let self = managerRef.value else { return }
+                self.interruptionLog("mediaServicesWereReset received (media server restarted)")
+            }
+        }
+
+        audioSessionLostObserver = center.addObserver(
+            forName: AVAudioSession.mediaServicesWereLostNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [managerRef] _ in
+            Task { @MainActor in
+                guard let self = managerRef.value else { return }
+                self.interruptionLog("mediaServicesWereLost received (media server terminated)")
+            }
+        }
+    }
+#endif
+
     private func dashboardLog(_ message: String) {
 #if DEBUG
         print("[DashboardWarmup] \(message)")
@@ -5022,6 +5330,27 @@ final class PlaybackManager: ObservableObject {
         currentTrack = nil
         currentPlayableTrack = track
         playbackOrigin = .search
+    }
+
+    func seedInterruptionStateForTesting(
+        state: PlaybackState,
+        requestID: UUID = UUID(),
+        wasPlayingBeforeInterruption: Bool? = nil,
+        player: AVPlayer? = nil
+    ) {
+        self.state = state
+        self.activeRequestID = requestID
+        if let wasPlayingBeforeInterruption {
+            self.activeInterruptionContext = InterruptionContext(
+                requestID: requestID,
+                wasPlaying: wasPlayingBeforeInterruption
+            )
+        } else {
+            self.activeInterruptionContext = nil
+        }
+        if let player {
+            self.player = player
+        }
     }
 #endif
 
