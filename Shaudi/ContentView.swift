@@ -750,20 +750,18 @@ private struct NowPlayingView: View {
     private var topBar: some View {
         ZStack {
             HStack {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 19, weight: .bold))
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Dismiss Now Playing")
-                .nowPlayingControlRegion()
-
-                Spacer()
-
                 HStack(spacing: 0) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 19, weight: .bold))
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss Now Playing")
+                    .nowPlayingControlRegion()
+
                     Button {
                         isShowingPlaylistPicker = true
                     } label: {
@@ -783,7 +781,11 @@ private struct NowPlayingView: View {
                             : "Add to playlist"
                     )
                     .nowPlayingControlRegion()
+                }
 
+                Spacer()
+
+                HStack(spacing: 0) {
                     Button {
                         isShowingQueue = true
                     } label: {
