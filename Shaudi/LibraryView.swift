@@ -454,7 +454,7 @@ struct LibraryView: View {
     }
 
     private func playlistCard(_ playlist: Playlist) -> some View {
-        VStack(alignment: .leading, spacing: playlistArtworkTitleSpacing) {
+        VStack(alignment: .center, spacing: playlistArtworkTitleSpacing) {
             playlistArtwork(playlist)
                 .aspectRatio(1, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -464,14 +464,15 @@ struct LibraryView: View {
                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .multilineTextAlignment(.center)
                 .frame(
                     maxWidth: .infinity,
                     minHeight: playlistTitleHeight,
                     maxHeight: playlistTitleHeight,
-                    alignment: .topLeading
+                    alignment: .top
                 )
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
         .clipped()
     }
 
@@ -1184,6 +1185,7 @@ struct PlaylistArtworkView: View {
                 image: image,
                 showsFirstFrameOnly: reduceMotion
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -1216,6 +1218,17 @@ private struct AnimatedPlaylistCoverImage: UIViewRepresentable {
         } else {
             imageView.startAnimating()
         }
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: UIImageView,
+        context: Context
+    ) -> CGSize {
+        CGSize(
+            width: proposal.width ?? image.size.width,
+            height: proposal.height ?? image.size.height
+        )
     }
 
     static func dismantleUIView(_ imageView: UIImageView, coordinator: ()) {
