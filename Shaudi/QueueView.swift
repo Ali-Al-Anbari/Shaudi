@@ -49,7 +49,8 @@ struct QueueView: View {
                         title: current.title,
                         artist: current.channelTitle,
                         thumbnailURL: current.thumbnailURL,
-                        isCurrentTrack: true
+                        isCurrentTrack: true,
+                        feedbackIdentity: playbackManager.currentRecommendationIdentity
                     )
                     .listRowBackground(ShaudiTheme.accent.opacity(0.14))
                 }
@@ -64,7 +65,8 @@ struct QueueView: View {
                             title: track.displayTitle,
                             artist: track.displayArtist,
                             thumbnailURL: track.thumbnailURL,
-                            isCurrentTrack: false
+                            isCurrentTrack: false,
+                            feedbackIdentity: playbackManager.recommendationIdentity(for: track)
                         )
                         .contentShape(Rectangle())
                         .onTapGesture {
@@ -103,7 +105,8 @@ struct QueueView: View {
         title: String,
         artist: String?,
         thumbnailURL: URL?,
-        isCurrentTrack: Bool
+        isCurrentTrack: Bool,
+        feedbackIdentity: SongIdentity?
     ) -> some View {
         HStack(spacing: 12) {
             artwork(thumbnailURL: thumbnailURL)
@@ -132,6 +135,23 @@ struct QueueView: View {
                 Image(systemName: "speaker.wave.2.fill")
                     .font(.caption)
                     .foregroundStyle(ShaudiTheme.accent)
+            }
+
+            if let feedbackIdentity {
+                Menu {
+                    RecommendationFeedbackButtons(identity: feedbackIdentity) { action in
+                        playbackManager.recordRecommendationFeedback(
+                            action,
+                            for: feedbackIdentity
+                        )
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.headline)
+                        .frame(width: 36, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Recommendation feedback")
             }
         }
         .padding(.vertical, 4)
@@ -163,5 +183,30 @@ struct QueueView: View {
             .font(.headline)
             .foregroundStyle(ShaudiTheme.accent)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct RecommendationFeedbackButtons: View {
+    let identity: SongIdentity
+    let action: (RecommendationFeedbackAction) -> Void
+
+    var body: some View {
+        Button {
+            action(.moreLikeThis)
+        } label: {
+            Label("More Like This", systemImage: "hand.thumbsup")
+        }
+
+        Button {
+            action(.lessLikeThis)
+        } label: {
+            Label("Less Like This", systemImage: "hand.thumbsdown")
+        }
+
+        Button(role: .destructive) {
+            action(.dontRecommendArtist)
+        } label: {
+            Label("Don't Recommend This Artist", systemImage: "person.crop.circle.badge.xmark")
+        }
     }
 }

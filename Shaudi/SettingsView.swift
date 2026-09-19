@@ -4,8 +4,10 @@ import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
+    @StateObject private var recommendationFeedback = RecommendationFeedbackStore.shared
 
     @State private var isShowingResetConfirmation = false
+    @State private var isShowingFeedbackResetConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -74,6 +76,49 @@ struct SettingsView: View {
                         }
                     }
 
+                    settingsSection("Recommendation Preferences") {
+                        Text("Don't Recommend Artists")
+                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+
+                        if recommendationFeedback.snapshot.excludedArtistNames.isEmpty {
+                            Text("No excluded artists.")
+                                .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+                        } else {
+                            ForEach(
+                                recommendationFeedback.snapshot.excludedArtistNames,
+                                id: \.self
+                            ) { artist in
+                                HStack {
+                                    Text(artist)
+                                        .lineLimit(1)
+
+                                    Spacer(minLength: 12)
+
+                                    Button(role: .destructive) {
+                                        recommendationFeedback.removeExcludedArtist(artist)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .frame(width: 32, height: 32)
+                                    }
+                                    .accessibilityLabel("Allow recommendations by \(artist)")
+                                }
+                            }
+
+                            Divider()
+
+                            Button("Clear Don't Recommend Artists", role: .destructive) {
+                                recommendationFeedback.clearExcludedArtists()
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Reset Recommendation Feedback", role: .destructive) {
+                            isShowingFeedbackResetConfirmation = true
+                        }
+                        .disabled(recommendationFeedback.snapshot.isEmpty)
+                    }
+
                     Button("Restore Default Appearance", role: .destructive) {
                         isShowingResetConfirmation = true
                     }
@@ -97,6 +142,17 @@ struct SettingsView: View {
                 }
             } message: {
                 Text("This resets your primary and secondary fonts and colors to their defaults.")
+            }
+            .confirmationDialog(
+                "Reset Recommendation Feedback?",
+                isPresented: $isShowingFeedbackResetConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Feedback", role: .destructive) {
+                    recommendationFeedback.clearAll()
+                }
+            } message: {
+                Text("This clears More Like This, Less Like This, and all excluded artists.")
             }
         }
         .tint(appearanceSettings.primaryColor)

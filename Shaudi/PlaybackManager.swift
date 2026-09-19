@@ -92,6 +92,7 @@ final class PlaybackManager: ObservableObject {
     private let recommendationHistoryLimit = RecommendationRadioPolicy.historyQueueLimit
     private let recommendationUpcomingWatermark = RecommendationRadioPolicy.targetUpcomingCount
     private let recommendationService = RecommendationService()
+    private let recommendationFeedbackStore = RecommendationFeedbackStore.shared
     private let metadataClient = YouTubeMetadataClient()
     private let genreTagService = LastFMRecommendationService()
     private let genreLookupCoordinator = GenreLookupCoordinator()
@@ -1052,6 +1053,40 @@ final class PlaybackManager: ObservableObject {
             return []
         }
         return Array(queue[nextIdx...])
+    }
+
+    var currentRecommendationIdentity: SongIdentity? {
+        guard
+            playbackOrigin == .recommendations,
+            let videoID = currentPlayableTrack?.youtubeVideoID
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        else {
+            return nil
+        }
+        return recommendationTransportMetadata[videoID]?.canonicalIdentity
+    }
+
+    func recommendationIdentity(for track: Track) -> SongIdentity? {
+        let videoID = normalizedVideoID(track.youtubeVideoID)
+        return recommendationTransportMetadata[videoID]?.canonicalIdentity
+    }
+
+    func recordRecommendationFeedback(
+        _ action: RecommendationFeedbackAction,
+        for identity: SongIdentity
+    ) {
+        recommendationFeedbackStore.record(action, identity: identity)
+
+        switch action {
+        case .moreLikeThis:
+            return
+        case .lessLikeThis:
+            removeUpcomingAutomaticRecommendations { $0 == identity }
+        case .dontRecommendArtist:
+            removeUpcomingAutomaticRecommendations {
+                SongNormalization.text($0.artist) == SongNormalization.text(identity.artist)
+            }
+        }
     }
 
     func previousTrack() {
@@ -4427,6 +4462,8 @@ final class PlaybackManager: ObservableObject {
             let videoID = normalizedVideoID(result.youtubeResult.youtubeVideoID)
             guard
                 !videoID.isEmpty,
+                recommendationFeedbackStore.snapshot
+                    .allowsAutomaticRecommendation(result.songIdentity),
                 !recommendationSeenVideoIDs.contains(videoID),
                 !recommendationSeenSongIdentities.contains(result.songIdentity)
             else {
@@ -4502,6 +4539,55 @@ final class PlaybackManager: ObservableObject {
         recommendationLog("queue after=\(queue.count)")
         recommendationLog("hasNextTrack=\(hasNextTrack)")
         recommendationLog("upcomingCount=\(recommendationUpcomingCount)")
+    }
+
+    private func removeUpcomingAutomaticRecommendations(
+        where shouldRemove: (SongIdentity) -> Bool
+    ) {
+        guard let currentIndex, queue.indices.contains(currentIndex) else {
+            return
+        }
+
+        let history = Array(queue[...currentIndex])
+        let upcoming = currentIndex + 1 < queue.endIndex
+            ? Array(queue[(currentIndex + 1)...])
+            : []
+        let clampedManualCount = min(manualQueueCount, upcoming.count)
+        let retainedUpcoming = upcoming.enumerated().compactMap { offset, track -> Track? in
+            guard offset >= clampedManualCount else {
+                return track
+            }
+            let videoID = normalizedVideoID(track.youtubeVideoID)
+            guard let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity else {
+                return track
+            }
+            return shouldRemove(identity) ? nil : track
+        }
+        guard retainedUpcoming.count != upcoming.count else {
+            return
+        }
+
+        queue = history + retainedUpcoming
+        self.currentIndex = history.count - 1
+        let retainedVideoIDs = Set(queue.map { normalizedVideoID($0.youtubeVideoID) })
+        recommendationTransportMetadata = recommendationTransportMetadata.filter {
+            retainedVideoIDs.contains($0.key)
+        }
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        refreshQueuePredictionsAfterMutation()
+
+        if
+            let radioSession = recommendationRadioSession,
+            let seed = currentPlayableTrack
+        {
+            beginRecommendationReservoirRefill(
+                sessionID: radioSession.id,
+                epochID: radioSession.epoch.id,
+                seed: seed
+            )
+        }
     }
 
     private func recordSeenRecommendationVideoID(_ videoID: String) {
@@ -4854,6 +4940,35 @@ final class PlaybackManager: ObservableObject {
         if tracks.indices.contains(currentIndex) {
             self.currentPlayableTrack = PlayableTrack(track: tracks[currentIndex])
         }
+    }
+
+    func seedRecommendationQueueForTesting(
+        tracks: [Track],
+        currentIndex: Int,
+        manualQueueCount: Int = 0,
+        identitiesByVideoID: [String: SongIdentity]
+    ) {
+        seedQueueForTesting(
+            tracks: tracks,
+            currentIndex: currentIndex,
+            manualQueueCount: manualQueueCount
+        )
+        playbackOrigin = .recommendations
+        recommendationTransportMetadata = identitiesByVideoID.mapValues { identity in
+            RecommendationTransportMetadata(
+                canonicalIdentity: identity,
+                youtubeTitle: identity.title,
+                youtubeChannel: identity.artist
+            )
+        }
+    }
+
+    func seedManualSearchForTesting(_ track: PlayableTrack) {
+        queue = []
+        currentIndex = nil
+        currentTrack = nil
+        currentPlayableTrack = track
+        playbackOrigin = .search
     }
 #endif
 

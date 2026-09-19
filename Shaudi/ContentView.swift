@@ -798,6 +798,17 @@ private struct NowPlayingView: View {
                     .nowPlayingControlRegion()
 
                     Menu {
+                        if let identity = playbackManager.currentRecommendationIdentity {
+                            RecommendationFeedbackButtons(identity: identity) { action in
+                                playbackManager.recordRecommendationFeedback(
+                                    action,
+                                    for: identity
+                                )
+                            }
+
+                            Divider()
+                        }
+
                         Button {
                             isShowingCoverPicker = true
                         } label: {

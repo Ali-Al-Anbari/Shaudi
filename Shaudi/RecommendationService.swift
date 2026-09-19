@@ -550,10 +550,7 @@ struct RecommendationService {
     struct RankedSong {
         let track: LastFMSimilarTrack
         let identity: RecommendationSongIdentity
-
-        var score: Double {
-            track.match
-        }
+        let score: Double
     }
 
     private struct RankedYouTubeResult {
@@ -577,6 +574,7 @@ struct RecommendationService {
     private let topTracksOperation: TopTracksOperation
     private let videoResolver: YouTubeRecommendationResolver
     private let resolutionCache: any YouTubeResolutionCaching
+    private let feedbackStore: RecommendationFeedbackStore
     private let resultLimit = RecommendationRadioPolicy.targetUpcomingCount
     private let candidatePoolLimit = RecommendationRadioPolicy.candidatePoolSize
     private let youtubeResolutionLimit = 12
@@ -584,6 +582,10 @@ struct RecommendationService {
     private let topTrackAnchorLimit = 10
 
     init() {
+        self.init(feedbackStore: .shared)
+    }
+
+    init(feedbackStore: RecommendationFeedbackStore) {
         let lastFMService = LastFMRecommendationService()
         similarTracksOperation = { artist, title, limit, isFallback in
             try await lastFMService.similarTracks(
@@ -598,6 +600,7 @@ struct RecommendationService {
         }
         videoResolver = YouTubeRecommendationResolver()
         resolutionCache = PersistentYouTubeResolutionCache.shared
+        self.feedbackStore = feedbackStore
     }
 
     init(
@@ -610,12 +613,33 @@ struct RecommendationService {
         videoResolver: YouTubeRecommendationResolver,
         resolutionCache: any YouTubeResolutionCaching
     ) {
+        self.init(
+            similarTracks: similarTracks,
+            topTracks: topTracks,
+            videoResolver: videoResolver,
+            resolutionCache: resolutionCache,
+            feedbackStore: .shared
+        )
+    }
+
+    init(
+        similarTracks: @escaping (
+            _ artist: String,
+            _ title: String,
+            _ limit: Int
+        ) async throws -> [LastFMSimilarTrack],
+        topTracks: @escaping TopTracksOperation = { _, _ in [] },
+        videoResolver: YouTubeRecommendationResolver,
+        resolutionCache: any YouTubeResolutionCaching,
+        feedbackStore: RecommendationFeedbackStore
+    ) {
         similarTracksOperation = { artist, title, limit, _ in
             try await similarTracks(artist, title, limit)
         }
         topTracksOperation = topTracks
         self.videoResolver = videoResolver
         self.resolutionCache = resolutionCache
+        self.feedbackStore = feedbackStore
     }
 
     func recommendations(
@@ -795,6 +819,7 @@ struct RecommendationService {
                 exhaustedCurrentPaths: false
             )
         }
+        let candidates = personalizedCandidates(candidates)
         var resolved: [ResolvedRecommendation] = []
         var fallbackCandidates: [LastFMSimilarTrack] = []
         var deferredCandidates: [LastFMSimilarTrack] = []
@@ -1140,6 +1165,7 @@ struct RecommendationService {
         seen.insert(seedIdentity)
         var versionSurvivorCount = 0
         var filtered: [RankedSong] = []
+        let feedback = feedbackStore.snapshot
 
         for track in candidates {
             let artist = SongNormalization.humanReadable(track.artist)
@@ -1149,6 +1175,10 @@ struct RecommendationService {
             let identity = RecommendationSongIdentity(artist: artist, title: title)
             guard !artist.isEmpty, !title.isEmpty else {
                 recommendationLog("rejected missing artist/title")
+                continue
+            }
+            guard feedback.allowsAutomaticRecommendation(identity) else {
+                recommendationLog("rejected excluded artist=\(artist)")
                 continue
             }
             guard !isAlternateVersion(title, identity: identity, existing: seen) else {
@@ -1171,7 +1201,8 @@ struct RecommendationService {
                     match: track.match,
                     url: track.url
                 ),
-                identity: identity
+                identity: identity,
+                score: track.match + feedback.scoreAdjustment(for: identity)
             ))
         }
 
@@ -1194,6 +1225,26 @@ struct RecommendationService {
             return lhs.identity.artist < rhs.identity.artist
         }
         return lhs.identity.title < rhs.identity.title
+    }
+
+    private func personalizedCandidates(
+        _ candidates: [LastFMSimilarTrack]
+    ) -> [LastFMSimilarTrack] {
+        let feedback = feedbackStore.snapshot
+        return candidates.compactMap { candidate -> RankedSong? in
+            let identity = SongIdentity(artist: candidate.artist, title: candidate.title)
+            guard feedback.allowsAutomaticRecommendation(identity) else {
+                recommendationLog("rejected excluded artist=\(identity.artist)")
+                return nil
+            }
+            return RankedSong(
+                track: candidate,
+                identity: identity,
+                score: candidate.match + feedback.scoreAdjustment(for: identity)
+            )
+        }
+        .sorted(by: rankedSongOrder)
+        .map(\.track)
     }
 
     private func isAlternateVersion(
@@ -1225,10 +1276,14 @@ struct RecommendationService {
         _ target: LastFMSimilarTrack,
         attempt: RecommendationYouTubeResolutionAttempt
     ) async throws -> RecommendationCandidateResolution {
+        let identity = SongIdentity(artist: target.artist, title: target.title)
+        guard feedbackStore.snapshot.allowsAutomaticRecommendation(identity) else {
+            recommendationLog("rejected excluded artist before resolution=\(identity.artist)")
+            return .candidateMiss
+        }
 #if DEBUG
         print("[YouTubeResolver] attempting=\(target.artist) - \(target.title)")
 #endif
-        let identity = SongIdentity(artist: target.artist, title: target.title)
         let cachedResult: YouTubeSearchResult?
         switch attempt {
         case .cacheOnly:
