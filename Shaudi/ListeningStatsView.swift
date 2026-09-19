@@ -9,6 +9,7 @@ struct ListeningStatsView: View {
     @Query private var recentHistory: [ListeningHistoryEntry]
     @Query(sort: \ListeningHistoryEntry.startedAt, order: .reverse)
     private var listeningHistory: [ListeningHistoryEntry]
+    @State private var isShowingWrapped = false
 
     init() {
         _recentHistory = Query(ListeningHistoryStats.recentDescriptor(limit: 5))
@@ -88,6 +89,8 @@ struct ListeningStatsView: View {
                     .foregroundStyle(ShaudiTheme.accent)
                     .accessibilityAddTraits(.isHeader)
 
+                wrappedEntry
+
                 summary
 
                 if hasListeningStats {
@@ -142,6 +145,60 @@ struct ListeningStatsView: View {
         .background(ShaudiTheme.dashboardBackground)
         .navigationBarTitleDisplayMode(.inline)
         .tint(appearanceSettings.primaryColor)
+        .fullScreenCover(isPresented: $isShowingWrapped) {
+            ShaudiWrappedView(entries: listeningHistory, tracks: tracks)
+        }
+    }
+
+    private var wrappedEntry: some View {
+        Button {
+            isShowingWrapped = true
+        } label: {
+            HStack(spacing: 16) {
+                ZStack {
+                    Circle()
+                        .fill(.white.opacity(0.13))
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 52, height: 52)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Shaudi Wrapped")
+                        .font(ShaudiTheme.scriptFont(size: 26, relativeTo: .title2))
+                        .foregroundStyle(.white)
+                    Text("Your listening story, made from real Shaudi history.")
+                        .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                        .foregroundStyle(.white.opacity(0.74))
+                        .multilineTextAlignment(.leading)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.70))
+            }
+            .padding(18)
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.37, green: 0.12, blue: 0.43),
+                        Color(red: 0.62, green: 0.17, blue: 0.38)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(.white.opacity(0.10), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Opens your listening recap")
     }
 
     private var recentlyPlayedSection: some View {
