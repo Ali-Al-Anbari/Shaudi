@@ -7,6 +7,7 @@ import PhotosUI
 import SwiftData
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct PlaylistsView: View {
     @Environment(\.modelContext) private var modelContext
@@ -415,6 +416,7 @@ struct PlaylistDetailView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingArtworkImage: UIImage?
     @State private var isShowingArtworkCropper = false
+    @State private var artworkErrorMessage: String?
     @State private var isPlaylistVisible = false
     @State private var infoTrack: Track?
     @State private var editingTrack: Track?
@@ -646,6 +648,14 @@ struct PlaylistDetailView: View {
                 } label: {
                     Label("Change Playlist Photo", systemImage: "photo")
                 }
+
+                if playlist.artworkID != nil {
+                    Button(role: .destructive) {
+                        removePlaylistArtwork()
+                    } label: {
+                        Label("Remove Playlist Photo", systemImage: "trash")
+                    }
+                }
             } label: {
                 Label("Playlist Actions", systemImage: "ellipsis.circle")
             }
@@ -657,6 +667,17 @@ struct PlaylistDetailView: View {
         )
         .onChange(of: selectedPhoto) { _, photo in
             prepareSelectedArtwork(photo)
+        }
+        .alert(
+            "Couldn’t Change Playlist Cover",
+            isPresented: Binding(
+                get: { artworkErrorMessage != nil },
+                set: { if !$0 { artworkErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(artworkErrorMessage ?? "Please choose a different image.")
         }
         .sheet(isPresented: $isShowingRename) {
             PlaylistNameEditor(
@@ -711,6 +732,11 @@ struct PlaylistDetailView: View {
             .disabled(!hasPlayableTrack)
             .opacity(hasPlayableTrack ? 1 : 0.45)
             .accessibilityLabel("Start Playlist")
+
+            PlaylistArtworkView(playlist: playlist)
+                .frame(width: 40, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .accessibilityHidden(true)
 
             Text(playlist.name)
                 .font(ShaudiTheme.scriptFont(size: 25, relativeTo: .title3))
@@ -961,24 +987,48 @@ struct PlaylistDetailView: View {
 
         Task { @MainActor in
             defer { self.selectedPhoto = nil }
-            guard
-                let data = try? await selectedPhoto.loadTransferable(type: Data.self),
-                let image = UIImage(data: data)
-            else {
+            guard let data = try? await selectedPhoto.loadTransferable(type: Data.self) else {
+                artworkErrorMessage = "The selected image could not be loaded."
                 return
             }
 
+            let declaresGIF = selectedPhoto.supportedContentTypes.contains {
+                $0.conforms(to: .gif)
+            }
+            if declaresGIF || ArtworkStorage.isGIFData(data) {
+                savePlaylistGIFArtwork(data)
+                return
+            }
+
+            guard let image = UIImage(data: data) else {
+                artworkErrorMessage = "The selected image format is not supported."
+                return
+            }
             editingArtworkImage = image
             isShowingArtworkCropper = true
         }
     }
 
     private func savePlaylistArtwork(_ image: UIImage) {
+        replacePlaylistArtwork { artworkID in
+            try ArtworkStorage.savePlaylistImage(image, for: artworkID)
+        }
+    }
+
+    private func savePlaylistGIFArtwork(_ data: Data) {
+        replacePlaylistArtwork { artworkID in
+            try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
+        }
+    }
+
+    private func replacePlaylistArtwork(
+        using save: (UUID) throws -> Void
+    ) {
         let previousArtworkID = playlist.artworkID
         let newArtworkID = UUID()
 
         do {
-            try ArtworkStorage.savePlaylistImage(image, for: newArtworkID)
+            try save(newArtworkID)
             playlist.artworkID = newArtworkID
 
             do {
@@ -993,9 +1043,25 @@ struct PlaylistDetailView: View {
                 ArtworkStorage.deletePlaylistImage(for: previousArtworkID)
             }
         } catch {
+            artworkErrorMessage = error.localizedDescription
 #if DEBUG
             print("[Artwork] Playlist save failed: \(error.localizedDescription)")
 #endif
+        }
+    }
+
+    private func removePlaylistArtwork() {
+        guard let artworkID = playlist.artworkID else {
+            return
+        }
+
+        playlist.artworkID = nil
+        do {
+            try modelContext.save()
+            ArtworkStorage.deletePlaylistImage(for: artworkID)
+        } catch {
+            playlist.artworkID = artworkID
+            artworkErrorMessage = error.localizedDescription
         }
     }
 }

@@ -1133,6 +1133,8 @@ struct ManualTrackAdditionView: View {
 }
 
 struct PlaylistArtworkView: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let playlist: Playlist
 
     var body: some View {
@@ -1142,11 +1144,9 @@ struct PlaylistArtworkView: View {
 
                 if
                     let artworkID = playlist.artworkID,
-                    let image = ArtworkStorage.playlistImage(for: artworkID)
+                    let cover = ArtworkStorage.playlistCover(for: artworkID)
                 {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
+                    playlistCover(cover)
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
                 } else if let thumbnailURL = playlist.tracksInPlaybackOrder
@@ -1172,10 +1172,55 @@ struct PlaylistArtworkView: View {
         }
     }
 
+    @ViewBuilder
+    private func playlistCover(_ cover: PlaylistCoverMedia) -> some View {
+        switch cover {
+        case .image(let image):
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+        case .animatedGIF(let image):
+            AnimatedPlaylistCoverImage(
+                image: image,
+                showsFirstFrameOnly: reduceMotion
+            )
+        }
+    }
+
     private var placeholder: some View {
         Image(systemName: "rectangle.stack.fill")
             .font(.title2)
             .foregroundStyle(ShaudiTheme.accent)
+    }
+}
+
+private struct AnimatedPlaylistCoverImage: UIViewRepresentable {
+    let image: UIImage
+    let showsFirstFrameOnly: Bool
+
+    func makeUIView(context: Context) -> UIImageView {
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFill
+        imageView.clipsToBounds = true
+        return imageView
+    }
+
+    func updateUIView(_ imageView: UIImageView, context: Context) {
+        let displayedImage = showsFirstFrameOnly ? (image.images?.first ?? image) : image
+        if imageView.image !== displayedImage {
+            imageView.image = displayedImage
+        }
+
+        if showsFirstFrameOnly {
+            imageView.stopAnimating()
+        } else {
+            imageView.startAnimating()
+        }
+    }
+
+    static func dismantleUIView(_ imageView: UIImageView, coordinator: ()) {
+        imageView.stopAnimating()
+        imageView.image = nil
     }
 }
 

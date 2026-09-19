@@ -6,6 +6,26 @@
 import Foundation
 import ImageIO
 import UIKit
+import UniformTypeIdentifiers
+
+enum PlaylistCoverMedia {
+    case image(UIImage)
+    case animatedGIF(UIImage)
+}
+
+enum ArtworkStorageError: LocalizedError {
+    case invalidGIF
+    case gifTooLarge(maximumMegabytes: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidGIF:
+            return "That GIF could not be read. Please choose a different file."
+        case .gifTooLarge(let maximumMegabytes):
+            return "That GIF is too large. Choose one smaller than \(maximumMegabytes) MB."
+        }
+    }
+}
 
 enum TrackCoverMedia {
     case image(UIImage)
@@ -16,6 +36,21 @@ enum ArtworkStorage {
     static let bannerAspectRatio: CGFloat = 360 / 148
     static let bannerOutputSize = CGSize(width: 1_080, height: 444)
     static let playlistOutputSize = CGSize(width: 900, height: 900)
+    static let maximumPlaylistGIFSize = 25 * 1_024 * 1_024
+
+    private final class PlaylistCoverCacheEntry {
+        let media: PlaylistCoverMedia
+
+        init(_ media: PlaylistCoverMedia) {
+            self.media = media
+        }
+    }
+
+    private static let playlistCoverCache: NSCache<NSString, PlaylistCoverCacheEntry> = {
+        let cache = NSCache<NSString, PlaylistCoverCacheEntry>()
+        cache.totalCostLimit = 96 * 1_024 * 1_024
+        return cache
+    }()
 
     private static let bannerFilename = "library-banner.jpg"
 
@@ -102,13 +137,93 @@ enum ArtworkStorage {
         image(filename: playlistFilename(for: artworkID))
     }
 
+    static func playlistCover(for artworkID: UUID) -> PlaylistCoverMedia? {
+        let cacheKey = artworkID.uuidString.lowercased() as NSString
+        if let cached = playlistCoverCache.object(forKey: cacheKey) {
+            return cached.media
+        }
+
+        if
+            let data = playlistGIFData(for: artworkID),
+            let image = playlistAnimatedGIFImage(from: data)
+        {
+            let media = PlaylistCoverMedia.animatedGIF(image)
+            cachePlaylistCover(media, for: artworkID)
+            return media
+        }
+
+        guard let image = playlistImage(for: artworkID) else {
+            return nil
+        }
+
+        let media = PlaylistCoverMedia.image(image)
+        cachePlaylistCover(media, for: artworkID)
+        return media
+    }
+
     static func savePlaylistImage(_ image: UIImage, for artworkID: UUID) throws {
         try save(image, filename: playlistFilename(for: artworkID))
+        try? FileManager.default.removeItem(
+            at: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID))
+        )
+        cachePlaylistCover(.image(image), for: artworkID)
+    }
+
+    static func savePlaylistGIF(_ data: Data, for artworkID: UUID) throws {
+        guard data.count <= maximumPlaylistGIFSize else {
+            throw ArtworkStorageError.gifTooLarge(
+                maximumMegabytes: maximumPlaylistGIFSize / 1_024 / 1_024
+            )
+        }
+        guard isGIFData(data), let image = playlistAnimatedGIFImage(from: data) else {
+            throw ArtworkStorageError.invalidGIF
+        }
+
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        try data.write(
+            to: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID)),
+            options: .atomic
+        )
+        try? FileManager.default.removeItem(
+            at: directoryURL.appendingPathComponent(playlistFilename(for: artworkID))
+        )
+        cachePlaylistCover(.animatedGIF(image), for: artworkID)
+    }
+
+    static func playlistGIFData(for artworkID: UUID) -> Data? {
+        try? Data(
+            contentsOf: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID))
+        )
     }
 
     static func deletePlaylistImage(for artworkID: UUID) {
-        let url = directoryURL.appendingPathComponent(playlistFilename(for: artworkID))
-        try? FileManager.default.removeItem(at: url)
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(
+            at: directoryURL.appendingPathComponent(playlistFilename(for: artworkID))
+        )
+        try? fileManager.removeItem(
+            at: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID))
+        )
+        playlistCoverCache.removeObject(forKey: artworkID.uuidString.lowercased() as NSString)
+    }
+
+    static func clearPlaylistCoverCache() {
+        playlistCoverCache.removeAllObjects()
+    }
+
+    static func isGIFData(_ data: Data) -> Bool {
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let typeIdentifier = CGImageSourceGetType(source),
+            let type = UTType(typeIdentifier as String)
+        else {
+            return false
+        }
+
+        return type.conforms(to: .gif)
     }
 
     static func trackCover(for coverID: UUID) -> TrackCoverMedia? {
@@ -205,6 +320,10 @@ enum ArtworkStorage {
         "playlist-\(artworkID.uuidString.lowercased()).jpg"
     }
 
+    private static func playlistGIFFilename(for artworkID: UUID) -> String {
+        "playlist-\(artworkID.uuidString.lowercased()).gif"
+    }
+
     private static func trackCoverImageFilename(for coverID: UUID) -> String {
         "track-cover-\(coverID.uuidString.lowercased()).jpg"
     }
@@ -215,6 +334,82 @@ enum ArtworkStorage {
 
     private static func isGIF(_ data: Data) -> Bool {
         data.starts(with: Data("GIF".utf8))
+    }
+
+    private static func playlistAnimatedGIFImage(from data: Data) -> UIImage? {
+        guard
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let typeIdentifier = CGImageSourceGetType(source),
+            let type = UTType(typeIdentifier as String),
+            type.conforms(to: .gif)
+        else {
+            return nil
+        }
+
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 0 else {
+            return nil
+        }
+
+        let memoryBudget = 24 * 1_024 * 1_024
+        let maximumPixelSize = min(
+            Int(playlistOutputSize.width),
+            max(64, Int(sqrt(Double(memoryBudget) / Double(frameCount * 4))))
+        )
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize
+        ]
+
+        var frames: [UIImage] = []
+        var duration: TimeInterval = 0
+        for index in 0..<frameCount {
+            guard let image = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                index,
+                options as CFDictionary
+            ) else {
+                return nil
+            }
+
+            duration += gifFrameDuration(
+                CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            )
+            frames.append(UIImage(cgImage: image))
+        }
+
+        guard let firstFrame = frames.first else {
+            return nil
+        }
+        guard frames.count > 1 else {
+            return firstFrame
+        }
+
+        return UIImage.animatedImage(
+            with: frames,
+            duration: max(duration, 0.1 * Double(frames.count))
+        )
+    }
+
+    private static func cachePlaylistCover(_ media: PlaylistCoverMedia, for artworkID: UUID) {
+        let image: UIImage
+        switch media {
+        case .image(let value), .animatedGIF(let value):
+            image = value
+        }
+
+        let frames = image.images ?? [image]
+        let cost = frames.reduce(0) { partialResult, frame in
+            partialResult + Int(frame.size.width * frame.scale)
+                * Int(frame.size.height * frame.scale) * 4
+        }
+        playlistCoverCache.setObject(
+            PlaylistCoverCacheEntry(media),
+            forKey: artworkID.uuidString.lowercased() as NSString,
+            cost: cost
+        )
     }
 
     private static func animatedGIFImage(from data: Data) -> UIImage? {

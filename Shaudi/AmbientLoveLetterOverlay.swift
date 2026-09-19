@@ -10,30 +10,18 @@ enum LoveLetterPolicy {
 
 enum LoveLetterScheduler {
     static let messages = [
-        "you make ordinary days feel special",
-        "i'd choose you in every version of this life",
-        "some songs sound better because they remind me of you",
         "you are my favorite person",
-        "you make everything feel a little softer",
         "life without you would be ass lowkey",
-        "you are the calm in all my favorite chaos",
-        "every day with you feels like a small miracle",
-        "you make my world feel more like home",
-        "my favorite memories always have you in them",
-        "you are my sweetest thought",
-        "the best part of my day is always you",
-        "you make the little things feel beautiful",
-        "i still get excited to tell you things",
         "if you see this screenshot it and ill send you $10",
-        "loving you feels wonderfully easy",
-        "you make my heart feel understood",
         "huge ass on you ngl",
-        "the world is warmer with you in it",
-        "you make even quiet moments feel full",
-        "i like who i am when i'm with you",
-        "you are the thought behind my smile",
-        "you make life feel beautifully familiar",
-        "my heart is always a little happier near you"
+        "you're cool ig",
+        "betray me, AND DIE!!!!!",
+        "send toe pic please",
+        "hey guess what? chicken butt",
+        "don't forget to love me",
+        "if I ever mess up, just know that no I didn't",
+        "you fell for it pussyfart",
+        "ok ok i love ya"
     ]
 
     static func nextMessageIndex(
