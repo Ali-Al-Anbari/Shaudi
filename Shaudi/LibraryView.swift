@@ -403,6 +403,12 @@ struct LibraryView: View {
             addToPlaylist: {
                 playlistTrack = track
             },
+            playNext: {
+                playbackManager.playNext(track)
+            },
+            addToQueue: {
+                playbackManager.addToQueue(track)
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -783,6 +789,12 @@ private struct CollectionView: View {
             addToPlaylist: {
                 playlistTrack = track
             },
+            playNext: {
+                playbackManager.playNext(track)
+            },
+            addToQueue: {
+                playbackManager.addToQueue(track)
+            },
             delete: {
                 deleteTrackFromLibrary(track, in: modelContext)
             }
@@ -917,6 +929,8 @@ private struct LibraryTrackRow: View {
     let trim: () -> Void
     let edit: () -> Void
     let addToPlaylist: () -> Void
+    let playNext: () -> Void
+    let addToQueue: () -> Void
     let delete: () -> Void
 
     var body: some View {
@@ -980,6 +994,14 @@ private struct LibraryTrackRow: View {
 
                     Button(action: addToPlaylist) {
                         Label("Add to Playlist", systemImage: "text.badge.plus")
+                    }
+
+                    Button(action: playNext) {
+                        Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                    }
+
+                    Button(action: addToQueue) {
+                        Label("Add to Queue", systemImage: "text.badge.plus.fill")
                     }
 
                     Button(role: .destructive) {
@@ -1746,6 +1768,24 @@ struct TrackDetailView: View {
 
         if playbackManager.currentTrack != nil {
             queueControls
+
+            HStack(spacing: 12) {
+                Button {
+                    playbackManager.playNext(track)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+                .buttonStyle(.bordered)
+                .tint(ShaudiTheme.accent)
+
+                Button {
+                    playbackManager.addToQueue(track)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
+                }
+                .buttonStyle(.bordered)
+                .tint(ShaudiTheme.accent)
+            }
         }
     }
 

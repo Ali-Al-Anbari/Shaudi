@@ -857,6 +857,18 @@ struct PlaylistDetailView: View {
                     Label("Add to Playlist", systemImage: "text.badge.plus")
                 }
 
+                Button {
+                    playbackManager.playNext(track)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+
+                Button {
+                    playbackManager.addToQueue(track)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
+                }
+
                 Button(role: .destructive) {
                     playlist.tracks.removeAll { $0 === track }
                 } label: {

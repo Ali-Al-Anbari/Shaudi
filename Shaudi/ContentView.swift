@@ -291,7 +291,7 @@ private struct MiniPlayerView: View {
                 }
                 .simultaneousGesture(miniPlayerSwipeGesture(pageWidth: pageWidth))
             }
-            .frame(height: 44)
+            .frame(height: 48)
             .accessibilityLabel("Open Now Playing")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { onOpen() }
@@ -330,12 +330,11 @@ private struct MiniPlayerView: View {
         .onChange(of: playbackManager.currentPlayableTrack?.id) { _, _ in
             resetMiniPlayerGesture()
 #if DEBUG
-            if let track = playbackManager.currentPlayableTrack {
-                let artist = playbackManager.currentTrack?.displayArtist ?? track.channelTitle ?? ""
-                let source = playbackManager.currentTrack?.displayArtist?.isEmpty == false
-                    ? "savedTrack"
-                    : "playableTrack"
-                print("[MiniPlayer] videoID=\(track.youtubeVideoID) title=\(track.title) artist=\(artist) artistSource=\(source)")
+            if let content = currentPage {
+                let artist = miniPlayerArtist(content.artist) ?? ""
+                print("[MiniPlayer] title=\"\(content.title)\"")
+                print("[MiniPlayer] artist=\"\(artist)\"")
+                print("[MiniPlayer] artistEmpty=\(artist.isEmpty)")
             }
 #endif
         }
@@ -409,13 +408,14 @@ private struct MiniPlayerView: View {
                 if let artist = miniPlayerArtist(content.artist) {
                     Text(artist)
                         .font(ShaudiTheme.bodyFont(size: 12, relativeTo: .caption))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color.white.opacity(0.84))
                         .lineLimit(1)
+                        .truncationMode(.tail)
                         .minimumScaleFactor(0.85)
                         .layoutPriority(1)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
 
             Spacer(minLength: 4)
         }
@@ -602,6 +602,7 @@ private struct NowPlayingView: View {
     @State private var isGestureSettling = false
     @State private var isGestureSuppressed = false
     @State private var controlFrames: [CGRect] = []
+    @State private var isShowingQueue = false
 
     private let artworkHorizontalInset: CGFloat = 48
     private let maximumArtworkSize: CGFloat = 360
@@ -723,6 +724,9 @@ private struct NowPlayingView: View {
         .onChange(of: selectedCover) { _, selection in
             saveSelectedCover(selection)
         }
+        .sheet(isPresented: $isShowingQueue) {
+            QueueView(playbackManager: playbackManager)
+        }
     }
 
     private var background: some View {
@@ -778,6 +782,17 @@ private struct NowPlayingView: View {
                             ? "Manage playlists"
                             : "Add to playlist"
                     )
+                    .nowPlayingControlRegion()
+
+                    Button {
+                        isShowingQueue = true
+                    } label: {
+                        Image(systemName: "list.bullet")
+                            .font(.system(size: 18, weight: .semibold))
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("View Queue")
                     .nowPlayingControlRegion()
 
                     Menu {

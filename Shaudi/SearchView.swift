@@ -567,6 +567,24 @@ struct SearchView: View {
             } label: {
                 Label("Add to Playlist", systemImage: "text.badge.plus")
             }
+
+            if playbackManager.currentPlayableTrack != nil {
+                Button {
+                    let track = existingTrack(for: result.youtubeVideoID)
+                        ?? trackForPlaylist(result)
+                    playbackManager.playNext(track)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+
+                Button {
+                    let track = existingTrack(for: result.youtubeVideoID)
+                        ?? trackForPlaylist(result)
+                    playbackManager.addToQueue(track)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
+                }
+            }
         } label: {
             Image(systemName: "ellipsis.circle")
                 .font(.title3)

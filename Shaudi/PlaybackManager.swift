@@ -202,6 +202,12 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var isTrimPreviewActive = false
     @Published private(set) var trimPreviewTime: TimeInterval?
 
+    /// Number of upcoming tracks (starting at currentIndex + 1) that were
+    /// added via "Play Next" or "Add to Queue".  When this count is > 0 those
+    /// items sit at the front of the upcoming section; automatic playlist /
+    /// radio items follow them.
+    private(set) var manualQueueCount: Int = 0
+
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
     private var preResolutionTask: Task<Void, Never>?
@@ -404,6 +410,7 @@ final class PlaybackManager: ObservableObject {
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
+        manualQueueCount = 0
         startCurrentQueueTrack()
     }
 
@@ -496,6 +503,7 @@ final class PlaybackManager: ObservableObject {
             playbackStartTime: track.playbackStartTime,
             playbackEndTime: track.playbackEndTime
         )
+        manualQueueCount = 0
         startPlaybackContext(displayTrack, persistentTrack: nil)
     }
 
@@ -879,6 +887,173 @@ final class PlaybackManager: ObservableObject {
         refreshQueuePredictionsAfterMutation()
     }
 
+    // MARK: - User-manageable queue
+
+    /// Insert `track` as the very next item after the currently playing track.
+    func playNext(_ track: Track) {
+        guard currentPlayableTrack != nil else {
+            return
+        }
+
+        let insertionIndex: Int
+        if let currentIndex, queue.indices.contains(currentIndex) {
+            insertionIndex = currentIndex + 1
+        } else {
+            return
+        }
+
+        queue.insert(track, at: insertionIndex)
+        manualQueueCount += 1
+        queueLog("playNext count=\(manualQueueCount) total=\(queue.count)")
+        refreshQueuePredictionsAfterMutation()
+    }
+
+    /// Append `track` to the end of the manual-queue section (before automatic items).
+    func addToQueue(_ track: Track) {
+        guard currentPlayableTrack != nil else {
+            return
+        }
+
+        let insertionIndex: Int
+        if let currentIndex, queue.indices.contains(currentIndex) {
+            insertionIndex = currentIndex + 1 + manualQueueCount
+        } else {
+            return
+        }
+
+        // Clamp in case manualQueueCount is somehow stale
+        let safeIndex = min(insertionIndex, queue.endIndex)
+        queue.insert(track, at: safeIndex)
+        manualQueueCount += 1
+        queueLog("addToQueue count=\(manualQueueCount) total=\(queue.count)")
+        refreshQueuePredictionsAfterMutation()
+    }
+
+    /// Build a transient Track from a PlayableTrack (for Search-result queue actions).
+    func makeTransientTrack(from playableTrack: PlayableTrack) -> Track {
+        var components = URLComponents(string: "https://www.youtube.com/watch")!
+        components.queryItems = [URLQueryItem(name: "v", value: playableTrack.youtubeVideoID)]
+        return Track(
+            title: playableTrack.title,
+            youtubeURL: components.url!,
+            youtubeVideoID: playableTrack.youtubeVideoID,
+            channelTitle: playableTrack.channelTitle,
+            thumbnailURL: playableTrack.thumbnailURL,
+            duration: playableTrack.duration,
+            metadataLastRefreshed: .now,
+            playbackStartTime: playableTrack.playbackStartTime,
+            playbackEndTime: playableTrack.playbackEndTime
+        )
+    }
+
+    /// Jump to an item in the upcoming queue by its index within the upcoming slice.
+    /// `upcomingIndex` is 0-based relative to the track *after* the current one.
+    func jumpToQueueItem(upcomingIndex: Int) {
+        guard
+            let currentIndex,
+            queue.indices.contains(currentIndex)
+        else {
+            return
+        }
+
+        let absoluteIndex = currentIndex + 1 + upcomingIndex
+        guard queue.indices.contains(absoluteIndex) else {
+            return
+        }
+
+        // Tracks skipped over are not "consumed" as manual items — reset count
+        // based on how many manual items remain ahead of the new position.
+        let skipped = upcomingIndex
+        manualQueueCount = max(0, manualQueueCount - skipped)
+
+        let requestedAt = currentTime
+        let track = queue[absoluteIndex]
+        let videoID = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("Queue jump requested for \(videoID)")
+        cancelUpcomingPreResolutionObservation()
+        self.currentIndex = absoluteIndex
+#if os(iOS)
+        updateRemoteQueueCommands()
+#endif
+        startCurrentQueueTrack(requestStartedAt: requestedAt)
+    }
+
+    /// Remove an upcoming item by its 0-based index in the upcoming slice.
+    func removeFromQueue(upcomingIndex: Int) {
+        guard
+            let currentIndex,
+            queue.indices.contains(currentIndex)
+        else {
+            return
+        }
+
+        let absoluteIndex = currentIndex + 1 + upcomingIndex
+        guard queue.indices.contains(absoluteIndex) else {
+            return
+        }
+
+        queue.remove(at: absoluteIndex)
+        if upcomingIndex < manualQueueCount {
+            manualQueueCount = max(0, manualQueueCount - 1)
+        }
+        queueLog("removeFromQueue upcomingIndex=\(upcomingIndex) manualCount=\(manualQueueCount) total=\(queue.count)")
+        refreshQueuePredictionsAfterMutation()
+    }
+
+    /// Reorder items within the upcoming queue. Indices are 0-based within the upcoming slice.
+    func moveQueue(from source: IndexSet, to destination: Int) {
+        guard
+            let currentIndex,
+            queue.indices.contains(currentIndex)
+        else {
+            return
+        }
+
+        guard currentIndex + 1 < queue.endIndex else {
+            return
+        }
+
+        var upcomingSlice = Array(queue[(currentIndex + 1)...])
+
+        guard destination >= 0, destination <= upcomingSlice.count else {
+            return
+        }
+
+        let validSource = source.filter { upcomingSlice.indices.contains($0) }
+        guard !validSource.isEmpty else {
+            return
+        }
+
+        // Manual reorder: collect moved elements, remove them, then insert at destination.
+        let movedElements = validSource.map { upcomingSlice[$0] }
+        var remaining = upcomingSlice.indices
+            .filter { !validSource.contains($0) }
+            .map { upcomingSlice[$0] }
+
+        // Adjust destination for removed elements before it
+        let removedBeforeDestination = validSource.filter { $0 < destination }.count
+        let insertAt = max(0, min(destination - removedBeforeDestination, remaining.count))
+        remaining.insert(contentsOf: movedElements, at: insertAt)
+        upcomingSlice = remaining
+
+        queue = Array(queue[...currentIndex]) + upcomingSlice
+
+        queueLog("moveQueue manualCount=\(manualQueueCount) total=\(queue.count)")
+        refreshQueuePredictionsAfterMutation()
+    }
+
+    /// The tracks currently upcoming (everything after the current track).
+    var upcomingQueueTracks: [Track] {
+        guard let currentIndex, queue.indices.contains(currentIndex) else {
+            return []
+        }
+        let nextIdx = currentIndex + 1
+        guard nextIdx < queue.endIndex else {
+            return []
+        }
+        return Array(queue[nextIdx...])
+    }
+
     func previousTrack() {
         guard !isTrimPreviewActive else {
             return
@@ -925,6 +1100,12 @@ final class PlaybackManager: ObservableObject {
             videoID: videoID
         )
         cancelUpcomingPreResolutionObservation()
+        // If the track we're advancing into is the first upcoming item (no wrap),
+        // it may be a manual-queue item — consume one manual slot.
+        if nextIndex == currentIndex + 1, manualQueueCount > 0 {
+            manualQueueCount -= 1
+            queueLog("manualQueueCount consumed=1 remaining=\(manualQueueCount)")
+        }
         self.currentIndex = nextIndex
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -1539,6 +1720,7 @@ final class PlaybackManager: ObservableObject {
         currentTrack = nil
         currentPlayableTrack = nil
         playbackOrigin = nil
+        manualQueueCount = 0
         state = .idle
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -4230,7 +4412,9 @@ final class PlaybackManager: ObservableObject {
         guard let currentIndex, queue.indices.contains(currentIndex) else {
             return 0
         }
-        return max(0, queue.count - currentIndex - 1)
+        let totalUpcoming = max(0, queue.count - currentIndex - 1)
+        // Exclude manual-queue items so they don't suppress radio refill.
+        return max(0, totalUpcoming - manualQueueCount)
     }
 
     private func appendRecommendations(
@@ -4287,13 +4471,22 @@ final class PlaybackManager: ObservableObject {
         } else {
             existingUpcoming = []
         }
-        let upcoming = Array(
-            (existingUpcoming + newTracks)
+
+        // Separate the manual-queue items (front of upcoming) from the
+        // auto-upcoming items so radio additions never displace them.
+        let clampedManualCount = min(manualQueueCount, existingUpcoming.count)
+        let manualItems = Array(existingUpcoming.prefix(clampedManualCount))
+        let autoItems = Array(existingUpcoming.dropFirst(clampedManualCount))
+
+        let autoUpcoming = Array(
+            (autoItems + newTracks)
                 .prefix(recommendationUpcomingLimit)
         )
+        let upcoming = manualItems + autoUpcoming
 
         queue = history + upcoming
         self.currentIndex = history.count - 1
+        // manualQueueCount is unchanged — the manual items are still there.
         let retainedVideoIDs = Set(queue.map { normalizedVideoID($0.youtubeVideoID) })
         recommendationTransportMetadata = recommendationTransportMetadata.filter {
             retainedVideoIDs.contains($0.key)
@@ -4646,6 +4839,23 @@ final class PlaybackManager: ObservableObject {
         print("[SearchPreResolve] \(message)")
 #endif
     }
+
+#if DEBUG
+    /// Seed internal queue state for unit tests only. Does NOT start playback.
+    func seedQueueForTesting(
+        tracks: [Track],
+        currentIndex: Int,
+        manualQueueCount: Int = 0
+    ) {
+        self.queue = tracks
+        self.currentIndex = currentIndex
+        self.manualQueueCount = manualQueueCount
+        // Set a fake currentPlayableTrack so queue mutation guards pass.
+        if tracks.indices.contains(currentIndex) {
+            self.currentPlayableTrack = PlayableTrack(track: tracks[currentIndex])
+        }
+    }
+#endif
 
     private func queueLog(_ message: String) {
 #if DEBUG
