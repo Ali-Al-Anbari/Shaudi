@@ -575,6 +575,7 @@ struct RecommendationService {
     private let videoResolver: YouTubeRecommendationResolver
     private let resolutionCache: any YouTubeResolutionCaching
     private let feedbackStore: RecommendationFeedbackStore
+    private let personalizationStore: RecommendationPersonalizationStore
     private let resultLimit = RecommendationRadioPolicy.targetUpcomingCount
     private let candidatePoolLimit = RecommendationRadioPolicy.candidatePoolSize
     private let youtubeResolutionLimit = 12
@@ -582,10 +583,23 @@ struct RecommendationService {
     private let topTrackAnchorLimit = 10
 
     init() {
-        self.init(feedbackStore: .shared)
+        self.init(
+            feedbackStore: .shared,
+            personalizationStore: .shared
+        )
     }
 
     init(feedbackStore: RecommendationFeedbackStore) {
+        self.init(
+            feedbackStore: feedbackStore,
+            personalizationStore: .shared
+        )
+    }
+
+    init(
+        feedbackStore: RecommendationFeedbackStore,
+        personalizationStore: RecommendationPersonalizationStore
+    ) {
         let lastFMService = LastFMRecommendationService()
         similarTracksOperation = { artist, title, limit, isFallback in
             try await lastFMService.similarTracks(
@@ -601,6 +615,7 @@ struct RecommendationService {
         videoResolver = YouTubeRecommendationResolver()
         resolutionCache = PersistentYouTubeResolutionCache.shared
         self.feedbackStore = feedbackStore
+        self.personalizationStore = personalizationStore
     }
 
     init(
@@ -618,7 +633,8 @@ struct RecommendationService {
             topTracks: topTracks,
             videoResolver: videoResolver,
             resolutionCache: resolutionCache,
-            feedbackStore: .shared
+            feedbackStore: .shared,
+            personalizationStore: .shared
         )
     }
 
@@ -633,6 +649,28 @@ struct RecommendationService {
         resolutionCache: any YouTubeResolutionCaching,
         feedbackStore: RecommendationFeedbackStore
     ) {
+        self.init(
+            similarTracks: similarTracks,
+            topTracks: topTracks,
+            videoResolver: videoResolver,
+            resolutionCache: resolutionCache,
+            feedbackStore: feedbackStore,
+            personalizationStore: .shared
+        )
+    }
+
+    init(
+        similarTracks: @escaping (
+            _ artist: String,
+            _ title: String,
+            _ limit: Int
+        ) async throws -> [LastFMSimilarTrack],
+        topTracks: @escaping TopTracksOperation = { _, _ in [] },
+        videoResolver: YouTubeRecommendationResolver,
+        resolutionCache: any YouTubeResolutionCaching,
+        feedbackStore: RecommendationFeedbackStore,
+        personalizationStore: RecommendationPersonalizationStore
+    ) {
         similarTracksOperation = { artist, title, limit, _ in
             try await similarTracks(artist, title, limit)
         }
@@ -640,6 +678,7 @@ struct RecommendationService {
         self.videoResolver = videoResolver
         self.resolutionCache = resolutionCache
         self.feedbackStore = feedbackStore
+        self.personalizationStore = personalizationStore
     }
 
     func recommendations(
@@ -1166,6 +1205,9 @@ struct RecommendationService {
         var versionSurvivorCount = 0
         var filtered: [RankedSong] = []
         let feedback = feedbackStore.snapshot
+#if DEBUG
+        var rankingLogCount = 0
+#endif
 
         for track in candidates {
             let artist = SongNormalization.humanReadable(track.artist)
@@ -1191,8 +1233,23 @@ struct RecommendationService {
                 continue
             }
 
+            let explicitAdjustment = feedback.scoreAdjustment(for: identity)
+            let passiveAdjustment = personalizationStore.profile.adjustment(for: identity)
+            let finalScore = track.match + explicitAdjustment + passiveAdjustment.total
 #if DEBUG
-            print("[Recommendations] candidate=\(artist) - \(title) match=\(String(format: "%.2f", track.match))")
+            if rankingLogCount < 8 {
+                let reasons = passiveAdjustment.reasons.joined(separator: ",")
+                print(
+                    "[RecommendationRanking] candidate=\(artist) - \(title) "
+                        + "base=\(String(format: "%.3f", track.match)) "
+                        + "artist=\(String(format: "%.3f", passiveAdjustment.artist)) "
+                        + "song=\(String(format: "%.3f", passiveAdjustment.song)) "
+                        + "explicit=\(String(format: "%.3f", explicitAdjustment)) "
+                        + "adjustment=\(String(format: "%.3f", explicitAdjustment + passiveAdjustment.total)) "
+                        + "final=\(String(format: "%.3f", finalScore)) reasons=\(reasons)"
+                )
+                rankingLogCount += 1
+            }
 #endif
             filtered.append(RankedSong(
                 track: LastFMSimilarTrack(
@@ -1202,7 +1259,7 @@ struct RecommendationService {
                     url: track.url
                 ),
                 identity: identity,
-                score: track.match + feedback.scoreAdjustment(for: identity)
+                score: finalScore
             ))
         }
 
@@ -1237,10 +1294,13 @@ struct RecommendationService {
                 recommendationLog("rejected excluded artist=\(identity.artist)")
                 return nil
             }
+            let passiveAdjustment = personalizationStore.profile.adjustment(for: identity)
             return RankedSong(
                 track: candidate,
                 identity: identity,
-                score: candidate.match + feedback.scoreAdjustment(for: identity)
+                score: candidate.match
+                    + feedback.scoreAdjustment(for: identity)
+                    + passiveAdjustment.total
             )
         }
         .sorted(by: rankedSongOrder)

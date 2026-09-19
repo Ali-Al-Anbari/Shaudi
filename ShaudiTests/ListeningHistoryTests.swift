@@ -83,9 +83,15 @@ final class ListeningHistoryTests: XCTestCase {
     func testSkipFinalizesAndNextWaitsForConfirmedPlayback() throws {
         let harness = try Harness()
         let first = UUID()
-        harness.confirm(requestID: first)
-        harness.recorder.finalize(requestID: first, mediaTime: 12)
+        harness.confirm(requestID: first, authoritativeDuration: 200)
+        harness.recorder.finalize(
+            requestID: first,
+            mediaTime: 12,
+            outcome: .manualNext
+        )
         XCTAssertEqual(try harness.entries().count, 1)
+        XCTAssertEqual(try harness.entries().first?.authoritativeDuration, 200)
+        XCTAssertEqual(try harness.entries().first?.completionOutcome, .manualNext)
 
         let second = UUID()
         XCTAssertEqual(try harness.entries().count, 1)
@@ -190,6 +196,71 @@ final class ListeningHistoryTests: XCTestCase {
         XCTAssertEqual(recent.last?.canonicalTitle, "Song 240")
     }
 
+    func testHistoryDisplayUsesFiveCalendarDaysWithoutDeletingOlderData() throws {
+        let harness = try Harness()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let now = calendar.date(from: DateComponents(
+            year: 2026,
+            month: 9,
+            day: 19,
+            hour: 12
+        ))!
+        let cutoff = ListeningHistoryStats.displayCutoff(now: now, calendar: calendar)
+        let visible = historyEntry(
+            artist: "Visible Artist",
+            title: "Recent",
+            duration: 180,
+            startedAt: cutoff
+        )
+        let older = historyEntry(
+            artist: "Older Artist",
+            title: "Still Stored",
+            duration: 180,
+            startedAt: cutoff.addingTimeInterval(-1)
+        )
+        harness.context.insert(visible)
+        harness.context.insert(older)
+        try harness.context.save()
+
+        let displayed = try harness.context.fetch(
+            ListeningHistoryStats.recentDisplayDescriptor(since: cutoff, limit: 100)
+        )
+        let allEntries = try harness.context.fetch(
+            ListeningHistoryStats.recentDescriptor(limit: 100)
+        )
+        let profile = harness.recorder.personalizationProfile(now: now)
+
+        XCTAssertEqual(displayed.map(\.canonicalTitle), ["Recent"])
+        XCTAssertEqual(allEntries.count, 2)
+        XCTAssertGreaterThan(
+            profile.adjustment(
+                for: SongIdentity(artist: "Older Artist", title: "Another Song")
+            ).artist,
+            0
+        )
+    }
+
+    func testPersonalizationProfileDerivesFromSavedHistoryInFreshContext() throws {
+        let harness = try Harness()
+        let entry = historyEntry(
+            artist: "Persisted Artist",
+            title: "Persisted Song",
+            duration: 180
+        )
+        entry.authoritativeDuration = 200
+        harness.context.insert(entry)
+        try harness.context.save()
+
+        let reloadedContext = ModelContext(harness.container)
+        let reloadedRecorder = ListeningHistoryRecorder(modelContext: reloadedContext)
+        let adjustment = reloadedRecorder.personalizationProfile().adjustment(
+            for: SongIdentity(artist: "Persisted Artist", title: "Another Song")
+        )
+
+        XCTAssertGreaterThan(adjustment.artist, 0)
+    }
+
     func testTopArtistsGroupsCaseDifferencesAndKeepsDisplayArtistReadable() {
         let artists = ListeningHistoryStats.topArtists(from: [
             historyEntry(artist: "Juice WRLD", title: "Bandit", duration: 40),
@@ -243,7 +314,8 @@ private func historyEntry(
     artist: String,
     title: String,
     duration: TimeInterval,
-    source: ListeningHistoryPlaybackSource = .library
+    source: ListeningHistoryPlaybackSource = .library,
+    startedAt: Date = .now
 ) -> ListeningHistoryEntry {
     let identity = SongIdentity(artist: artist, title: title)
     return ListeningHistoryEntry(
@@ -252,6 +324,7 @@ private func historyEntry(
         canonicalTitle: identity.title,
         canonicalIdentityKey: identity.cacheKey,
         playbackSourceRawValue: source.rawValue,
+        startedAt: startedAt,
         listenedDuration: duration
     )
 }
@@ -279,7 +352,8 @@ private final class Harness {
         mediaTime: TimeInterval = 0,
         identity: SongIdentity? = nil,
         title: String? = nil,
-        source: ListeningHistoryPlaybackSource = .search
+        source: ListeningHistoryPlaybackSource = .search,
+        authoritativeDuration: TimeInterval? = nil
     ) {
         let baseIdentity = identity ?? SongIdentity(artist: "Artist", title: "Song")
         let selectedIdentity = title.map { SongIdentity(artist: baseIdentity.artist, title: $0) }
@@ -290,7 +364,8 @@ private final class Harness {
                 youtubeVideoID: "video",
                 identity: selectedIdentity,
                 artworkURL: URL(string: "https://example.com/art.jpg"),
-                source: source
+                source: source,
+                authoritativeDuration: authoritativeDuration
             ),
             mediaTime: mediaTime
         )

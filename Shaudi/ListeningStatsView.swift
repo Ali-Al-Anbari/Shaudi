@@ -483,6 +483,7 @@ private struct ListeningHistoryView: View {
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
     @State private var entries: [ListeningHistoryEntry] = []
     @State private var reachedEnd = false
+    private let displayCutoff = ListeningHistoryStats.displayCutoff()
 
     var body: some View {
         Group {
@@ -526,7 +527,8 @@ private struct ListeningHistoryView: View {
         guard !reachedEnd else {
             return
         }
-        var descriptor = ListeningHistoryStats.recentDescriptor(
+        var descriptor = ListeningHistoryStats.recentDisplayDescriptor(
+            since: displayCutoff,
             limit: ListeningHistoryPolicy.fullHistoryBatchSize
         )
         descriptor.fetchOffset = entries.count

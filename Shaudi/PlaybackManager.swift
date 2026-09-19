@@ -93,6 +93,7 @@ final class PlaybackManager: ObservableObject {
     private let recommendationUpcomingWatermark = RecommendationRadioPolicy.targetUpcomingCount
     private let recommendationService = RecommendationService()
     private let recommendationFeedbackStore = RecommendationFeedbackStore.shared
+    private let recommendationPersonalizationStore = RecommendationPersonalizationStore.shared
     private let metadataClient = YouTubeMetadataClient()
     private let genreTagService = LastFMRecommendationService()
     private let genreLookupCoordinator = GenreLookupCoordinator()
@@ -115,6 +116,25 @@ final class PlaybackManager: ObservableObject {
     private enum QueueTrackIdentity: Hashable {
         case videoID(String)
         case object(ObjectIdentifier)
+    }
+
+    private enum PlaybackAdvanceReason {
+        case manualNext
+        case naturalCompletion
+
+        var logLabel: String {
+            switch self {
+            case .manualNext: "Next"
+            case .naturalCompletion: "Natural"
+            }
+        }
+
+        var historyOutcome: ListeningHistoryCompletionOutcome {
+            switch self {
+            case .manualNext: .manualNext
+            case .naturalCompletion: .naturalCompletion
+            }
+        }
     }
 
     struct StartupMetrics {
@@ -238,6 +258,8 @@ final class PlaybackManager: ObservableObject {
     private var lastRecordedTrackPlaybackRequestID: UUID?
     private var activeListeningPeriod: ActiveListeningPeriod?
     private var listeningHistoryRecorder: ListeningHistoryRecorder?
+    private var pendingListeningHistoryOutcome: ListeningHistoryCompletionOutcome?
+    private var personalizationProfileNeedsRefresh = true
     private var preparedNextVideoID: String?
     private var preparedNextPlayback: PreparedNextPlayback?
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
@@ -283,6 +305,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
         listeningHistoryRecorder = ListeningHistoryRecorder(modelContext: modelContext)
+        refreshRecommendationPersonalizationIfNeeded(force: true)
     }
 
     var hasPreviousTrack: Bool {
@@ -818,7 +841,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        advanceToNextTrack(reason: "Next")
+        advanceToNextTrack(reason: .manualNext)
     }
 
     func toggleShuffle() {
@@ -1113,7 +1136,7 @@ final class PlaybackManager: ObservableObject {
         startCurrentQueueTrack(requestStartedAt: requestedAt)
     }
 
-    private func advanceToNextTrack(reason: String) {
+    private func advanceToNextTrack(reason: PlaybackAdvanceReason) {
         guard
             let currentIndex,
             let nextIndex = nextQueueIndex(after: currentIndex)
@@ -1127,7 +1150,7 @@ final class PlaybackManager: ObservableObject {
         if nextIndex == queue.startIndex, currentIndex == queue.index(before: queue.endIndex) {
             queueLog("wrapped to start")
         }
-        log("\(reason) advance requested for \(videoID)")
+        log("\(reason.logLabel) advance requested for \(videoID)")
 
         let preparedPlayback = takePreparedNextPlayback(
             queueIndex: nextIndex,
@@ -1142,6 +1165,7 @@ final class PlaybackManager: ObservableObject {
             queueLog("manualQueueCount consumed=1 remaining=\(manualQueueCount)")
         }
         self.currentIndex = nextIndex
+        pendingListeningHistoryOutcome = reason.historyOutcome
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
@@ -3716,9 +3740,10 @@ final class PlaybackManager: ObservableObject {
         }
 
         if hasNextTrack {
-            advanceToNextTrack(reason: "Natural")
+            advanceToNextTrack(reason: .naturalCompletion)
         } else {
             log("Final item completed; stopping playback")
+            pendingListeningHistoryOutcome = .naturalCompletion
             stop()
         }
     }
@@ -3991,6 +4016,7 @@ final class PlaybackManager: ObservableObject {
 
     private func startRecommendationSession(anchor: RecommendationSeed) {
         endRecommendationSession(reason: "new Search playback")
+        refreshRecommendationPersonalizationIfNeeded(force: true)
 
         let seedVideoID = normalizedVideoID(anchor.youtubeVideoID)
         let session = RecommendationRadioSession(anchor: anchor)
@@ -4207,6 +4233,7 @@ final class PlaybackManager: ObservableObject {
         sessionID: UUID,
         seedTrack: PlayableTrack
     ) {
+        refreshRecommendationPersonalizationIfNeeded()
         let taskKey = epochID.uuidString
         guard
             recommendationTasks[taskKey] == nil,
@@ -4289,6 +4316,7 @@ final class PlaybackManager: ObservableObject {
         epochID: UUID,
         seed: PlayableTrack
     ) {
+        refreshRecommendationPersonalizationIfNeeded()
         let neededCount = max(
             0,
             recommendationUpcomingWatermark - recommendationUpcomingCount
@@ -4678,7 +4706,9 @@ final class PlaybackManager: ObservableObject {
             identity: identity,
             artworkURL: playableTrack.thumbnailURL,
             source: ListeningHistoryPlaybackSource(origin),
-            genres: currentTrack?.cachedGenreTags ?? []
+            genres: currentTrack?.cachedGenreTags ?? [],
+            authoritativeDuration: currentEffectivePlaybackDuration
+                ?? validDuration(playableTrack.duration)
         )
         listeningHistoryRecorder?.confirmPlayback(
             requestID: requestID,
@@ -4820,7 +4850,13 @@ final class PlaybackManager: ObservableObject {
 
     private func clearPlayer() {
         finishActiveListeningPeriod()
-        listeningHistoryRecorder?.finalize(requestID: activeRequestID)
+        if listeningHistoryRecorder?.finalize(
+            requestID: activeRequestID,
+            outcome: pendingListeningHistoryOutcome
+        ) == true {
+            personalizationProfileNeedsRefresh = true
+        }
+        pendingListeningHistoryOutcome = nil
         removeTrimPreviewTimeObserver()
         removeListeningCheckpointObserver()
 
@@ -4840,6 +4876,23 @@ final class PlaybackManager: ObservableObject {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+    }
+
+    private func refreshRecommendationPersonalizationIfNeeded(force: Bool = false) {
+        guard force || personalizationProfileNeedsRefresh else {
+            return
+        }
+        guard let listeningHistoryRecorder else {
+            recommendationPersonalizationStore.update(.empty)
+            return
+        }
+        recommendationPersonalizationStore.update(
+            listeningHistoryRecorder.personalizationProfile()
+        )
+        personalizationProfileNeedsRefresh = false
+#if DEBUG
+        recommendationLog("personalization profile refreshed")
+#endif
     }
 
     private func installListeningCheckpointObserver(

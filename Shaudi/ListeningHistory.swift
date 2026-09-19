@@ -21,6 +21,11 @@ enum ListeningHistoryPlaybackSource: String, CaseIterable {
     }
 }
 
+enum ListeningHistoryCompletionOutcome: String, Codable {
+    case naturalCompletion
+    case manualNext
+}
+
 @Model
 final class ListeningHistoryEntry {
     @Attribute(.unique) var id: UUID
@@ -36,6 +41,8 @@ final class ListeningHistoryEntry {
     var listenedDuration: TimeInterval
     var confirmedPlay: Bool
     var genreTagsStorage: String
+    var authoritativeDuration: TimeInterval?
+    var completionOutcomeRawValue: String?
 
     init(
         id: UUID = UUID(),
@@ -50,7 +57,9 @@ final class ListeningHistoryEntry {
         lastUpdatedAt: Date? = nil,
         listenedDuration: TimeInterval = 0,
         confirmedPlay: Bool = true,
-        genreTagsStorage: String = ""
+        genreTagsStorage: String = "",
+        authoritativeDuration: TimeInterval? = nil,
+        completionOutcomeRawValue: String? = nil
     ) {
         self.id = id
         self.youtubeVideoID = youtubeVideoID
@@ -65,6 +74,8 @@ final class ListeningHistoryEntry {
         self.listenedDuration = listenedDuration
         self.confirmedPlay = confirmedPlay
         self.genreTagsStorage = genreTagsStorage
+        self.authoritativeDuration = authoritativeDuration
+        self.completionOutcomeRawValue = completionOutcomeRawValue
     }
 
     var playbackSource: ListeningHistoryPlaybackSource? {
@@ -73,6 +84,10 @@ final class ListeningHistoryEntry {
 
     var cachedGenreTags: [String] {
         genreTagsStorage.split(separator: "|").map(String.init)
+    }
+
+    var completionOutcome: ListeningHistoryCompletionOutcome? {
+        completionOutcomeRawValue.flatMap(ListeningHistoryCompletionOutcome.init(rawValue:))
     }
 }
 
@@ -84,13 +99,15 @@ struct ListeningHistorySnapshot: Equatable {
     let artworkURL: URL?
     let playbackSourceRawValue: String
     let genreTagsStorage: String
+    let authoritativeDuration: TimeInterval?
 
     init(
         youtubeVideoID: String,
         identity: SongIdentity,
         artworkURL: URL?,
         source: ListeningHistoryPlaybackSource,
-        genres: [String] = []
+        genres: [String] = [],
+        authoritativeDuration: TimeInterval? = nil
     ) {
         self.youtubeVideoID = youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
         canonicalArtist = identity.artist
@@ -99,6 +116,9 @@ struct ListeningHistorySnapshot: Equatable {
         self.artworkURL = artworkURL
         playbackSourceRawValue = source.rawValue
         genreTagsStorage = genres.joined(separator: "|")
+        self.authoritativeDuration = authoritativeDuration.flatMap {
+            $0.isFinite && $0 > 0 ? $0 : nil
+        }
     }
 }
 
@@ -146,7 +166,8 @@ final class ListeningHistoryRecorder {
             artworkURL: snapshot.artworkURL,
             playbackSourceRawValue: snapshot.playbackSourceRawValue,
             startedAt: now,
-            genreTagsStorage: snapshot.genreTagsStorage
+            genreTagsStorage: snapshot.genreTagsStorage,
+            authoritativeDuration: snapshot.authoritativeDuration
         )
         modelContext.insert(entry)
         activeEvent = ActiveEvent(
@@ -202,20 +223,54 @@ final class ListeningHistoryRecorder {
         beginSegment(requestID: requestID, mediaTime: mediaTime)
     }
 
-    func finalize(requestID: UUID? = nil, mediaTime: TimeInterval? = nil, now: Date = .now) {
+    @discardableResult
+    func finalize(
+        requestID: UUID? = nil,
+        mediaTime: TimeInterval? = nil,
+        outcome: ListeningHistoryCompletionOutcome? = nil,
+        now: Date = .now
+    ) -> Bool {
         guard let event = activeEvent else {
-            return
+            return false
         }
         if let requestID, event.requestID != requestID {
-            return
+            return false
         }
         if let mediaTime {
             closeSegment(requestID: event.requestID, mediaTime: mediaTime, now: now)
         }
         event.entry.endedAt = now
         event.entry.lastUpdatedAt = now
+        event.entry.completionOutcomeRawValue = outcome?.rawValue
         activeEvent = nil
         save()
+        return true
+    }
+
+    func personalizationProfile(now: Date = .now) -> RecommendationPersonalizationProfile {
+        let entries: [ListeningHistoryEntry]
+        do {
+            entries = try modelContext.fetch(FetchDescriptor<ListeningHistoryEntry>())
+        } catch {
+#if DEBUG
+            print("[Recommendations] personalization profile fetch failed: \(error.localizedDescription)")
+#endif
+            return .empty
+        }
+
+        return RecommendationPersonalizationProfile(
+            events: entries.map { entry in
+                RecommendationListeningEvent(
+                    identity: ListeningHistoryStats.identity(for: entry),
+                    listenedDuration: entry.listenedDuration,
+                    authoritativeDuration: entry.authoritativeDuration,
+                    startedAt: entry.startedAt,
+                    completionOutcome: entry.completionOutcome,
+                    confirmedPlay: entry.confirmedPlay
+                )
+            },
+            now: now
+        )
     }
 
     private func save() {
@@ -241,6 +296,29 @@ enum ListeningHistoryStats {
 
     static func recentDescriptor(limit: Int) -> FetchDescriptor<ListeningHistoryEntry> {
         var descriptor = FetchDescriptor<ListeningHistoryEntry>(
+            sortBy: [SortDescriptor(\.startedAt, order: .reverse)]
+        )
+        descriptor.fetchLimit = max(0, limit)
+        return descriptor
+    }
+
+    static func displayCutoff(
+        now: Date = .now,
+        calendar: Calendar = .current
+    ) -> Date {
+        let startOfToday = calendar.startOfDay(for: now)
+        return calendar.date(byAdding: .day, value: -4, to: startOfToday) ?? startOfToday
+    }
+
+    static func recentDisplayDescriptor(
+        since cutoff: Date,
+        limit: Int
+    ) -> FetchDescriptor<ListeningHistoryEntry> {
+        let predicate = #Predicate<ListeningHistoryEntry> { entry in
+            entry.startedAt >= cutoff
+        }
+        var descriptor = FetchDescriptor<ListeningHistoryEntry>(
+            predicate: predicate,
             sortBy: [SortDescriptor(\.startedAt, order: .reverse)]
         )
         descriptor.fetchLimit = max(0, limit)
