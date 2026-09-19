@@ -279,6 +279,41 @@ final class PlaybackManager: ObservableObject {
         activeInterruptionContext?.wasPlaying == true
     }
 
+    enum PlaybackCompletionSource: String {
+        case normalEnd = "normalEnd"
+        case boundary = "boundary"
+        case failedToEnd = "failedToEnd"
+        case stalledFallback = "stalledFallback"
+        case timingFallback = "timingFallback"
+    }
+
+    /// Completion gate: ensures the active playback request completes natural completion at most once.
+    private var completedPlaybackRequestID: UUID?
+
+    /// Conservative tolerance (seconds) to distinguish genuine near-EOF failures/stalls from mid-song ones.
+    private let nearEOFTolerance: TimeInterval = 2.0
+
+    /// Grace period (seconds) before an unrecovered stall near EOF triggers natural completion fallback.
+    private let stallGracePeriod: TimeInterval = 2.5
+
+    /// Grace period (seconds) before a near-end paused/waiting state triggers timing safety net completion.
+    private let timingFallbackGracePeriod: TimeInterval = 1.5
+
+    private var stallFallbackTask: Task<Void, Never>?
+    private var timingFallbackTask: Task<Void, Never>?
+
+    /// Tracks requested video IDs for duration hydration to avoid redundant API queries.
+    private var durationHydrationRequestedVideoIDs: Set<String> = []
+    private var durationHydrationTasks: [String: Task<Void, Never>] = [:]
+
+    /// Temporary validated UI fallback duration when Track.duration is missing.
+    /// Strictly kept in-memory and NEVER persisted to Track.duration.
+    private var temporaryValidatedUIDuration: TimeInterval?
+
+#if DEBUG
+    var testMetadataProvider: ((String) async throws -> YouTubeMetadata)?
+#endif
+
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
     private var pendingTrimPreviewStartTime: (track: Track, time: TimeInterval)?
     private var suspendedPlaybackContext: SuspendedPlaybackContext?
@@ -1385,6 +1420,7 @@ final class PlaybackManager: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         activeRequestID = requestID
+        completedPlaybackRequestID = nil
         currentTrack = persistentTrack
         currentPlayableTrack = playableTrack
         lifecycleLog("startPlaybackContext videoID=\(videoID) title=\"\(playableTrack.title)\" origin=\(String(describing: playbackOrigin)) duration=\(playableTrack.duration.map { "\($0)s" } ?? "nil") requestID=\(requestID)")
@@ -1393,6 +1429,12 @@ final class PlaybackManager: ObservableObject {
             publishNowPlaying(playableTrack, requestID: requestID)
         }
 #endif
+
+        hydrateTrackDurationIfNeeded(
+            for: persistentTrack,
+            playableTrack: playableTrack,
+            requestID: requestID
+        )
 
         guard !videoID.isEmpty else {
             if let preparedPlayback {
@@ -1491,6 +1533,7 @@ final class PlaybackManager: ObservableObject {
 
     func pause() {
         activeInterruptionContext = nil
+        cancelPendingCompletionFallbacks(reason: "user paused")
 
         if isTrimPreviewActive {
             pauseActiveTrimPreview()
@@ -1747,6 +1790,7 @@ final class PlaybackManager: ObservableObject {
 
     func resume() {
         activeInterruptionContext = nil
+        cancelPendingCompletionFallbacks(reason: "resumed")
 
         if isTrimPreviewActive {
             guard let track = trimPreviewRange?.track else {
@@ -1773,6 +1817,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func seek(to time: TimeInterval) {
+        cancelPendingCompletionFallbacks(reason: "user sought")
         guard
             time.isFinite,
             let player,
@@ -1812,6 +1857,9 @@ final class PlaybackManager: ObservableObject {
 
     func stop() {
         activeInterruptionContext = nil
+        cancelPendingCompletionFallbacks(reason: "playback stopped")
+        completedPlaybackRequestID = nil
+        temporaryValidatedUIDuration = nil
         lifecycleLog("stop called: currentIndex=\(String(describing: currentIndex)), queueCount=\(queue.count), origin=\(String(describing: playbackOrigin))")
         if isTrimPreviewActive {
             endActiveTrimPreviewIfNeeded()
@@ -3052,11 +3100,12 @@ final class PlaybackManager: ObservableObject {
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
-        ) { [managerReference, itemReference] _ in
+        ) { [managerReference, itemReference] notification in
+            let item = (notification.object as? AVPlayerItem) ?? itemReference.value
             Task { @MainActor in
                 guard
                     let self = managerReference.value,
-                    let item = itemReference.value
+                    let item
                 else {
                     return
                 }
@@ -3064,7 +3113,7 @@ final class PlaybackManager: ObservableObject {
                 let currentPos = self.player?.currentTime().seconds ?? -1
                 let dur = item.duration.seconds
                 self.endLog("AVPlayerItemDidPlayToEndTime fired for request=\(requestID) itemCurrentTime=\(currentPos)s itemDuration=\(dur)s isActive=\(self.isActive(requestID))")
-                self.handlePlaybackCompletion(for: item, requestID: requestID)
+                self.handlePlaybackCompletion(for: item, requestID: requestID, source: .normalEnd)
             }
         }
 
@@ -3073,17 +3122,40 @@ final class PlaybackManager: ObservableObject {
             object: item,
             queue: .main
         ) { [managerReference, itemReference] notification in
+            let item = (notification.object as? AVPlayerItem) ?? itemReference.value
+            let errorDesc = (notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription
             Task { @MainActor in
                 guard
                     let self = managerReference.value,
-                    let item = itemReference.value
+                    let item,
+                    self.isActive(requestID),
+                    self.player?.currentItem === item
                 else {
                     return
                 }
 
-                let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
                 let currentPos = self.player?.currentTime().seconds ?? -1
-                self.endLog("AVPlayerItemFailedToPlayToEndTime fired for request=\(requestID) error=\(String(describing: error?.localizedDescription)) itemCurrentTime=\(currentPos)s isActive=\(self.isActive(requestID))")
+                let playbackRange = self.effectivePlaybackRange(for: self.currentPlayableTrack)
+                let effectiveEnd = playbackRange.endTime
+
+                let isNearEOF = self.isNearEffectivePlaybackEnd(
+                    position: currentPos,
+                    effectiveEndTime: effectiveEnd,
+                    tolerance: self.nearEOFTolerance
+                )
+
+                self.endLog("AVPlayerItemFailedToPlayToEndTime fired for request=\(requestID) error=\(String(describing: errorDesc)) itemCurrentTime=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s isNearEOF=\(isNearEOF) isActive=\(self.isActive(requestID))")
+
+                if isNearEOF {
+                    self.endLog("Failed-to-end within near-EOF tolerance (\(self.nearEOFTolerance)s) -> routing to natural completion")
+                    self.handlePlaybackCompletion(
+                        for: item,
+                        requestID: requestID,
+                        source: .failedToEnd
+                    )
+                } else {
+                    self.endLog("Failed-to-end not near EOF -> preserving normal failure handling")
+                }
             }
         }
 
@@ -3091,11 +3163,14 @@ final class PlaybackManager: ObservableObject {
             forName: .AVPlayerItemPlaybackStalled,
             object: item,
             queue: .main
-        ) { [managerReference, itemReference] _ in
+        ) { [managerReference, itemReference] notification in
+            let item = (notification.object as? AVPlayerItem) ?? itemReference.value
             Task { @MainActor in
                 guard
                     let self = managerReference.value,
-                    let item = itemReference.value
+                    let item,
+                    self.isActive(requestID),
+                    self.player?.currentItem === item
                 else {
                     return
                 }
@@ -3103,6 +3178,7 @@ final class PlaybackManager: ObservableObject {
                 let currentPos = self.player?.currentTime().seconds ?? -1
                 let timeControl = self.player?.timeControlStatus.rawValue ?? -1
                 self.endLog("AVPlayerItemPlaybackStalled fired for request=\(requestID) itemCurrentTime=\(currentPos)s timeControlStatus=\(timeControl) isActive=\(self.isActive(requestID))")
+                self.handlePlaybackStalled(for: item, requestID: requestID)
             }
         }
 
@@ -3126,6 +3202,16 @@ final class PlaybackManager: ObservableObject {
                         trackDuration: trackDuration,
                         requestID: requestID
                     )
+                    if self.validDuration(self.currentPlayableTrack?.duration) == nil {
+                        let itemDuration = self.validDuration(item.duration.seconds)
+                        let ranges = item.seekableTimeRanges.map(\.timeRangeValue)
+                        if self.isPlausibleItemDuration(itemDuration, seekableRanges: ranges) {
+                            self.temporaryValidatedUIDuration = itemDuration
+                            self.timingLog("Using plausible item duration=\(itemDuration!)s as temporary in-memory UI fallback for \(videoID)")
+                        } else {
+                            self.timingLog("Rejecting implausible/unsafe item duration=\(String(describing: itemDuration))s for \(videoID)")
+                        }
+                    }
 #if os(iOS)
                     self.synchronizeNowPlayingPlaybackState()
 #endif
@@ -3179,9 +3265,15 @@ final class PlaybackManager: ObservableObject {
                     if self.isAudioInterrupted {
                         self.state = .paused
                     }
+                    self.scheduleNearEndTimingFallbackIfNeeded(
+                        for: player,
+                        item: self.player?.currentItem,
+                        requestID: requestID
+                    )
                     return
                 }
 
+                self.cancelPendingCompletionFallbacks(reason: "player resumed playing")
                 self.state = .playing
                 guard !self.isTrimPreviewActive else {
                     return
@@ -3600,17 +3692,18 @@ final class PlaybackManager: ObservableObject {
         if authoritativeDuration == nil {
             timingLog("effectivePlaybackRange: track \"\(track.title)\" (\(track.youtubeVideoID)) has nil or invalid duration: \(String(describing: track.duration))")
         }
-        let fullTrackRange = EffectivePlaybackRange(startTime: 0, endTime: authoritativeDuration)
-        guard let authoritativeDuration else {
+        let effectiveDuration = authoritativeDuration ?? temporaryValidatedUIDuration
+        let fullTrackRange = EffectivePlaybackRange(startTime: 0, endTime: effectiveDuration)
+        guard let effectiveDuration else {
             return fullTrackRange
         }
 
         let startTime = track.playbackStartTime ?? 0
-        let endTime = track.playbackEndTime ?? authoritativeDuration
+        let endTime = track.playbackEndTime ?? effectiveDuration
         return validatedPlaybackRange(
             startTime: startTime,
             endTime: endTime,
-            authoritativeDuration: authoritativeDuration
+            authoritativeDuration: effectiveDuration
         ) ?? fullTrackRange
     }
 
@@ -3649,6 +3742,7 @@ final class PlaybackManager: ObservableObject {
         if let endTime = playbackRange.endTime {
             clampedTime = min(clampedTime, endTime)
         }
+
         return clampedTime
     }
 
@@ -3755,7 +3849,7 @@ final class PlaybackManager: ObservableObject {
 
                 let currentPos = self.player?.currentTime().seconds ?? -1
                 self.endLog("boundary observer fired at \(effectiveEndTime)s for request=\(requestID) itemCurrentTime=\(currentPos)s isActive=\(self.isActive(requestID))")
-                self.handlePlaybackCompletion(for: item, requestID: requestID)
+                self.handlePlaybackCompletion(for: item, requestID: requestID, source: .boundary)
             }
         }
     }
@@ -3837,12 +3931,170 @@ final class PlaybackManager: ObservableObject {
         endTrimPreview(for: track)
     }
 
-    private func handlePlaybackCompletion(for item: AVPlayerItem, requestID: UUID) {
-        endLog("handlePlaybackCompletion entered: requestID=\(requestID) isActive=\(isActive(requestID)) playerCurrentItemMatch=\(player?.currentItem === item)")
-        guard isActive(requestID), player?.currentItem === item else {
-            endLog("handlePlaybackCompletion dropped: isActive=\(isActive(requestID)), currentItemMatch=\(player?.currentItem === item)")
+    private func isNearEffectivePlaybackEnd(
+        position: TimeInterval,
+        effectiveEndTime: TimeInterval?,
+        tolerance: TimeInterval = 2.0
+    ) -> Bool {
+        guard let effectiveEndTime, effectiveEndTime > 0, position.isFinite, position >= 0 else {
+            return false
+        }
+        return position >= (effectiveEndTime - tolerance)
+    }
+
+    func isPlausibleItemDuration(
+        _ duration: TimeInterval?,
+        seekableRanges: [CMTimeRange] = []
+    ) -> Bool {
+        guard let duration, duration.isFinite, duration > 0 else {
+            return false
+        }
+        if duration > 86400 {
+            return false
+        }
+        if let lastRange = seekableRanges.last {
+            let seekableEnd = lastRange.end.seconds
+            if seekableEnd > 30, duration > seekableEnd * 1.8 {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func cancelPendingCompletionFallbacks(reason: String = "cancelled") {
+        if stallFallbackTask != nil {
+            endLog("cancelPendingCompletionFallbacks: cancelling stall fallback (\(reason))")
+            stallFallbackTask?.cancel()
+            stallFallbackTask = nil
+        }
+        if timingFallbackTask != nil {
+            endLog("cancelPendingCompletionFallbacks: cancelling timing fallback (\(reason))")
+            timingFallbackTask?.cancel()
+            timingFallbackTask = nil
+        }
+    }
+
+    private func handlePlaybackStalled(for item: AVPlayerItem, requestID: UUID) {
+        let currentPos = player?.currentTime().seconds ?? -1
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        let effectiveEnd = playbackRange.endTime
+
+        let isNearEOF = isNearEffectivePlaybackEnd(
+            position: currentPos,
+            effectiveEndTime: effectiveEnd,
+            tolerance: nearEOFTolerance
+        )
+
+        endLog("AVPlayerItemPlaybackStalled: request=\(requestID) currentPos=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s isNearEOF=\(isNearEOF)")
+
+        guard isNearEOF else {
+            endLog("Playback stall not near EOF; waiting for normal buffering recovery")
             return
         }
+
+        stallFallbackTask?.cancel()
+        stallFallbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.stallGracePeriod ?? 2.5) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            guard self.isActive(requestID), self.player?.currentItem === item else { return }
+            guard self.completedPlaybackRequestID != requestID else { return }
+
+            if let player = self.player, player.timeControlStatus == .playing || player.rate > 0 {
+                self.endLog("Stall fallback cancelled: playback recovered during grace period")
+                return
+            }
+
+            self.endLog("Stall fallback triggered after \(self.stallGracePeriod)s grace period near EOF")
+            self.handlePlaybackCompletion(
+                for: item,
+                requestID: requestID,
+                source: .stalledFallback
+            )
+        }
+    }
+
+    private func scheduleNearEndTimingFallbackIfNeeded(
+        for player: AVPlayer,
+        item: AVPlayerItem?,
+        requestID: UUID
+    ) {
+        guard
+            let item,
+            isActive(requestID),
+            self.player === player,
+            player.currentItem === item,
+            !isAudioInterrupted,
+            !isTrimPreviewActive,
+            completedPlaybackRequestID != requestID,
+            state != .paused
+        else {
+            return
+        }
+
+        let currentPos = player.currentTime().seconds
+        guard currentPos.isFinite, currentPos >= 0 else { return }
+
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        let effectiveEnd = playbackRange.endTime
+
+        guard isNearEffectivePlaybackEnd(
+            position: currentPos,
+            effectiveEndTime: effectiveEnd,
+            tolerance: nearEOFTolerance
+        ) else {
+            return
+        }
+
+        endLog("Scheduling near-end timing safety net fallback: pos=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s gracePeriod=\(timingFallbackGracePeriod)s")
+
+        timingFallbackTask?.cancel()
+        timingFallbackTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64((self?.timingFallbackGracePeriod ?? 1.5) * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            guard self.isActive(requestID), self.player === player, player.currentItem === item else { return }
+            guard self.completedPlaybackRequestID != requestID else { return }
+            guard self.state != .paused, !self.isAudioInterrupted else { return }
+
+            if player.timeControlStatus == .playing || player.rate > 0 {
+                self.endLog("Timing safety net cancelled: playback resumed during grace period")
+                return
+            }
+
+            self.endLog("Timing safety net triggered after \(self.timingFallbackGracePeriod)s near EOF (pos=\(currentPos)s, effectiveEnd=\(String(describing: effectiveEnd))s)")
+            self.handlePlaybackCompletion(
+                for: item,
+                requestID: requestID,
+                source: .timingFallback
+            )
+        }
+    }
+
+    private func handlePlaybackCompletion(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        source: PlaybackCompletionSource
+    ) {
+        let currentPos = player?.currentTime().seconds ?? -1
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        let effectiveEnd = playbackRange.endTime
+        let videoID = currentPlayableTrack?.youtubeVideoID ?? "none"
+
+        endLog("handlePlaybackCompletion entered: source=\(source.rawValue) requestID=\(requestID) videoID=\(videoID) currentPos=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s isActive=\(isActive(requestID)) itemMatch=\(player?.currentItem === item)")
+
+        guard isActive(requestID), player?.currentItem === item else {
+            endLog("handlePlaybackCompletion dropped: stale request or item mismatch (isActive=\(isActive(requestID)), currentItemMatch=\(player?.currentItem === item))")
+            return
+        }
+
+        guard completedPlaybackRequestID != requestID else {
+            endLog("handlePlaybackCompletion ignored: completion already handled for requestID=\(requestID) (attempted source=\(source.rawValue))")
+            return
+        }
+
+        completedPlaybackRequestID = requestID
+        cancelPendingCompletionFallbacks(reason: "completion accepted")
+
+        endLog("handlePlaybackCompletion accepted: source=\(source.rawValue) for videoID=\(videoID)")
 
         if isTrimPreviewActive {
             lifecycleLog("pausing active trim preview at end")
@@ -3865,6 +4117,96 @@ final class PlaybackManager: ObservableObject {
             log("Final item completed; stopping playback")
             pendingListeningHistoryOutcome = .naturalCompletion
             stop()
+        }
+    }
+
+    private func hydrateTrackDurationIfNeeded(
+        for track: Track?,
+        playableTrack: PlayableTrack,
+        requestID: UUID
+    ) {
+        let videoID = normalizedVideoID(playableTrack.youtubeVideoID)
+        guard !videoID.isEmpty else { return }
+
+        if let currentDuration = validDuration(track?.duration ?? playableTrack.duration) {
+            endLog("hydrateTrackDurationIfNeeded: duration already known (\(currentDuration)s) for \(videoID)")
+            return
+        }
+
+        guard durationHydrationRequestedVideoIDs.insert(videoID).inserted else {
+            endLog("hydrateTrackDurationIfNeeded: hydration already in flight or requested for \(videoID)")
+            return
+        }
+
+        durationHydrationTasks[videoID] = Task { [weak self] in
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.durationHydrationTasks[videoID] = nil
+                }
+            }
+
+            do {
+                let metadata: YouTubeMetadata
+#if DEBUG
+                if let self, let provider = self.testMetadataProvider {
+                    metadata = try await provider(videoID)
+                } else if let self {
+                    metadata = try await self.metadataClient.metadata(for: videoID)
+                } else {
+                    return
+                }
+#else
+                guard let self else { return }
+                metadata = try await self.metadataClient.metadata(for: videoID)
+#endif
+
+                guard let self else { return }
+                guard let authoritativeDuration = self.validDuration(metadata.duration) else {
+                    self.endLog("Hydration returned nil/invalid duration for \(videoID)")
+                    return
+                }
+
+                if let targetTrack = track ?? self.currentTrack, targetTrack.youtubeVideoID == videoID {
+                    targetTrack.duration = authoritativeDuration
+                    if let thumb = metadata.thumbnailURL {
+                        targetTrack.thumbnailURL = thumb
+                    }
+                    targetTrack.metadataLastRefreshed = .now
+                    try? targetTrack.modelContext?.save()
+                    self.endLog("Successfully hydrated and persisted Track.duration=\(authoritativeDuration)s for \(videoID)")
+                }
+
+                guard self.isActive(requestID), self.currentPlayableTrack?.youtubeVideoID == videoID else {
+                    return
+                }
+
+                self.temporaryValidatedUIDuration = nil
+                if let updatedPlayable = self.currentPlayableTrack {
+                    self.currentPlayableTrack = PlayableTrack(
+                        youtubeVideoID: updatedPlayable.youtubeVideoID,
+                        title: updatedPlayable.title,
+                        channelTitle: updatedPlayable.channelTitle,
+                        thumbnailURL: metadata.thumbnailURL ?? updatedPlayable.thumbnailURL,
+                        duration: authoritativeDuration,
+                        playbackStartTime: updatedPlayable.playbackStartTime,
+                        playbackEndTime: updatedPlayable.playbackEndTime
+                    )
+                }
+
+                let newRange = self.effectivePlaybackRange(for: self.currentPlayableTrack)
+                self.updateActivePlaybackRange(newRange)
+#if os(iOS)
+                if let currentPlayableTrack = self.currentPlayableTrack {
+                    self.publishNowPlaying(currentPlayableTrack, requestID: requestID)
+                    self.synchronizeNowPlayingPlaybackState()
+                }
+#endif
+                self.endLog("Active playback range and Now Playing updated with hydrated duration for \(videoID)")
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.endLog("Duration hydration failed for \(videoID): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -4980,6 +5322,7 @@ final class PlaybackManager: ObservableObject {
     ) {
         switch type {
         case .began:
+            cancelPendingCompletionFallbacks(reason: "audio interrupted")
             let wasPlaying = (state == .playing) || (player?.timeControlStatus == .playing)
             let rate = player?.rate ?? 0
             let timeControl = player?.timeControlStatus.rawValue ?? -1
@@ -5052,12 +5395,18 @@ final class PlaybackManager: ObservableObject {
     private func invalidateCurrentRequest() {
         activeRequestID = nil
         activeInterruptionContext = nil
+        completedPlaybackRequestID = nil
+        cancelPendingCompletionFallbacks(reason: "request invalidated")
+        temporaryValidatedUIDuration = nil
         playbackTask?.cancel()
         playbackTask = nil
     }
 
     private func clearPlayer() {
         lifecycleLog("clearPlayer called: activeRequestID=\(String(describing: activeRequestID)), hadPlayer=\(player != nil)")
+        cancelPendingCompletionFallbacks(reason: "player cleared")
+        completedPlaybackRequestID = nil
+        temporaryValidatedUIDuration = nil
         finishActiveListeningPeriod()
         if listeningHistoryRecorder?.finalize(
             requestID: activeRequestID,
@@ -5299,6 +5648,7 @@ final class PlaybackManager: ObservableObject {
         self.manualQueueCount = manualQueueCount
         // Set a fake currentPlayableTrack so queue mutation guards pass.
         if tracks.indices.contains(currentIndex) {
+            self.currentTrack = tracks[currentIndex]
             self.currentPlayableTrack = PlayableTrack(track: tracks[currentIndex])
         }
     }
@@ -5351,6 +5701,82 @@ final class PlaybackManager: ObservableObject {
         if let player {
             self.player = player
         }
+    }
+
+    func triggerPlaybackCompletionForTesting(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        source: PlaybackCompletionSource
+    ) {
+        handlePlaybackCompletion(for: item, requestID: requestID, source: source)
+    }
+
+    func triggerFailedToEndForTesting(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        currentPosition: TimeInterval,
+        effectiveEnd: TimeInterval?
+    ) {
+        let isNearEOF = isNearEffectivePlaybackEnd(
+            position: currentPosition,
+            effectiveEndTime: effectiveEnd,
+            tolerance: nearEOFTolerance
+        )
+        if isNearEOF {
+            handlePlaybackCompletion(for: item, requestID: requestID, source: .failedToEnd)
+        }
+    }
+
+    func triggerStalledForTesting(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        currentPosition: TimeInterval,
+        effectiveEnd: TimeInterval?,
+        simulatedRecovery: Bool = false
+    ) {
+        let isNearEOF = isNearEffectivePlaybackEnd(
+            position: currentPosition,
+            effectiveEndTime: effectiveEnd,
+            tolerance: nearEOFTolerance
+        )
+        guard isNearEOF else { return }
+        if simulatedRecovery {
+            cancelPendingCompletionFallbacks(reason: "simulated recovery")
+            return
+        }
+        handlePlaybackCompletion(for: item, requestID: requestID, source: .stalledFallback)
+    }
+
+    func isNearEffectivePlaybackEndForTesting(
+        position: TimeInterval,
+        effectiveEndTime: TimeInterval?,
+        tolerance: TimeInterval = 2.0
+    ) -> Bool {
+        isNearEffectivePlaybackEnd(position: position, effectiveEndTime: effectiveEndTime, tolerance: tolerance)
+    }
+
+    func hydrateTrackDurationForTesting(
+        for track: Track,
+        requestID: UUID
+    ) async {
+        let playable = PlayableTrack(track: track)
+        hydrateTrackDurationIfNeeded(for: track, playableTrack: playable, requestID: requestID)
+        if let task = durationHydrationTasks[track.youtubeVideoID] {
+            _ = await task.result
+        }
+    }
+
+    var completedPlaybackRequestIDForTesting: UUID? {
+        completedPlaybackRequestID
+    }
+
+    var temporaryValidatedUIDurationForTesting: TimeInterval? {
+        get { temporaryValidatedUIDuration }
+        set { temporaryValidatedUIDuration = newValue }
+    }
+
+    func setRepeatModeForTesting(_ mode: RepeatMode) {
+        self.repeatMode = mode
     }
 #endif
 
