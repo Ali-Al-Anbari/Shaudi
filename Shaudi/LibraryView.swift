@@ -1769,6 +1769,8 @@ struct TrackDetailView: View {
                     track.metadataLastRefreshed = .now
                     track.playbackStartTime = nil
                     track.playbackEndTime = nil
+                    track.authoritativeRecommendationTitle = nil
+                    track.authoritativeRecommendationArtist = nil
                 }
 
                 track.title = request.title

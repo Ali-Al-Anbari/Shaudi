@@ -27,6 +27,8 @@ final class Track {
     var playbackEndTime: Double? = nil
     var customCoverID: UUID? = nil
     var playlists: [Playlist]
+    var authoritativeRecommendationTitle: String? = nil
+    var authoritativeRecommendationArtist: String? = nil
 
     init(
         title: String,
@@ -44,7 +46,9 @@ final class Track {
         playbackStartTime: Double? = nil,
         playbackEndTime: Double? = nil,
         customCoverID: UUID? = nil,
-        playlists: [Playlist] = []
+        playlists: [Playlist] = [],
+        authoritativeRecommendationTitle: String? = nil,
+        authoritativeRecommendationArtist: String? = nil
     ) {
         self.title = title
         self.youtubeURL = youtubeURL
@@ -62,6 +66,8 @@ final class Track {
         self.playbackEndTime = playbackEndTime
         self.customCoverID = customCoverID
         self.playlists = playlists
+        self.authoritativeRecommendationTitle = authoritativeRecommendationTitle
+        self.authoritativeRecommendationArtist = authoritativeRecommendationArtist
     }
 }
 

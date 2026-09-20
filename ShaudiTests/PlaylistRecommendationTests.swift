@@ -814,4 +814,171 @@ final class PlaylistRecommendationTests: XCTestCase {
             return XCTFail("Expected explicit user override to remain authoritative")
         }
     }
+
+    func testUserEditedTitleRetainsPrecedenceOverPersistedRecommendationTitle() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Title Override")
+        context.insert(playlist)
+        let recommendation = makeResolved(
+            artist: "Canonical Artist",
+            title: "Canonical Song",
+            videoID: "override002"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        let inserted = try XCTUnwrap(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+        inserted.title = "My Corrected Title"
+        try context.save()
+
+        let reloaded = try XCTUnwrap(
+            ModelContext(container).fetch(FetchDescriptor<Track>())
+                .first { $0.youtubeVideoID == "override002" }
+        )
+        let anchor = try XCTUnwrap(
+            PlaylistVibeProfile.build(from: [reloaded]).representativeAnchors.first
+        )
+
+        XCTAssertEqual(anchor.songIdentity.artist, "Canonical Artist")
+        XCTAssertEqual(anchor.songIdentity.title, "My Corrected Title")
+    }
+
+    func testLegacyTrackWithoutRecommendationProvenanceUsesExistingParser() {
+        let legacy = makeTrack(
+            id: "legacy00001",
+            title: "Legacy Artist - Legacy Song",
+            artist: "Archive Uploader"
+        )
+
+        XCTAssertNil(legacy.authoritativeRecommendationTitle)
+        XCTAssertNil(legacy.authoritativeRecommendationArtist)
+        let anchor = PlaylistVibeProfile.build(from: [legacy]).representativeAnchors.first
+
+        XCTAssertEqual(
+            anchor?.songIdentity,
+            SongIdentity(artist: "Legacy Artist", title: "Legacy Song")
+        )
+    }
+
+    func testExistingLibraryTrackIsReusedAndGainsRecommendationProvenance() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Existing Track")
+        let existing = makeTrack(
+            id: "existing001",
+            title: "West Coast",
+            artist: "SomeFanArchive"
+        )
+        context.insert(playlist)
+        context.insert(existing)
+        try context.save()
+        let recommendation = makeResolved(
+            artist: "Lana Del Rey",
+            title: "West Coast",
+            videoID: "existing001",
+            youtubeTitle: "West Coast (fan upload)",
+            uploader: "SomeFanArchive"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        let added = try XCTUnwrap(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: [existing]
+        ))
+
+        XCTAssertTrue(added === existing)
+        XCTAssertEqual(try ModelContext(container).fetch(FetchDescriptor<Track>()).count, 1)
+        XCTAssertEqual(existing.channelTitle, "SomeFanArchive")
+        XCTAssertEqual(
+            existing.persistedAuthoritativeRecommendationIdentity,
+            SongIdentity(artist: "Lana Del Rey", title: "West Coast")
+        )
+        XCTAssertEqual(
+            PlaylistVibeProfile.build(from: [existing])
+                .representativeAnchors.first?.songIdentity,
+            SongIdentity(artist: "Lana Del Rey", title: "West Coast")
+        )
+    }
+
+    func testRecommendationPromotionPreservesTransportMetadata() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Transport Metadata")
+        context.insert(playlist)
+        let thumbnailURL = URL(string: "https://example.com/canonical-cover.jpg")!
+        let recommendation = ResolvedRecommendation(
+            artist: "Canonical Artist",
+            title: "Canonical Song",
+            match: 0.9,
+            youtubeResult: YouTubeSearchResult(
+                youtubeVideoID: "metadata001",
+                title: "Misleading Upload Title",
+                channelTitle: "Unrelated Uploader",
+                thumbnailURL: thumbnailURL,
+                duration: 321
+            )
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        XCTAssertNotNil(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+        let reloaded = try XCTUnwrap(
+            ModelContext(container).fetch(FetchDescriptor<Track>())
+                .first { $0.youtubeVideoID == "metadata001" }
+        )
+
+        XCTAssertEqual(reloaded.youtubeVideoID, "metadata001")
+        XCTAssertEqual(reloaded.thumbnailURL, thumbnailURL)
+        XCTAssertEqual(reloaded.duration, 321)
+        XCTAssertEqual(reloaded.title, "Canonical Song")
+        XCTAssertEqual(reloaded.channelTitle, "Canonical Artist")
+        XCTAssertEqual(reloaded.authoritativeRecommendationTitle, "Canonical Song")
+        XCTAssertEqual(reloaded.authoritativeRecommendationArtist, "Canonical Artist")
+    }
+
+    func testManualTrackDoesNotBecomeAuthoritativeRecommendationIdentity() {
+        let manual = makeTrack(
+            id: "manual00001",
+            title: "Artist Name - Song Name",
+            artist: "Artist Name"
+        )
+
+        XCTAssertNil(manual.persistedAuthoritativeRecommendationIdentity)
+        XCTAssertEqual(
+            PlaylistVibeProfile.build(from: [manual])
+                .representativeAnchors.first?.songIdentity,
+            SongIdentity(artist: "Artist Name", title: "Song Name")
+        )
+    }
+
+    func testRawUploaderMetadataRemainsLowConfidenceForLegacyTrack() {
+        let upload = makeTrack(
+            id: "uploader001",
+            title: "A Song Without Artist Attribution",
+            artist: "Random Upload Channel"
+        )
+
+        let profile = PlaylistVibeProfile.build(from: [upload])
+
+        XCTAssertNil(upload.persistedAuthoritativeRecommendationIdentity)
+        XCTAssertTrue(profile.representativeAnchors.isEmpty)
+        XCTAssertTrue(profile.existingIdentities.isEmpty)
+    }
 }

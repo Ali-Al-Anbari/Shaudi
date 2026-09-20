@@ -5152,7 +5152,9 @@ final class PlaybackManager: ObservableObject {
             channelTitle: result.artist,
             thumbnailURL: result.youtubeResult.thumbnailURL,
             duration: result.youtubeResult.duration,
-            metadataLastRefreshed: .now
+            metadataLastRefreshed: .now,
+            authoritativeRecommendationTitle: result.songIdentity.title,
+            authoritativeRecommendationArtist: result.songIdentity.artist
         )
     }
 

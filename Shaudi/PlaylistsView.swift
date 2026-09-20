@@ -1166,6 +1166,7 @@ struct PlaylistDetailView: View {
     private func trackForRecommendation(_ item: ResolvedRecommendation) -> Track {
         let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
         if let existing = libraryTracks.first(where: { $0.youtubeVideoID == videoID }) {
+            existing.preserveAuthoritativeRecommendationIdentity(item.songIdentity)
             return existing
         }
         let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") ?? URL(string: "https://www.youtube.com")!
@@ -1176,7 +1177,9 @@ struct PlaylistDetailView: View {
             channelTitle: item.artist,
             thumbnailURL: item.youtubeResult.thumbnailURL,
             duration: item.youtubeResult.duration,
-            metadataLastRefreshed: .now
+            metadataLastRefreshed: .now,
+            authoritativeRecommendationTitle: item.songIdentity.title,
+            authoritativeRecommendationArtist: item.songIdentity.artist
         )
         modelContext.insert(track)
         return track

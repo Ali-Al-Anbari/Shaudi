@@ -28,13 +28,7 @@ struct PlaylistVibeProfile {
                 existingVideoIDs.insert(videoID)
             }
 
-            let seed = RecommendationSeed(
-                youtubeVideoID: track.youtubeVideoID,
-                rawTitle: track.title,
-                displayedArtist: track.displayArtist,
-                sourceChannel: track.channelTitle,
-                userArtistOverride: track.userArtistOverride
-            )
+            let seed = RecommendationSeed(persistedTrack: track)
 
             guard !seed.cleanedArtist.isEmpty, !seed.cleanedTitle.isEmpty else {
                 continue
@@ -778,6 +772,7 @@ final class PlaylistRecommendationService {
         let track: Track
         if let existing = existingLibraryTracks.first(where: { $0.youtubeVideoID == videoID }) {
             track = existing
+            track.preserveAuthoritativeRecommendationIdentity(recommendation.songIdentity)
         } else {
             guard let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") else {
                 return nil
@@ -789,7 +784,9 @@ final class PlaylistRecommendationService {
                 channelTitle: recommendation.artist,
                 thumbnailURL: recommendation.youtubeResult.thumbnailURL,
                 duration: recommendation.youtubeResult.duration,
-                metadataLastRefreshed: .now
+                metadataLastRefreshed: .now,
+                authoritativeRecommendationTitle: recommendation.songIdentity.title,
+                authoritativeRecommendationArtist: recommendation.songIdentity.artist
             )
             modelContext.insert(track)
         }

@@ -35,6 +35,32 @@ struct SongIdentity: Hashable {
     }
 }
 
+extension Track {
+    var persistedAuthoritativeRecommendationIdentity: SongIdentity? {
+        guard
+            let artist = nonempty(authoritativeRecommendationArtist),
+            let title = nonempty(authoritativeRecommendationTitle)
+        else {
+            return nil
+        }
+        return SongIdentity(artist: artist, title: title)
+    }
+
+    func preserveAuthoritativeRecommendationIdentity(_ identity: SongIdentity) {
+        if nonempty(authoritativeRecommendationArtist) != nil,
+           nonempty(authoritativeRecommendationTitle) != nil {
+            return
+        }
+        authoritativeRecommendationArtist = identity.artist
+        authoritativeRecommendationTitle = identity.title
+    }
+
+    private func nonempty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+}
+
 typealias RecommendationSongIdentity = SongIdentity
 
 struct RecommendationSeed {
@@ -130,6 +156,41 @@ struct RecommendationSeed {
 #endif
     }
 
+    init(persistedTrack track: Track) {
+        if let userArtistOverride = Self.nonempty(track.userArtistOverride) {
+            self.init(
+                youtubeVideoID: track.youtubeVideoID,
+                rawTitle: track.title,
+                displayedArtist: track.displayArtist,
+                sourceChannel: track.channelTitle,
+                userArtistOverride: userArtistOverride
+            )
+            return
+        }
+
+        if let identity = track.persistedAuthoritativeRecommendationIdentity {
+            let currentTitle = Self.nonempty(track.title) ?? identity.title
+            self.init(
+                youtubeVideoID: track.youtubeVideoID,
+                canonicalIdentity: SongIdentity(
+                    artist: identity.artist,
+                    title: currentTitle
+                ),
+                youtubeTitle: track.title,
+                youtubeChannel: track.channelTitle ?? ""
+            )
+            return
+        }
+
+        self.init(
+            youtubeVideoID: track.youtubeVideoID,
+            rawTitle: track.title,
+            displayedArtist: track.displayArtist,
+            sourceChannel: track.channelTitle,
+            userArtistOverride: track.userArtistOverride
+        )
+    }
+
     var songIdentity: RecommendationSongIdentity {
         RecommendationSongIdentity(artist: cleanedArtist, title: cleanedTitle)
     }
@@ -140,6 +201,11 @@ struct RecommendationSeed {
         }
         guard identityConfidence >= .high else { return nil }
         return songIdentity
+    }
+
+    private static func nonempty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
     }
 }
 
