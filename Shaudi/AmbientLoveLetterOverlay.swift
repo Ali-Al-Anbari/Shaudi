@@ -2,8 +2,8 @@ import Combine
 import SwiftUI
 
 enum LoveLetterPolicy {
-    nonisolated static let minimumDelay: TimeInterval = 1.5 * 60
-    nonisolated static let maximumDelay: TimeInterval = 3 * 60
+    nonisolated static let minimumDelay: TimeInterval = 2.5 * 60
+    nonisolated static let maximumDelay: TimeInterval = 6 * 60
     nonisolated static let fadeDuration: TimeInterval = 1
     nonisolated static let visibleDuration: TimeInterval = 5
 }

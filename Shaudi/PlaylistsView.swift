@@ -410,6 +410,9 @@ struct PlaylistDetailView: View {
 
     let playlist: Playlist
 
+    @Query(sort: \Track.dateAdded, order: .reverse)
+    private var libraryTracks: [Track]
+
     @State private var isShowingRename = false
     @State private var isShowingAddTracks = false
     @State private var isShowingPhotoPicker = false
@@ -422,6 +425,18 @@ struct PlaylistDetailView: View {
     @State private var editingTrack: Track?
     @State private var trimmingTrack: Track?
     @State private var playlistTrack: Track?
+
+    @State private var recommendationResult = PlaylistRecommendationResult(
+        visibleRecommendations: [],
+        spareResolved: [],
+        deferredCandidates: []
+    )
+    @State private var isRecommendationsLoading = false
+    @State private var isFindingMore = false
+    @State private var recommendationsErrorMessage: String?
+    @State private var recommendationTask: Task<Void, Never>?
+    @State private var recommendationRotation = 0
+    @State private var manualAddedVideoIDs: Set<String> = []
 
     private let warmupTrackLimit = 10
 
@@ -548,7 +563,7 @@ struct PlaylistDetailView: View {
                         ContentUnavailableView(
                             "No Tracks",
                             systemImage: "music.note",
-                            description: Text("Add tracks from your Library.")
+                            description: Text("Add some songs to get recommendations.")
                         )
                     } else {
                         List {
@@ -566,6 +581,8 @@ struct PlaylistDetailView: View {
                                 )
                                 .listRowSeparator(.hidden)
                             }
+
+                            recommendationsSection
                         }
                         .listStyle(.plain)
                         .scrollContentBackground(.hidden)
@@ -611,13 +628,16 @@ struct PlaylistDetailView: View {
         .onAppear {
             isPlaylistVisible = true
             updatePlaylistWarmup()
+            loadRecommendations()
         }
         .onDisappear {
             isPlaylistVisible = false
             playbackManager.cancelPlaylistWarmup()
+            recommendationTask?.cancel()
         }
-        .onChange(of: trackOrderSignature) {
+        .onChange(of: trackOrderSignature) { oldSignature, newSignature in
             updatePlaylistWarmup()
+            handleTrackSignatureChange(oldSignature: oldSignature, newSignature: newSignature)
         }
         .onChange(of: playbackManager.isShuffleEnabled) {
             updatePlaylistWarmup()
@@ -945,6 +965,350 @@ struct PlaylistDetailView: View {
             .font(.headline)
             .foregroundStyle(ShaudiTheme.lavender)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Playlist Recommendations
+
+    @ViewBuilder
+    private var recommendationsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Recommended for this playlist")
+                    .font(ShaudiTheme.bodyFont(size: 19, relativeTo: .headline).weight(.semibold))
+                    .foregroundStyle(.primary)
+
+                Spacer()
+
+                Button {
+                    handleRefreshRecommendations()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(isRecommendationsLoading ? ShaudiTheme.accent.opacity(0.4) : ShaudiTheme.accent)
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isRecommendationsLoading || isFindingMore)
+                .accessibilityLabel("Refresh recommendations")
+            }
+            .padding(.horizontal, 4)
+            .padding(.top, 16)
+
+            if isRecommendationsLoading && recommendationResult.visibleRecommendations.isEmpty {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .tint(ShaudiTheme.accent)
+                    Text("Finding recommendations…")
+                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 16)
+            } else if recommendationsErrorMessage != nil && recommendationResult.visibleRecommendations.isEmpty {
+                VStack(spacing: 6) {
+                    Text("Couldn’t load recommendations.")
+                        .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                        .foregroundStyle(.secondary)
+
+                    Button("Retry") {
+                        loadRecommendations(forceRefresh: true)
+                    }
+                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .footnote).weight(.semibold))
+                    .foregroundStyle(ShaudiTheme.accent)
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 14)
+            } else {
+                ForEach(recommendationResult.visibleRecommendations, id: \.youtubeResult.youtubeVideoID) { item in
+                    recommendationRow(item)
+                }
+
+                if recommendationResult.canFindMore {
+                    findMoreButton
+                }
+            }
+        }
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 12, trailing: 12))
+        .listRowSeparator(.hidden)
+    }
+
+    private var findMoreButton: some View {
+        Button {
+            handleFindMore()
+        } label: {
+            HStack(spacing: 8) {
+                if isFindingMore {
+                    ProgressView()
+                        .tint(ShaudiTheme.accent)
+                        .scaleEffect(0.85)
+                } else {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                Text(isFindingMore ? "Finding more…" : "Find More")
+                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline).weight(.semibold))
+            }
+            .foregroundStyle(ShaudiTheme.accent)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 11)
+            .background(
+                ShaudiTheme.card.opacity(0.58),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(ShaudiTheme.accent.opacity(0.28), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isFindingMore)
+        .padding(.top, 4)
+        .accessibilityLabel(isFindingMore ? "Finding more recommendations" : "Find more recommendations")
+    }
+
+    private func recommendationRow(_ item: ResolvedRecommendation) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                handlePlayRecommendation(item)
+            } label: {
+                HStack(spacing: 12) {
+                    AsyncImage(url: item.youtubeResult.thumbnailURL) { phase in
+                        if case .success(let image) = phase {
+                            image
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            trackArtworkPlaceholder
+                        }
+                    }
+                    .frame(width: 44, height: 44)
+                    .background(ShaudiTheme.lavender.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.title)
+                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text(item.artist)
+                            .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Play \(item.title) by \(item.artist)")
+
+            Spacer(minLength: 4)
+
+            Button {
+                handleAddRecommendation(item)
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 24))
+                    .foregroundStyle(ShaudiTheme.accent)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Add to playlist")
+
+            Menu {
+                Button {
+                    let track = trackForRecommendation(item)
+                    playbackManager.playNext(track)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                }
+
+                Button {
+                    let track = trackForRecommendation(item)
+                    playbackManager.addToQueue(track)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
+                }
+
+                Button {
+                    let track = trackForRecommendation(item)
+                    playlistTrack = track
+                } label: {
+                    Label("Add to Playlist", systemImage: "text.badge.plus")
+                }
+
+                Button(role: .destructive) {
+                    handleRejectRecommendation(item)
+                } label: {
+                    Label("Not for this playlist", systemImage: "hand.thumbsdown")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.headline)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("Song actions")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 9)
+        .background(
+            ShaudiTheme.card.opacity(0.58),
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+        )
+    }
+
+    private func trackForRecommendation(_ item: ResolvedRecommendation) -> Track {
+        let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let existing = libraryTracks.first(where: { $0.youtubeVideoID == videoID }) {
+            return existing
+        }
+        let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") ?? URL(string: "https://www.youtube.com")!
+        let track = Track(
+            title: item.title,
+            youtubeURL: url,
+            youtubeVideoID: videoID,
+            channelTitle: item.artist,
+            thumbnailURL: item.youtubeResult.thumbnailURL,
+            duration: item.youtubeResult.duration,
+            metadataLastRefreshed: .now
+        )
+        modelContext.insert(track)
+        return track
+    }
+
+    private func handlePlayRecommendation(_ item: ResolvedRecommendation) {
+        let playable = PlayableTrack(
+            youtubeVideoID: item.youtubeResult.youtubeVideoID,
+            title: item.title,
+            channelTitle: item.artist,
+            thumbnailURL: item.youtubeResult.thumbnailURL,
+            duration: item.youtubeResult.duration
+        )
+        playbackManager.play(playable, canonicalIdentity: item.songIdentity)
+    }
+
+    private func loadRecommendations(forceRefresh: Bool = false) {
+        recommendationTask?.cancel()
+        guard !tracks.isEmpty else {
+            recommendationResult = PlaylistRecommendationResult(
+                visibleRecommendations: [],
+                spareResolved: [],
+                deferredCandidates: []
+            )
+            isRecommendationsLoading = false
+            return
+        }
+
+        let currentTracks = tracks
+        let playlistID = String(describing: playlist.persistentModelID)
+        let rotation = recommendationRotation
+
+        recommendationTask = Task { @MainActor in
+            isRecommendationsLoading = true
+            recommendationsErrorMessage = nil
+
+            do {
+                let results = try await PlaylistRecommendationService.shared.recommendations(
+                    for: currentTracks,
+                    playlistID: playlistID,
+                    rotation: rotation,
+                    forceRefresh: forceRefresh
+                )
+                guard !Task.isCancelled else { return }
+                recommendationResult = results
+                isRecommendationsLoading = false
+            } catch is CancellationError {
+                // Cancelled
+            } catch {
+                guard !Task.isCancelled else { return }
+                recommendationsErrorMessage = error.localizedDescription
+                isRecommendationsLoading = false
+            }
+        }
+    }
+
+    private func handleFindMore() {
+        guard !isFindingMore, recommendationResult.canFindMore else { return }
+        let currentTracks = tracks
+        let playlistID = String(describing: playlist.persistentModelID)
+
+        Task { @MainActor in
+            isFindingMore = true
+            do {
+                let updated = try await PlaylistRecommendationService.shared.findMore(
+                    for: currentTracks,
+                    playlistID: playlistID,
+                    currentResult: recommendationResult
+                )
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    recommendationResult = updated
+                }
+                isFindingMore = false
+            } catch is CancellationError {
+                isFindingMore = false
+            } catch {
+                isFindingMore = false
+            }
+        }
+    }
+
+    private func handleRefreshRecommendations() {
+        guard !isRecommendationsLoading, !isFindingMore else { return }
+        recommendationRotation += 1
+        let playlistID = String(describing: playlist.persistentModelID)
+        PlaylistRecommendationService.shared.cache.remove(playlistID: playlistID)
+        loadRecommendations(forceRefresh: true)
+    }
+
+    private func handleAddRecommendation(_ item: ResolvedRecommendation) {
+        let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !videoID.isEmpty else { return }
+
+        manualAddedVideoIDs.insert(videoID)
+
+        _ = PlaylistRecommendationService.shared.addRecommendation(
+            item,
+            to: playlist,
+            in: modelContext,
+            existingLibraryTracks: libraryTracks
+        )
+
+        let playlistID = String(describing: playlist.persistentModelID)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            recommendationResult = PlaylistRecommendationService.shared.consumeVisibleRecommendation(
+                item,
+                from: recommendationResult,
+                playlistID: playlistID
+            )
+        }
+    }
+
+    private func handleRejectRecommendation(_ item: ResolvedRecommendation) {
+        let playlistID = String(describing: playlist.persistentModelID)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            recommendationResult = PlaylistRecommendationService.shared.rejectRecommendation(
+                item,
+                from: recommendationResult,
+                playlistID: playlistID
+            )
+        }
+    }
+
+    private func handleTrackSignatureChange(oldSignature: [String], newSignature: [String]) {
+        let newlyAdded = Set(newSignature).subtracting(oldSignature)
+        if !newlyAdded.isEmpty && newlyAdded.isSubset(of: manualAddedVideoIDs) {
+            return
+        }
+        let playlistID = String(describing: playlist.persistentModelID)
+        PlaylistRecommendationService.shared.cache.remove(playlistID: playlistID)
+        loadRecommendations(forceRefresh: true)
     }
 
     private func handlePlaylistPlayButton() {
