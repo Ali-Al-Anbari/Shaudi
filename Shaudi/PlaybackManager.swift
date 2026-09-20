@@ -199,6 +199,27 @@ final class PlaybackManager: ObservableObject {
         var readyAt: TimeInterval?
     }
 
+    private enum QueueProvenance {
+        case automatic
+        case manual
+    }
+
+    private struct QueueEntry: Identifiable {
+        let id: UUID
+        let track: Track
+        let provenance: QueueProvenance
+
+        init(
+            id: UUID = UUID(),
+            track: Track,
+            provenance: QueueProvenance
+        ) {
+            self.id = id
+            self.track = track
+            self.provenance = provenance
+        }
+    }
+
     private struct ActiveListeningPeriod {
         let requestID: UUID
         let track: Track?
@@ -215,7 +236,7 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var currentPlayableTrack: PlayableTrack?
     @Published private(set) var state: PlaybackState = .idle
     @Published private(set) var startupMetrics: StartupMetrics?
-    @Published private(set) var queue: [Track] = []
+    @Published private var queueEntries: [QueueEntry] = []
     @Published private(set) var currentIndex: Int?
     @Published private(set) var playbackStartEvent: PlaybackStartEvent?
     @Published private(set) var isShuffleEnabled = false
@@ -223,11 +244,18 @@ final class PlaybackManager: ObservableObject {
     @Published private(set) var isTrimPreviewActive = false
     @Published private(set) var trimPreviewTime: TimeInterval?
 
-    /// Number of upcoming tracks (starting at currentIndex + 1) that were
-    /// added via "Play Next" or "Add to Queue".  When this count is > 0 those
-    /// items sit at the front of the upcoming section; automatic playlist /
-    /// radio items follow them.
-    private(set) var manualQueueCount: Int = 0
+    /// Compatibility view for existing queue UI and playback callers. Ownership
+    /// lives on each queue occurrence in `queueEntries`.
+    var queue: [Track] {
+        queueEntries.map(\.track)
+    }
+
+    /// Number of upcoming queue occurrences added through Play Next or Add to
+    /// Queue. Manual entries may be interleaved with automatic entries after a
+    /// user reorder, so this is derived rather than stored as a prefix length.
+    var manualQueueCount: Int {
+        upcomingQueueEntries.count { $0.provenance == .manual }
+    }
 
     private var player: AVPlayer?
     private var playbackTask: Task<Void, Never>?
@@ -464,17 +492,19 @@ final class PlaybackManager: ObservableObject {
                         playlistID: $0
                     )
                 } ?? playlistQueueInNormalOrder
-                queue = queueStartingWithSelectedTrack(track, in: stableOrder)
+                queueEntries = automaticQueueEntries(
+                    queueStartingWithSelectedTrack(track, in: stableOrder)
+                )
                 shuffledPlaylistOrder = queue
                 currentIndex = queue.startIndex
                 queueLog("shuffled order rebuilt count=\(queue.count)")
             } else if let selectedIndex = playlistQueueInNormalOrder.firstIndex(
                 where: { $0 === track }
             ) {
-                queue = playlistQueueInNormalOrder
+                queueEntries = automaticQueueEntries(playlistQueueInNormalOrder)
                 currentIndex = selectedIndex
             } else {
-                queue = [track]
+                queueEntries = automaticQueueEntries([track])
                 currentIndex = queue.startIndex
             }
 
@@ -497,10 +527,10 @@ final class PlaybackManager: ObservableObject {
         } else {
             playlistQueueInNormalOrder = []
             if let selectedIndex = orderedQueue.firstIndex(where: { $0 === track }) {
-                queue = orderedQueue
+                queueEntries = automaticQueueEntries(orderedQueue)
                 currentIndex = selectedIndex
             } else {
-                queue = [track]
+                queueEntries = automaticQueueEntries([track])
                 currentIndex = queue.startIndex
             }
         }
@@ -508,7 +538,6 @@ final class PlaybackManager: ObservableObject {
 #if os(iOS)
         updateRemoteQueueCommands()
 #endif
-        manualQueueCount = 0
         startCurrentQueueTrack()
     }
 
@@ -587,7 +616,7 @@ final class PlaybackManager: ObservableObject {
         cancelUpcomingPreResolutionObservation()
         playbackOrigin = .search
         playlistQueueInNormalOrder = []
-        queue = []
+        queueEntries = []
         currentIndex = nil
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -601,7 +630,6 @@ final class PlaybackManager: ObservableObject {
             playbackStartTime: track.playbackStartTime,
             playbackEndTime: track.playbackEndTime
         )
-        manualQueueCount = 0
         startPlaybackContext(displayTrack, persistentTrack: nil)
     }
 
@@ -934,12 +962,12 @@ final class PlaybackManager: ObservableObject {
 
         let currentTrack = queue[currentIndex]
         if isShuffleEnabled {
-            let history = Array(queue[queue.startIndex...currentIndex])
-            let consumedIdentities = Set(history.map { queueIdentity(for: $0) })
+            let history = Array(queueEntries[queueEntries.startIndex...currentIndex])
+            let consumedIdentities = Set(history.map { queueIdentity(for: $0.track) })
             let remainingTracks = playlistQueueInNormalOrder.filter {
                 !consumedIdentities.contains(queueIdentity(for: $0))
             }
-            queue = history + remainingTracks.shuffled()
+            queueEntries = history + automaticQueueEntries(remainingTracks.shuffled())
             self.currentIndex = history.count - 1
             if case let .playlist(playlistID) = playbackOrigin {
                 shuffledPlaylistID = playlistID
@@ -948,7 +976,7 @@ final class PlaybackManager: ObservableObject {
             queueLog("shuffle enabled count=\(queue.count)")
             queueLog("shuffled order rebuilt")
         } else {
-            queue = playlistQueueInNormalOrder
+            queueEntries = automaticQueueEntries(playlistQueueInNormalOrder)
             if let restoredIndex = queue.firstIndex(where: { $0 === currentTrack })
                 ?? queue.firstIndex(where: {
                     queueIdentity(for: $0) == queueIdentity(for: currentTrack)
@@ -956,7 +984,9 @@ final class PlaybackManager: ObservableObject {
             {
                 self.currentIndex = restoredIndex
             } else {
-                queue.append(currentTrack)
+                queueEntries.append(
+                    QueueEntry(track: currentTrack, provenance: .automatic)
+                )
                 self.currentIndex = queue.count - 1
             }
             shuffledPlaylistID = nil
@@ -987,6 +1017,21 @@ final class PlaybackManager: ObservableObject {
 
     // MARK: - User-manageable queue
 
+    private var upcomingQueueEntries: [QueueEntry] {
+        guard let currentIndex, queueEntries.indices.contains(currentIndex) else {
+            return []
+        }
+        let nextIndex = currentIndex + 1
+        guard nextIndex < queueEntries.endIndex else {
+            return []
+        }
+        return Array(queueEntries[nextIndex...])
+    }
+
+    private func automaticQueueEntries(_ tracks: [Track]) -> [QueueEntry] {
+        tracks.map { QueueEntry(track: $0, provenance: .automatic) }
+    }
+
     /// Insert `track` as the very next item after the currently playing track.
     func playNext(_ track: Track) {
         guard currentPlayableTrack != nil else {
@@ -1000,13 +1045,16 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        queue.insert(track, at: insertionIndex)
-        manualQueueCount += 1
+        queueEntries.insert(
+            QueueEntry(track: track, provenance: .manual),
+            at: insertionIndex
+        )
         queueLog("playNext count=\(manualQueueCount) total=\(queue.count)")
         refreshQueuePredictionsAfterMutation()
     }
 
-    /// Append `track` to the end of the manual-queue section (before automatic items).
+    /// Append `track` after the last upcoming manual occurrence. If there are no
+    /// manual items, insert it immediately after the current track.
     func addToQueue(_ track: Track) {
         guard currentPlayableTrack != nil else {
             return
@@ -1014,15 +1062,19 @@ final class PlaybackManager: ObservableObject {
 
         let insertionIndex: Int
         if let currentIndex, queue.indices.contains(currentIndex) {
-            insertionIndex = currentIndex + 1 + manualQueueCount
+            let upcomingIndices = queueEntries.indices.dropFirst(currentIndex + 1)
+            insertionIndex = upcomingIndices.last(where: {
+                queueEntries[$0].provenance == .manual
+            }).map { $0 + 1 } ?? (currentIndex + 1)
         } else {
             return
         }
 
-        // Clamp in case manualQueueCount is somehow stale
         let safeIndex = min(insertionIndex, queue.endIndex)
-        queue.insert(track, at: safeIndex)
-        manualQueueCount += 1
+        queueEntries.insert(
+            QueueEntry(track: track, provenance: .manual),
+            at: safeIndex
+        )
         queueLog("addToQueue count=\(manualQueueCount) total=\(queue.count)")
         refreshQueuePredictionsAfterMutation()
     }
@@ -1059,11 +1111,6 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        // Tracks skipped over are not "consumed" as manual items — reset count
-        // based on how many manual items remain ahead of the new position.
-        let skipped = upcomingIndex
-        manualQueueCount = max(0, manualQueueCount - skipped)
-
         let requestedAt = currentTime
         let track = queue[absoluteIndex]
         let videoID = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1090,10 +1137,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        queue.remove(at: absoluteIndex)
-        if upcomingIndex < manualQueueCount {
-            manualQueueCount = max(0, manualQueueCount - 1)
-        }
+        queueEntries.remove(at: absoluteIndex)
         queueLog("removeFromQueue upcomingIndex=\(upcomingIndex) manualCount=\(manualQueueCount) total=\(queue.count)")
         refreshQueuePredictionsAfterMutation()
     }
@@ -1111,7 +1155,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        var upcomingSlice = Array(queue[(currentIndex + 1)...])
+        var upcomingSlice = Array(queueEntries[(currentIndex + 1)...])
 
         guard destination >= 0, destination <= upcomingSlice.count else {
             return
@@ -1134,7 +1178,7 @@ final class PlaybackManager: ObservableObject {
         remaining.insert(contentsOf: movedElements, at: insertAt)
         upcomingSlice = remaining
 
-        queue = Array(queue[...currentIndex]) + upcomingSlice
+        queueEntries = Array(queueEntries[...currentIndex]) + upcomingSlice
 
         queueLog("moveQueue manualCount=\(manualQueueCount) total=\(queue.count)")
         refreshQueuePredictionsAfterMutation()
@@ -1149,7 +1193,7 @@ final class PlaybackManager: ObservableObject {
         guard nextIdx < queue.endIndex else {
             return []
         }
-        return Array(queue[nextIdx...])
+        return queueEntries[nextIdx...].map(\.track)
     }
 
     var currentRecommendationIdentity: SongIdentity? {
@@ -1234,14 +1278,9 @@ final class PlaybackManager: ObservableObject {
             videoID: videoID
         )
         cancelUpcomingPreResolutionObservation()
-        // If the track we're advancing into is the first upcoming item (no wrap),
-        // it may be a manual-queue item — consume one manual slot.
-        if nextIndex == currentIndex + 1, manualQueueCount > 0 {
-            manualQueueCount -= 1
-            queueLog("manualQueueCount consumed=1 remaining=\(manualQueueCount)")
-        }
         advanceLog("advancing from index=\(currentIndex) to index=\(nextIndex) (\(videoID)), preparedPlayback=\(preparedPlayback != nil)")
         self.currentIndex = nextIndex
+        queueLog("manualQueueCount remaining=\(manualQueueCount)")
         pendingListeningHistoryOutcome = reason.historyOutcome
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -1870,13 +1909,12 @@ final class PlaybackManager: ObservableObject {
         endRecommendationSession(reason: "playback stopped")
         invalidateCurrentRequest()
         clearPlayer()
-        queue = []
+        queueEntries = []
         currentIndex = nil
         playlistQueueInNormalOrder = []
         currentTrack = nil
         currentPlayableTrack = nil
         playbackOrigin = nil
-        manualQueueCount = 0
         state = .idle
 #if os(iOS)
         updateRemoteQueueCommands()
@@ -4946,12 +4984,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     private var recommendationUpcomingCount: Int {
-        guard let currentIndex, queue.indices.contains(currentIndex) else {
-            return 0
-        }
-        let totalUpcoming = max(0, queue.count - currentIndex - 1)
-        // Exclude manual-queue items so they don't suppress radio refill.
-        return max(0, totalUpcoming - manualQueueCount)
+        upcomingQueueEntries.count { $0.provenance == .automatic }
     }
 
     private func appendRecommendations(
@@ -4993,7 +5026,9 @@ final class PlaybackManager: ObservableObject {
         }
 
         if currentIndex == nil {
-            queue = [transientRecommendationTrack(for: seed)]
+            queueEntries = automaticQueueEntries([
+                transientRecommendationTrack(for: seed)
+            ])
             currentIndex = queue.startIndex
         }
 
@@ -5003,29 +5038,34 @@ final class PlaybackManager: ObservableObject {
         }
 
         let historyStart = max(queue.startIndex, currentIndex - recommendationHistoryLimit + 1)
-        let history = Array(queue[historyStart...currentIndex])
-        let existingUpcoming: [Track]
+        let history = Array(queueEntries[historyStart...currentIndex])
+        let existingUpcoming: [QueueEntry]
         if currentIndex < queue.index(before: queue.endIndex) {
-            existingUpcoming = Array(queue[queue.index(after: currentIndex)...])
+            existingUpcoming = Array(queueEntries[queue.index(after: currentIndex)...])
         } else {
             existingUpcoming = []
         }
 
-        // Separate the manual-queue items (front of upcoming) from the
-        // auto-upcoming items so radio additions never displace them.
-        let clampedManualCount = min(manualQueueCount, existingUpcoming.count)
-        let manualItems = Array(existingUpcoming.prefix(clampedManualCount))
-        let autoItems = Array(existingUpcoming.dropFirst(clampedManualCount))
+        var automaticCount = 0
+        var upcoming: [QueueEntry] = []
+        for entry in existingUpcoming {
+            switch entry.provenance {
+            case .manual:
+                upcoming.append(entry)
+            case .automatic where automaticCount < recommendationUpcomingLimit:
+                upcoming.append(entry)
+                automaticCount += 1
+            case .automatic:
+                continue
+            }
+        }
+        for track in newTracks where automaticCount < recommendationUpcomingLimit {
+            upcoming.append(QueueEntry(track: track, provenance: .automatic))
+            automaticCount += 1
+        }
 
-        let autoUpcoming = Array(
-            (autoItems + newTracks)
-                .prefix(recommendationUpcomingLimit)
-        )
-        let upcoming = manualItems + autoUpcoming
-
-        queue = history + upcoming
+        queueEntries = history + upcoming
         self.currentIndex = history.count - 1
-        // manualQueueCount is unchanged — the manual items are still there.
         let retainedVideoIDs = Set(queue.map { normalizedVideoID($0.youtubeVideoID) })
         recommendationTransportMetadata = recommendationTransportMetadata.filter {
             retainedVideoIDs.contains($0.key)
@@ -5050,26 +5090,25 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        let history = Array(queue[...currentIndex])
-        let upcoming = currentIndex + 1 < queue.endIndex
-            ? Array(queue[(currentIndex + 1)...])
+        let history = Array(queueEntries[...currentIndex])
+        let upcoming = currentIndex + 1 < queueEntries.endIndex
+            ? Array(queueEntries[(currentIndex + 1)...])
             : []
-        let clampedManualCount = min(manualQueueCount, upcoming.count)
-        let retainedUpcoming = upcoming.enumerated().compactMap { offset, track -> Track? in
-            guard offset >= clampedManualCount else {
-                return track
+        let retainedUpcoming = upcoming.compactMap { entry -> QueueEntry? in
+            guard entry.provenance == .automatic else {
+                return entry
             }
-            let videoID = normalizedVideoID(track.youtubeVideoID)
+            let videoID = normalizedVideoID(entry.track.youtubeVideoID)
             guard let identity = recommendationTransportMetadata[videoID]?.canonicalIdentity else {
-                return track
+                return entry
             }
-            return shouldRemove(identity) ? nil : track
+            return shouldRemove(identity) ? nil : entry
         }
         guard retainedUpcoming.count != upcoming.count else {
             return
         }
 
-        queue = history + retainedUpcoming
+        queueEntries = history + retainedUpcoming
         self.currentIndex = history.count - 1
         let retainedVideoIDs = Set(queue.map { normalizedVideoID($0.youtubeVideoID) })
         recommendationTransportMetadata = recommendationTransportMetadata.filter {
@@ -5643,9 +5682,15 @@ final class PlaybackManager: ObservableObject {
         currentIndex: Int,
         manualQueueCount: Int = 0
     ) {
-        self.queue = tracks
+        queueEntries = tracks.enumerated().map { index, track in
+            let isUpcomingManual = index > currentIndex
+                && index <= currentIndex + manualQueueCount
+            return QueueEntry(
+                track: track,
+                provenance: isUpcomingManual ? .manual : .automatic
+            )
+        }
         self.currentIndex = currentIndex
-        self.manualQueueCount = manualQueueCount
         // Set a fake currentPlayableTrack so queue mutation guards pass.
         if tracks.indices.contains(currentIndex) {
             self.currentTrack = tracks[currentIndex]
@@ -5675,7 +5720,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func seedManualSearchForTesting(_ track: PlayableTrack) {
-        queue = []
+        queueEntries = []
         currentIndex = nil
         currentTrack = nil
         currentPlayableTrack = track
@@ -5773,6 +5818,17 @@ final class PlaybackManager: ObservableObject {
     var temporaryValidatedUIDurationForTesting: TimeInterval? {
         get { temporaryValidatedUIDuration }
         set { temporaryValidatedUIDuration = newValue }
+    }
+
+    var recommendationUpcomingCountForTesting: Int {
+        recommendationUpcomingCount
+    }
+
+    func appendRecommendationsForTesting(
+        _ recommendations: [ResolvedRecommendation],
+        seed: PlayableTrack
+    ) {
+        appendRecommendations(recommendations, seed: seed)
     }
 
     func setRepeatModeForTesting(_ mode: RepeatMode) {

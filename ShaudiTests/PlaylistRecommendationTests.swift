@@ -61,13 +61,21 @@ final class PlaylistRecommendationTests: XCTestCase {
         artist: String,
         title: String,
         videoID: String,
-        match: Double = 0.85
+        match: Double = 0.85,
+        youtubeTitle: String? = nil,
+        uploader: String? = nil
     ) -> ResolvedRecommendation {
         ResolvedRecommendation(
             artist: artist,
             title: title,
             match: match,
-            youtubeResult: makeYouTubeResult(videoID: videoID, artist: artist, title: title)
+            youtubeResult: YouTubeSearchResult(
+                youtubeVideoID: videoID,
+                title: youtubeTitle ?? "\(artist) - \(title)",
+                channelTitle: uploader ?? artist,
+                thumbnailURL: URL(string: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg"),
+                duration: 200
+            )
         )
     }
 
@@ -642,6 +650,168 @@ final class PlaylistRecommendationTests: XCTestCase {
             XCTAssertEqual(context.sessionID, testSessionID)
         default:
             XCTFail("Expected officialFallback attempt")
+        }
+    }
+
+    // MARK: - Canonical identity persistence regressions
+
+    func testAuthoritativeRecommendationIdentitySurvivesSaveReloadAndPlaylistProfileBuild() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Canonical Round Trip")
+        context.insert(playlist)
+        let recommendation = makeResolved(
+            artist: "Lana Del Rey",
+            title: "West Coast",
+            videoID: "canonical01"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        XCTAssertNotNil(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+
+        let reloadedTracks = try ModelContext(container).fetch(FetchDescriptor<Track>())
+        let reloaded = try XCTUnwrap(
+            reloadedTracks.first { $0.youtubeVideoID == recommendation.youtubeResult.youtubeVideoID }
+        )
+        XCTAssertEqual(reloaded.title, "West Coast")
+        XCTAssertEqual(reloaded.displayArtist, "Lana Del Rey")
+        let profile = PlaylistVibeProfile.build(from: [reloaded])
+        let anchor = try XCTUnwrap(profile.representativeAnchors.first)
+
+        XCTAssertEqual(
+            anchor.songIdentity,
+            SongIdentity(artist: "Lana Del Rey", title: "West Coast")
+        )
+        XCTAssertTrue(profile.existingIdentities.contains(anchor.songIdentity))
+    }
+
+    func testMisleadingUploaderDoesNotReplaceCanonicalArtistAfterPersistenceRoundTrip() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Uploader Identity")
+        context.insert(playlist)
+        let recommendation = makeResolved(
+            artist: "Lana Del Rey",
+            title: "West Coast",
+            videoID: "canonical02",
+            youtubeTitle: "West Coast (fan upload)",
+            uploader: "SomeFanArchive"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        XCTAssertNotNil(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+
+        let reloaded = try XCTUnwrap(
+            ModelContext(container).fetch(FetchDescriptor<Track>())
+                .first { $0.youtubeVideoID == "canonical02" }
+        )
+        XCTAssertEqual(reloaded.displayArtist, "Lana Del Rey")
+        XCTAssertNotEqual(reloaded.displayArtist, "SomeFanArchive")
+
+        let anchor = try XCTUnwrap(
+            PlaylistVibeProfile.build(from: [reloaded]).representativeAnchors.first
+        )
+        XCTAssertEqual(anchor.songIdentity.artist, "Lana Del Rey")
+        XCTAssertEqual(anchor.songIdentity.title, "West Coast")
+    }
+
+    func testSameTitleDifferentCanonicalArtistsRemainDistinctAfterPersistenceRoundTrip() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Same Title")
+        context.insert(playlist)
+        let first = makeResolved(
+            artist: "Artist One",
+            title: "Home",
+            videoID: "same-title1"
+        )
+        let second = makeResolved(
+            artist: "Artist Two",
+            title: "Home",
+            videoID: "same-title2"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        XCTAssertNotNil(service.addRecommendation(
+            first,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+        XCTAssertNotNil(service.addRecommendation(
+            second,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+
+        let reloadedTracks = try ModelContext(container).fetch(FetchDescriptor<Track>())
+        XCTAssertEqual(
+            Set(reloadedTracks.compactMap(\.displayArtist)),
+            ["Artist One", "Artist Two"]
+        )
+        XCTAssertEqual(Set(reloadedTracks.map(\.title)), ["Home"])
+        let profile = PlaylistVibeProfile.build(from: reloadedTracks)
+        let expected: Set<SongIdentity> = [
+            SongIdentity(artist: "Artist One", title: "Home"),
+            SongIdentity(artist: "Artist Two", title: "Home")
+        ]
+
+        XCTAssertEqual(profile.existingIdentities, expected)
+        XCTAssertEqual(Set(profile.representativeAnchors.map(\.songIdentity)), expected)
+    }
+
+    func testUserArtistOverrideRetainsPrecedenceAfterRecommendationPersistenceRoundTrip() throws {
+        let (container, context) = try makeTestContainer()
+        let playlist = Playlist(name: "Override Precedence")
+        context.insert(playlist)
+        let recommendation = makeResolved(
+            artist: "Canonical Artist",
+            title: "Canonical Song",
+            videoID: "override001"
+        )
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [] },
+            safeResolve: { _ in nil }
+        )
+
+        let inserted = try XCTUnwrap(service.addRecommendation(
+            recommendation,
+            to: playlist,
+            in: context,
+            existingLibraryTracks: []
+        ))
+        inserted.userArtistOverride = "My Corrected Artist"
+        try context.save()
+
+        let reloaded = try XCTUnwrap(
+            ModelContext(container).fetch(FetchDescriptor<Track>())
+                .first { $0.youtubeVideoID == "override001" }
+        )
+        let anchor = try XCTUnwrap(
+            PlaylistVibeProfile.build(from: [reloaded]).representativeAnchors.first
+        )
+
+        XCTAssertEqual(anchor.songIdentity.artist, "My Corrected Artist")
+        XCTAssertEqual(anchor.songIdentity.title, "Canonical Song")
+        guard case .userOverride = anchor.artistSource else {
+            return XCTFail("Expected explicit user override to remain authoritative")
         }
     }
 }

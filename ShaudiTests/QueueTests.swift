@@ -295,19 +295,134 @@ final class QueueTests: XCTestCase {
         XCTAssertEqual(manager.currentIndex, 2)
     }
 
-    // MARK: - 14. jumpToQueueItem reduces manualQueueCount by skipped items
+    // MARK: - 14. Queue ownership survives jumps and mixed reorders
 
-    func testJumpToQueueItemReducesManualCount() {
-        let t0 = makeTrack(id: "t0")
-        let t1 = makeTrack(id: "t1")
-        let t2 = makeTrack(id: "t2")
-        let t3 = makeTrack(id: "t3")
-        // 2 manual items at front
-        let manager = makeManager(tracks: [t0, t1, t2, t3], currentIndex: 0, manualQueueCount: 2)
+    func testJumpingToSecondManualItemLeavesNoUpcomingManualItems() {
+        let current = makeTrack(id: "current")
+        let manualA = makeTrack(id: "manual-a")
+        let manualB = makeTrack(id: "manual-b")
+        let automaticC = makeTrack(id: "automatic-c")
+        let manager = makeManager(
+            tracks: [current, manualA, manualB, automaticC],
+            currentIndex: 0,
+            manualQueueCount: 2
+        )
 
-        // Jump to t2 (upcomingIndex 1) — skip 1 manual item
         manager.jumpToQueueItem(upcomingIndex: 1)
+
+        XCTAssertEqual(manager.queue[manager.currentIndex!].youtubeVideoID, "manual-b")
+        XCTAssertEqual(manager.upcomingQueueTracks.map(\.youtubeVideoID), ["automatic-c"])
+        XCTAssertEqual(
+            manager.manualQueueCount,
+            0,
+            "The manual item that became current is no longer an upcoming manual item"
+        )
+    }
+
+    func testJumpingPastManualPrefixIntoAutomaticItemConsumesAllManualOwnership() {
+        let current = makeTrack(id: "current")
+        let manualA = makeTrack(id: "manual-a")
+        let manualB = makeTrack(id: "manual-b")
+        let automaticC = makeTrack(id: "automatic-c")
+        let automaticD = makeTrack(id: "automatic-d")
+        let manager = makeManager(
+            tracks: [current, manualA, manualB, automaticC, automaticD],
+            currentIndex: 0,
+            manualQueueCount: 2
+        )
+
+        manager.jumpToQueueItem(upcomingIndex: 2)
+
+        XCTAssertEqual(manager.queue[manager.currentIndex!].youtubeVideoID, "automatic-c")
+        XCTAssertEqual(manager.upcomingQueueTracks.map(\.youtubeVideoID), ["automatic-d"])
+        XCTAssertEqual(manager.manualQueueCount, 0)
+    }
+
+    func testAutomaticItemMovedBeforeManualItemRemainsAutomaticForFeedbackRemoval() {
+        let blockedIdentity = SongIdentity(artist: "Blocked Automatic Artist", title: "Blocked Auto")
+        let manager = makeRecommendationManager(
+            upcoming: [
+                ("manual-a", SongIdentity(artist: "Manual Artist", title: "Manual A")),
+                ("automatic-blocked", blockedIdentity),
+                ("automatic-other", SongIdentity(artist: "Other Artist", title: "Other Auto"))
+            ],
+            manualQueueCount: 1
+        )
+
+        manager.moveQueue(from: IndexSet(integer: 1), to: 0)
+        recordArtistExclusion(blockedIdentity, on: manager)
+
+        XCTAssertEqual(
+            manager.upcomingQueueTracks.map(\.youtubeVideoID),
+            ["manual-a", "automatic-other"],
+            "Moving an automatic item must not grant it manual-queue protection"
+        )
         XCTAssertEqual(manager.manualQueueCount, 1)
+    }
+
+    func testManualItemMovedAfterAutomaticItemsRemainsManualForFeedbackRemoval() {
+        let manualIdentity = SongIdentity(artist: "Blocked Manual Artist", title: "Manual A")
+        let manager = makeRecommendationManager(
+            upcoming: [
+                ("manual-a", manualIdentity),
+                ("automatic-c", SongIdentity(artist: "Automatic C Artist", title: "Automatic C")),
+                ("automatic-d", SongIdentity(artist: "Automatic D Artist", title: "Automatic D"))
+            ],
+            manualQueueCount: 1
+        )
+
+        manager.moveQueue(from: IndexSet(integer: 0), to: 3)
+        recordArtistExclusion(manualIdentity, on: manager)
+
+        XCTAssertEqual(
+            manager.upcomingQueueTracks.map(\.youtubeVideoID),
+            ["automatic-c", "automatic-d", "manual-a"],
+            "Manual provenance must follow the item when it is reordered"
+        )
+        XCTAssertEqual(manager.manualQueueCount, 1)
+    }
+
+    func testRecommendationRefillCountAfterJumpCountsRemainingAutomaticItem() {
+        let current = makeTrack(id: "current")
+        let manualA = makeTrack(id: "manual-a")
+        let manualB = makeTrack(id: "manual-b")
+        let automaticC = makeTrack(id: "automatic-c")
+        let manager = makeManager(
+            tracks: [current, manualA, manualB, automaticC],
+            currentIndex: 0,
+            manualQueueCount: 2
+        )
+
+        manager.jumpToQueueItem(upcomingIndex: 1)
+
+        XCTAssertEqual(
+            manager.recommendationUpcomingCountForTesting,
+            1,
+            "The production refill count must recognize Automatic C as automatic"
+        )
+    }
+
+    func testFeedbackAfterJumpRemovesRemainingAutomaticRecommendation() {
+        let automaticIdentity = SongIdentity(
+            artist: "Jump Feedback Artist",
+            title: "Automatic C"
+        )
+        let manager = makeRecommendationManager(
+            upcoming: [
+                ("manual-a", SongIdentity(artist: "Manual Artist A", title: "Manual A")),
+                ("manual-b", SongIdentity(artist: "Manual Artist B", title: "Manual B")),
+                ("automatic-c", automaticIdentity)
+            ],
+            manualQueueCount: 2
+        )
+
+        manager.jumpToQueueItem(upcomingIndex: 1)
+        recordArtistExclusion(automaticIdentity, on: manager)
+
+        XCTAssertTrue(
+            manager.upcomingQueueTracks.isEmpty,
+            "The remaining automatic recommendation must not be protected by stale manual ownership"
+        )
     }
 
     // MARK: - 15. jumpToQueueItem out of bounds is a no-op
@@ -387,5 +502,159 @@ final class QueueTests: XCTestCase {
         // Remove the one auto item — manualQueueCount stays 0 (not -1)
         manager.removeFromQueue(upcomingIndex: 0)
         XCTAssertEqual(manager.manualQueueCount, 0)
+    }
+
+    // MARK: - Per-occurrence provenance regressions
+
+    func testDuplicateSongOccurrencesRetainIndependentProvenanceThroughReorderAndRemoval() {
+        let current = makeTrack(id: "current")
+        let duplicate = makeTrack(id: "duplicate")
+        let duplicateIdentity = SongIdentity(
+            artist: "Duplicate Artist",
+            title: "Duplicate Song"
+        )
+        let manager = PlaybackManager()
+        manager.seedRecommendationQueueForTesting(
+            tracks: [current, duplicate, duplicate],
+            currentIndex: 0,
+            manualQueueCount: 1,
+            identitiesByVideoID: ["duplicate": duplicateIdentity]
+        )
+
+        manager.moveQueue(from: IndexSet(integer: 1), to: 0)
+        recordArtistExclusion(duplicateIdentity, on: manager)
+
+        XCTAssertEqual(manager.upcomingQueueTracks.count, 1)
+        XCTAssertTrue(manager.upcomingQueueTracks[0] === duplicate)
+        XCTAssertEqual(
+            manager.manualQueueCount,
+            1,
+            "Removing the automatic duplicate must leave the manual occurrence manual"
+        )
+
+        manager.removeFromQueue(upcomingIndex: 0)
+        XCTAssertTrue(manager.upcomingQueueTracks.isEmpty)
+        XCTAssertEqual(manager.manualQueueCount, 0)
+    }
+
+    func testRecommendationAppendCreatesAutomaticOccurrence() {
+        let current = makeTrack(id: "current")
+        let manager = makeManager(tracks: [current])
+        let recommendation = makeResolvedRecommendation(
+            artist: "Radio Artist",
+            title: "Radio Song",
+            videoID: "radio-song"
+        )
+
+        manager.appendRecommendationsForTesting(
+            [recommendation],
+            seed: PlayableTrack(track: current)
+        )
+
+        XCTAssertEqual(manager.upcomingQueueTracks.map(\.youtubeVideoID), ["radio-song"])
+        XCTAssertEqual(manager.manualQueueCount, 0)
+        XCTAssertEqual(manager.recommendationUpcomingCountForTesting, 1)
+    }
+
+    func testQueueAdvancementPreservesRemainingOccurrenceProvenance() {
+        let manager = makeRecommendationManager(
+            upcoming: [
+                ("manual-a", SongIdentity(artist: "Manual Artist", title: "Manual A")),
+                ("automatic-c", SongIdentity(artist: "Automatic Artist", title: "Automatic C")),
+                ("automatic-d", SongIdentity(artist: "Automatic Artist", title: "Automatic D"))
+            ],
+            manualQueueCount: 1
+        )
+        manager.moveQueue(from: IndexSet(integer: 1), to: 0)
+
+        manager.nextTrack()
+
+        XCTAssertEqual(manager.queue[manager.currentIndex!].youtubeVideoID, "automatic-c")
+        XCTAssertEqual(
+            manager.upcomingQueueTracks.map(\.youtubeVideoID),
+            ["manual-a", "automatic-d"]
+        )
+        XCTAssertEqual(manager.manualQueueCount, 1)
+        XCTAssertEqual(manager.recommendationUpcomingCountForTesting, 1)
+    }
+
+    func testStopClearsQueueOccurrenceProvenance() {
+        let current = makeTrack(id: "current")
+        let manager = makeManager(tracks: [current])
+        manager.playNext(makeTrack(id: "manual"))
+        XCTAssertEqual(manager.manualQueueCount, 1)
+
+        manager.stop()
+
+        XCTAssertTrue(manager.queue.isEmpty)
+        XCTAssertTrue(manager.upcomingQueueTracks.isEmpty)
+        XCTAssertEqual(manager.manualQueueCount, 0)
+        XCTAssertEqual(manager.recommendationUpcomingCountForTesting, 0)
+    }
+
+    func testRecommendationRefillCountAfterReorderUsesOccurrenceProvenance() {
+        let manager = makeRecommendationManager(
+            upcoming: [
+                ("manual-a", SongIdentity(artist: "Manual Artist", title: "Manual A")),
+                ("automatic-c", SongIdentity(artist: "Automatic Artist", title: "Automatic C")),
+                ("automatic-d", SongIdentity(artist: "Automatic Artist", title: "Automatic D"))
+            ],
+            manualQueueCount: 1
+        )
+
+        manager.moveQueue(from: IndexSet(integer: 1), to: 0)
+
+        XCTAssertEqual(
+            manager.upcomingQueueTracks.map(\.youtubeVideoID),
+            ["automatic-c", "manual-a", "automatic-d"]
+        )
+        XCTAssertEqual(manager.manualQueueCount, 1)
+        XCTAssertEqual(manager.recommendationUpcomingCountForTesting, 2)
+    }
+
+    private func makeRecommendationManager(
+        upcoming: [(videoID: String, identity: SongIdentity)],
+        manualQueueCount: Int
+    ) -> PlaybackManager {
+        let current = makeTrack(id: "current")
+        let tracks = [current] + upcoming.map { makeTrack(id: $0.videoID) }
+        let manager = PlaybackManager()
+        manager.seedRecommendationQueueForTesting(
+            tracks: tracks,
+            currentIndex: 0,
+            manualQueueCount: manualQueueCount,
+            identitiesByVideoID: Dictionary(
+                uniqueKeysWithValues: upcoming.map { ($0.videoID, $0.identity) }
+            )
+        )
+        return manager
+    }
+
+    private func recordArtistExclusion(
+        _ identity: SongIdentity,
+        on manager: PlaybackManager
+    ) {
+        RecommendationFeedbackStore.shared.clearAll()
+        manager.recordRecommendationFeedback(.dontRecommendArtist, for: identity)
+        RecommendationFeedbackStore.shared.clearAll()
+    }
+
+    private func makeResolvedRecommendation(
+        artist: String,
+        title: String,
+        videoID: String
+    ) -> ResolvedRecommendation {
+        ResolvedRecommendation(
+            artist: artist,
+            title: title,
+            match: 0.9,
+            youtubeResult: YouTubeSearchResult(
+                youtubeVideoID: videoID,
+                title: "\(artist) - \(title)",
+                channelTitle: artist,
+                thumbnailURL: nil,
+                duration: 180
+            )
+        )
     }
 }
