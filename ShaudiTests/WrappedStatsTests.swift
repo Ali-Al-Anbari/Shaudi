@@ -85,6 +85,98 @@ final class WrappedStatsTests: XCTestCase {
         XCTAssertEqual(top?.playCount, 2)
     }
 
+    func testCaseDistinctVideoIDsKeepArtistlessSongsSeparate() {
+        let entries = [
+            entry(artist: "", title: "Stay", listened: 80, videoID: " ABC123 "),
+            entry(artist: "", title: "Stay", listened: 70, videoID: "abc123")
+        ]
+        let summary = build(entries)
+
+        XCTAssertEqual(summary.topSongs.map(\.identityKey), ["video:ABC123", "video:abc123"])
+        XCTAssertEqual(summary.topSongs.map(\.playCount), [1, 1])
+        XCTAssertEqual(summary.playCount, 2)
+        XCTAssertEqual(summary.totalListenedDuration, 150)
+    }
+
+    func testEqualArtistlessSongsHaveStableOrderAcrossInputOrder() {
+        let entries = [
+            entry(artist: "", title: "Stay", listened: 60, videoID: "ABC123"),
+            entry(artist: "", title: "Stay", listened: 60, videoID: "abc123")
+        ]
+        XCTAssertEqual(build(entries).topSongs, build(entries.reversed()).topSongs)
+    }
+
+    func testArtistlessSongsGroupByVideoBeforeTitle() {
+        let summary = build([
+            entry(artist: "", title: "Stay", listened: 30, videoID: "video-A"),
+            entry(artist: "", title: "Stay", listened: 40, videoID: "video-A"),
+            entry(artist: "", title: "Stay", listened: 50, videoID: "video-B")
+        ])
+
+        XCTAssertEqual(summary.topSongs.count, 2)
+        XCTAssertEqual(summary.topSongs.first { $0.identityKey == "video:video-A" }?.playCount, 2)
+        XCTAssertEqual(summary.topSongs.first { $0.identityKey == "video:video-B" }?.playCount, 1)
+    }
+
+    func testCanonicalSongGroupsAcrossVideoIDsButDifferentArtistsStaySeparate() {
+        let summary = build([
+            entry(artist: "Artist One", title: "Stay", listened: 50, videoID: "video-A"),
+            entry(artist: "artist one", title: "Stay", listened: 60, videoID: "video-B"),
+            entry(artist: "Artist Two", title: "Stay", listened: 70, videoID: "video-C")
+        ])
+
+        XCTAssertEqual(summary.topSongs.count, 2)
+        XCTAssertEqual(summary.topSongs.first?.playCount, 2)
+        XCTAssertEqual(summary.topSongs.first?.listenedDuration, 110)
+        XCTAssertEqual(summary.topSongs.last?.artist, "Artist Two")
+    }
+
+    func testTitleOnlyIsLastResortForLegacyRowsWithoutArtistOrVideo() {
+        let summary = build([
+            entry(artist: "", title: "Stay", listened: 30, videoID: ""),
+            entry(artist: "", title: "stay", listened: 40, videoID: " "),
+            entry(artist: "", title: "", listened: 10, videoID: "")
+        ])
+
+        XCTAssertEqual(summary.topSongs.first?.identityKey, "title:stay")
+        XCTAssertEqual(summary.topSongs.first?.playCount, 2)
+        XCTAssertEqual(summary.topSongs.count, 2)
+    }
+
+    func testReplayCountsDoNotMergeCaseDistinctVideoIDs() {
+        let summary = build([
+            entry(artist: "Known", title: "Top", listened: 200),
+            entry(artist: "", title: "Stay", listened: 40, videoID: "ABC123"),
+            entry(artist: "", title: "Stay", listened: 40, videoID: "ABC123"),
+            entry(artist: "", title: "Stay", listened: 40, videoID: "abc123")
+        ])
+
+        XCTAssertEqual(summary.mostReplayedSong?.identityKey, "video:ABC123")
+        XCTAssertEqual(summary.mostReplayedSong?.playCount, 2)
+        XCTAssertEqual(summary.topSongs.first { $0.identityKey == "video:abc123" }?.playCount, 1)
+    }
+
+    func testGenreFallbackKeepsCaseDistinctVideoIDsSeparate() {
+        let upperTrack = Track(
+            title: "Upper",
+            youtubeURL: URL(string: "https://youtube.com/watch?v=ABC123")!,
+            youtubeVideoID: "ABC123"
+        )
+        upperTrack.storeGenreTags(["Rock"])
+        let lowerTrack = Track(
+            title: "Lower",
+            youtubeURL: URL(string: "https://youtube.com/watch?v=abc123")!,
+            youtubeVideoID: "abc123"
+        )
+        lowerTrack.storeGenreTags(["Pop"])
+
+        let summary = build([
+            entry(artist: "", title: "Stay", listened: 120, videoID: "ABC123")
+        ], tracks: [upperTrack, lowerTrack])
+
+        XCTAssertEqual(summary.favoriteGenres.map(\.name), ["Rock"])
+    }
+
     func testTopArtistReusesCanonicalListeningHistoryAggregation() {
         let entries = [
             entry(artist: "Paramore", title: "A", listened: 80),

@@ -104,6 +104,7 @@ enum WrappedStatsBuilder {
         now: Date = .now,
         calendar: Calendar = .current
     ) -> WrappedSummary {
+        // Wrapped uses confirmed listening-history events; Stats' library totals use Track counters.
         let startDate = period.startDate(now: now, calendar: calendar)
         let qualifying = entries.filter { entry in
             guard entry.confirmedPlay, entry.startedAt <= now else {
@@ -133,7 +134,7 @@ enum WrappedStatsBuilder {
         let genresByVideoID = trackGenresByVideoID(tracks)
         let favoriteGenres = FavoriteGenreCalculator.favorites(
             from: listenedEntries.map { entry in
-                let videoID = normalizedVideoID(entry.youtubeVideoID)
+                let videoID = casePreservedVideoID(entry.youtubeVideoID)
                 let genres = entry.cachedGenreTags.isEmpty
                     ? genresByVideoID[videoID] ?? []
                     : entry.cachedGenreTags
@@ -168,12 +169,16 @@ enum WrappedStatsBuilder {
             let identity = ListeningHistoryStats.identity(for: entry)
             let normalizedTitle = SongNormalization.baseTitle(identity.title)
             let normalizedArtist = SongNormalization.text(identity.artist)
-            let fallbackID = normalizedVideoID(entry.youtubeVideoID)
+            let fallbackID = casePreservedVideoID(entry.youtubeVideoID)
             let identityKey: String
-            if normalizedTitle.isEmpty {
-                identityKey = fallbackID.isEmpty ? "entry:\(entry.id.uuidString)" : "video:\(fallbackID)"
+            if !normalizedArtist.isEmpty, !normalizedTitle.isEmpty {
+                identityKey = "song:\(normalizedArtist)\u{1F}\(normalizedTitle)"
+            } else if !fallbackID.isEmpty {
+                identityKey = "video:\(fallbackID)"
+            } else if !normalizedTitle.isEmpty {
+                identityKey = "title:\(normalizedTitle)"
             } else {
-                identityKey = normalizedArtist + "\u{1F}" + normalizedTitle
+                identityKey = "entry:\(entry.id.uuidString)"
             }
 
             let displayTitle = identity.title.isEmpty ? "Unknown Song" : identity.title
@@ -229,7 +234,11 @@ enum WrappedStatsBuilder {
         if first.artist != second.artist {
             return first.artist.localizedStandardCompare(second.artist) == .orderedAscending
         }
-        return first.title.localizedStandardCompare(second.title) == .orderedAscending
+        let titleOrder = first.title.localizedStandardCompare(second.title)
+        if titleOrder != .orderedSame {
+            return titleOrder == .orderedAscending
+        }
+        return first.identityKey < second.identityKey
     }
 
     private static func replayOrder(_ first: WrappedSong, _ second: WrappedSong) -> Bool {
@@ -298,7 +307,7 @@ enum WrappedStatsBuilder {
     private static func trackGenresByVideoID(_ tracks: [Track]) -> [String: [String]] {
         var result: [String: Set<String>] = [:]
         for track in tracks {
-            let videoID = normalizedVideoID(track.youtubeVideoID)
+            let videoID = casePreservedVideoID(track.youtubeVideoID)
             guard !videoID.isEmpty, !track.cachedGenreTags.isEmpty else {
                 continue
             }
@@ -307,7 +316,7 @@ enum WrappedStatsBuilder {
         return result.mapValues { $0.sorted() }
     }
 
-    private static func normalizedVideoID(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    private static func casePreservedVideoID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -15,6 +15,7 @@ struct ListeningStatsView: View {
         _recentHistory = Query(ListeningHistoryStats.recentDescriptor(limit: 5))
     }
 
+    // Library totals and track rankings use Track counters; artist and recent history use events.
     private var totalListeningTime: TimeInterval {
         tracks.reduce(0) { $0 + $1.totalListenedDuration }
     }
