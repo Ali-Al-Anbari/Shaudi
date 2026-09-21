@@ -175,7 +175,9 @@ final class RecommendationPersonalizationTests: XCTestCase {
         feedback.record(.moreLikeThis, identity: target)
 
         XCTAssertGreaterThan(
-            feedback.scoreAdjustment(for: target) + profile.adjustment(for: target).total,
+            RecommendationAdjustment(
+                identity: target, feedback: feedback, personalization: profile
+            ).combined,
             0
         )
     }
@@ -196,9 +198,179 @@ final class RecommendationPersonalizationTests: XCTestCase {
         feedback.record(.lessLikeThis, identity: target)
 
         XCTAssertLessThan(
-            feedback.scoreAdjustment(for: target) + profile.adjustment(for: target).total,
+            RecommendationAdjustment(
+                identity: target, feedback: feedback, personalization: profile
+            ).combined,
             -0.25
         )
+    }
+
+    func testExplicitSignalsKeepTheirDirectionAtPassiveBounds() {
+        let liked = identity("Liked", "Song")
+        let disliked = identity("Disliked", "Song")
+        let positiveHistory = (0..<20).map { index in
+            event(
+                artist: disliked.artist,
+                title: index < 2 ? disliked.title : "Nearby \(index)",
+                listened: 190, duration: 200,
+                outcome: .naturalCompletion
+            )
+        }
+        let events = Array(repeating: event(
+            artist: liked.artist, title: liked.title, listened: 8,
+            duration: 200, outcome: .manualNext
+        ), count: 20) + positiveHistory
+        let profile = RecommendationPersonalizationProfile(events: events, now: now)
+        var feedback = RecommendationFeedbackSnapshot()
+        feedback.record(.moreLikeThis, identity: liked)
+        feedback.record(.lessLikeThis, identity: disliked)
+
+        let likedAdjustment = RecommendationAdjustment(
+            identity: liked, feedback: feedback, personalization: profile
+        )
+        let dislikedAdjustment = RecommendationAdjustment(
+            identity: disliked, feedback: feedback, personalization: profile
+        )
+        let artistContext = RecommendationAdjustment(
+            identity: identity(disliked.artist, "Other Song"),
+            feedback: feedback, personalization: profile
+        )
+
+        XCTAssertEqual(likedAdjustment.passive.total, -0.12, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(dislikedAdjustment.passive.total, 0.09)
+        XCTAssertLessThanOrEqual(dislikedAdjustment.passive.total, 0.10)
+        XCTAssertGreaterThan(likedAdjustment.combined, 0)
+        XCTAssertLessThan(dislikedAdjustment.combined, 0)
+        XCTAssertLessThan(artistContext.combined, 0)
+        XCTAssertLessThan(dislikedAdjustment.combined, artistContext.combined)
+        XCTAssertEqual(feedback.scoreAdjustment(for: liked), 0.085, accuracy: 0.0001)
+        XCTAssertEqual(feedback.scoreAdjustment(for: disliked), -0.43, accuracy: 0.0001)
+    }
+
+    func testNoExplicitFeedbackLeavesPassiveSignalUntouched() {
+        let target = identity("Passive", "Song")
+        let listeningEvent = event(
+            artist: target.artist, title: target.title, listened: 190,
+            duration: 200, outcome: .naturalCompletion
+        )
+        let profile = RecommendationPersonalizationProfile(events: [listeningEvent], now: now)
+        let feedback = RecommendationFeedbackSnapshot()
+        let adjustment = RecommendationAdjustment(
+            identity: target, feedback: feedback, personalization: profile
+        )
+        XCTAssertEqual(adjustment.explicit, 0)
+        XCTAssertEqual(adjustment.combined, profile.adjustment(for: target).total)
+        XCTAssertEqual(
+            RecommendationAdjustment(
+                identity: identity("Unknown", "Discovery"),
+                feedback: feedback, personalization: profile
+            ).combined,
+            0
+        )
+    }
+
+    func testRadioInitialAndReservoirRankWithSamePreferenceContribution() async throws {
+        let liked = identity("Liked Artist", "Liked Song")
+        let profile = RecommendationPersonalizationProfile(
+            events: Array(repeating: event(
+                artist: liked.artist, title: liked.title, listened: 8,
+                duration: 200, outcome: .manualNext
+            ), count: 20),
+            now: now
+        )
+        let stores = makeStores(profile: profile)
+        stores.feedback.record(.moreLikeThis, identity: liked)
+        let candidates = [
+            candidate("Neutral Artist", "Neutral Song", match: 0.72),
+            candidate(liked.artist, liked.title, match: 0.70)
+        ]
+        let radio = service(
+            candidates: candidates,
+            feedback: stores.feedback,
+            personalization: stores.personalization
+        )
+
+        let initial = try await radio.rankedCandidates(
+            for: seed(), excludingSongIdentities: []
+        )
+        let reservoir = radio.personalizedCandidates(candidates)
+        XCTAssertEqual(initial.map(\.identity), reservoir.map {
+            identity($0.artist, $0.title)
+        })
+        let adjustment = RecommendationAdjustment(
+            identity: liked,
+            feedback: stores.feedback.snapshot,
+            personalization: stores.personalization.profile
+        )
+        let rankedLiked = try XCTUnwrap(initial.first { $0.identity == liked })
+        XCTAssertEqual(rankedLiked.score, 0.70 + adjustment.combined, accuracy: 0.0001)
+        XCTAssertEqual(initial.first?.identity, liked)
+    }
+
+    func testPlaylistUsesSharedPreferenceWithIndependentAnchorSupport() async throws {
+        let target = identity("Target Artist", "Target Song")
+        let stores = makeStores(profile: RecommendationPersonalizationProfile(
+            events: Array(repeating: event(
+                artist: target.artist, title: target.title, listened: 8,
+                duration: 200, outcome: .manualNext
+            ), count: 20),
+            now: now
+        ))
+        stores.feedback.record(.moreLikeThis, identity: target)
+        let similar = candidate(target.artist, target.title, match: 0.8)
+        let playlist = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in [similar] },
+            safeResolve: { _ in nil },
+            officialResolve: { _ in nil },
+            feedbackStore: stores.feedback,
+            personalizationStore: stores.personalization,
+            rejectionStore: PlaylistRejectionStore(
+                defaults: UserDefaults(suiteName: UUID().uuidString)!
+            ),
+            cache: PlaylistRecommendationCache()
+        )
+        let firstSeed = seed()
+        let secondSeed = RecommendationSeed(
+            youtubeVideoID: "second",
+            canonicalIdentity: identity("Second Artist", "Second Song"),
+            youtubeTitle: "Second Artist - Second Song",
+            youtubeChannel: "Second Artist"
+        )
+        func vibe(_ anchors: [RecommendationSeed]) -> PlaylistVibeProfile {
+            PlaylistVibeProfile(
+                representativeAnchors: anchors, existingIdentities: [],
+                existingVideoIDs: [], artistFrequencies: [:], cachedGenres: [],
+                totalTracks: anchors.count, uniqueArtistCount: anchors.count
+            )
+        }
+        let oneCandidates = try await playlist.fetchAndRankCandidates(profile: vibe([firstSeed]))
+        let twoCandidates = try await playlist.fetchAndRankCandidates(profile: vibe([firstSeed, secondSeed]))
+        let one = try XCTUnwrap(oneCandidates.first)
+        let two = try XCTUnwrap(twoCandidates.first)
+        let shared = RecommendationAdjustment(
+            identity: target,
+            feedback: stores.feedback.snapshot,
+            personalization: stores.personalization.profile
+        )
+        XCTAssertEqual(one.score, 0.8 + shared.combined, accuracy: 0.0001)
+        XCTAssertEqual(two.score - one.score, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(two.supportingAnchorCount, 2)
+    }
+
+    func testEqualInputsKeepDeterministicArtistOrder() async throws {
+        let stores = makeStores(profile: .empty)
+        let radio = service(
+            candidates: [
+                candidate("Z Artist", "Song", match: 0.8),
+                candidate("A Artist", "Song", match: 0.8)
+            ],
+            feedback: stores.feedback,
+            personalization: stores.personalization
+        )
+        let first = try await radio.rankedCandidates(for: seed(), excludingSongIdentities: [])
+        let second = try await radio.rankedCandidates(for: seed(), excludingSongIdentities: [])
+        XCTAssertEqual(first.map(\.identity), second.map(\.identity))
+        XCTAssertEqual(first.map(\.track.artist), ["A Artist", "Z Artist"])
     }
 
     func testBlockedArtistOverridesStrongInferredAffinity() async throws {

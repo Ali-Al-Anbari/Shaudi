@@ -1299,19 +1299,22 @@ struct RecommendationService {
                 continue
             }
 
-            let explicitAdjustment = feedback.scoreAdjustment(for: identity)
-            let passiveAdjustment = personalizationStore.profile.adjustment(for: identity)
-            let finalScore = track.match + explicitAdjustment + passiveAdjustment.total
+            let adjustment = RecommendationAdjustment(
+                identity: identity,
+                feedback: feedback,
+                personalization: personalizationStore.profile
+            )
+            let finalScore = track.match + adjustment.combined
 #if DEBUG
             if rankingLogCount < 8 {
-                let reasons = passiveAdjustment.reasons.joined(separator: ",")
+                let reasons = adjustment.passive.reasons.joined(separator: ",")
                 print(
                     "[RecommendationRanking] candidate=\(artist) - \(title) "
                         + "base=\(String(format: "%.3f", track.match)) "
-                        + "artist=\(String(format: "%.3f", passiveAdjustment.artist)) "
-                        + "song=\(String(format: "%.3f", passiveAdjustment.song)) "
-                        + "explicit=\(String(format: "%.3f", explicitAdjustment)) "
-                        + "adjustment=\(String(format: "%.3f", explicitAdjustment + passiveAdjustment.total)) "
+                        + "artist=\(String(format: "%.3f", adjustment.passive.artist)) "
+                        + "song=\(String(format: "%.3f", adjustment.passive.song)) "
+                        + "explicit=\(String(format: "%.3f", adjustment.explicit)) "
+                        + "adjustment=\(String(format: "%.3f", adjustment.combined)) "
                         + "final=\(String(format: "%.3f", finalScore)) reasons=\(reasons)"
                 )
                 rankingLogCount += 1
@@ -1350,7 +1353,7 @@ struct RecommendationService {
         return lhs.identity.title < rhs.identity.title
     }
 
-    private func personalizedCandidates(
+    func personalizedCandidates(
         _ candidates: [LastFMSimilarTrack]
     ) -> [LastFMSimilarTrack] {
         let feedback = feedbackStore.snapshot
@@ -1360,13 +1363,15 @@ struct RecommendationService {
                 recommendationLog("rejected excluded artist=\(identity.artist)")
                 return nil
             }
-            let passiveAdjustment = personalizationStore.profile.adjustment(for: identity)
+            let adjustment = RecommendationAdjustment(
+                identity: identity,
+                feedback: feedback,
+                personalization: personalizationStore.profile
+            )
             return RankedSong(
                 track: candidate,
                 identity: identity,
-                score: candidate.match
-                    + feedback.scoreAdjustment(for: identity)
-                    + passiveAdjustment.total
+                score: candidate.match + adjustment.combined
             )
         }
         .sorted(by: rankedSongOrder)

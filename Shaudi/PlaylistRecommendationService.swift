@@ -732,10 +732,12 @@ final class PlaylistRecommendationService {
             // Bonus for candidates supported by multiple playlist anchors
             let multiAnchorBonus = Double(max(0, supportCount - 1)) * 0.25
 
-            let explicitAdjustment = feedback.scoreAdjustment(for: identity)
-            let passiveAdjustment = personalization.adjustment(for: identity).total
-
-            let score = baseMatch + multiAnchorBonus + explicitAdjustment + passiveAdjustment
+            let adjustment = RecommendationAdjustment(
+                identity: identity,
+                feedback: feedback,
+                personalization: personalization
+            )
+            let score = baseMatch + multiAnchorBonus + adjustment.combined
 
             scoredList.append(ScoredPlaylistCandidate(
                 track: track,
