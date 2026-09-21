@@ -37,6 +37,9 @@ enum ArtworkStorage {
     static let bannerOutputSize = CGSize(width: 1_080, height: 444)
     static let playlistOutputSize = CGSize(width: 900, height: 900)
     static let maximumPlaylistGIFSize = 25 * 1_024 * 1_024
+    static let maximumDecodedGIFBytes = 24 * 1_024 * 1_024
+    static let maximumDecodedGIFFrames = 120
+    static let maximumSourceGIFFrames = 2_000
 
     private final class PlaylistCoverCacheEntry {
         let media: PlaylistCoverMedia
@@ -48,6 +51,20 @@ enum ArtworkStorage {
 
     private static let playlistCoverCache: NSCache<NSString, PlaylistCoverCacheEntry> = {
         let cache = NSCache<NSString, PlaylistCoverCacheEntry>()
+        cache.totalCostLimit = 96 * 1_024 * 1_024
+        return cache
+    }()
+
+    private final class TrackCoverCacheEntry {
+        let media: TrackCoverMedia
+
+        init(_ media: TrackCoverMedia) {
+            self.media = media
+        }
+    }
+
+    private static let trackCoverCache: NSCache<NSString, TrackCoverCacheEntry> = {
+        let cache = NSCache<NSString, TrackCoverCacheEntry>()
         cache.totalCostLimit = 96 * 1_024 * 1_024
         return cache
     }()
@@ -145,7 +162,7 @@ enum ArtworkStorage {
 
         if
             let data = playlistGIFData(for: artworkID),
-            let image = playlistAnimatedGIFImage(from: data)
+            let image = animatedGIFImage(from: data)
         {
             let media = PlaylistCoverMedia.animatedGIF(image)
             cachePlaylistCover(media, for: artworkID)
@@ -162,9 +179,11 @@ enum ArtworkStorage {
     }
 
     static func savePlaylistImage(_ image: UIImage, for artworkID: UUID) throws {
-        try save(image, filename: playlistFilename(for: artworkID))
-        try? FileManager.default.removeItem(
-            at: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID))
+        let filename = playlistFilename(for: artworkID)
+        try save(image, filename: filename)
+        try removeObsoleteArtwork(
+            afterWriting: filename,
+            obsoleteFilename: playlistGIFFilename(for: artworkID)
         )
         cachePlaylistCover(.image(image), for: artworkID)
     }
@@ -175,7 +194,7 @@ enum ArtworkStorage {
                 maximumMegabytes: maximumPlaylistGIFSize / 1_024 / 1_024
             )
         }
-        guard isGIFData(data), let image = playlistAnimatedGIFImage(from: data) else {
+        guard isGIFData(data), let image = animatedGIFImage(from: data) else {
             throw ArtworkStorageError.invalidGIF
         }
 
@@ -187,8 +206,9 @@ enum ArtworkStorage {
             to: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID)),
             options: .atomic
         )
-        try? FileManager.default.removeItem(
-            at: directoryURL.appendingPathComponent(playlistFilename(for: artworkID))
+        try removeObsoleteArtwork(
+            afterWriting: playlistGIFFilename(for: artworkID),
+            obsoleteFilename: playlistFilename(for: artworkID)
         )
         cachePlaylistCover(.animatedGIF(image), for: artworkID)
     }
@@ -227,19 +247,28 @@ enum ArtworkStorage {
     }
 
     static func trackCover(for coverID: UUID) -> TrackCoverMedia? {
+        let cacheKey = coverID.uuidString.lowercased() as NSString
+        if let cached = trackCoverCache.object(forKey: cacheKey) {
+            return cached.media
+        }
+
         let gifURL = directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID))
         if
             let data = try? Data(contentsOf: gifURL),
             let image = animatedGIFImage(from: data)
         {
-            return .animatedGIF(image)
+            let media = TrackCoverMedia.animatedGIF(image)
+            cacheTrackCover(media, for: coverID)
+            return media
         }
 
         guard let image = image(filename: trackCoverImageFilename(for: coverID)) else {
             return nil
         }
 
-        return .image(image)
+        let media = TrackCoverMedia.image(image)
+        cacheTrackCover(media, for: coverID)
+        return media
     }
 
     static func saveTrackCover(data: Data, for coverID: UUID) throws {
@@ -250,23 +279,36 @@ enum ArtworkStorage {
         )
 
         if isGIF(data) {
-            guard animatedGIFImage(from: data) != nil else {
+            guard data.count <= maximumPlaylistGIFSize else {
+                throw ArtworkStorageError.gifTooLarge(
+                    maximumMegabytes: maximumPlaylistGIFSize / 1_024 / 1_024
+                )
+            }
+            guard let image = animatedGIFImage(from: data) else {
                 throw CocoaError(.fileReadCorruptFile)
             }
 
-            deleteTrackCover(for: coverID)
             try data.write(
                 to: directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID)),
                 options: .atomic
             )
+            try removeObsoleteArtwork(
+                afterWriting: trackCoverGIFFilename(for: coverID),
+                obsoleteFilename: trackCoverImageFilename(for: coverID)
+            )
+            cacheTrackCover(.animatedGIF(image), for: coverID)
             return
         }
 
         guard let image = UIImage(data: data) else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        deleteTrackCover(for: coverID)
         try save(image, filename: trackCoverImageFilename(for: coverID))
+        try removeObsoleteArtwork(
+            afterWriting: trackCoverImageFilename(for: coverID),
+            obsoleteFilename: trackCoverGIFFilename(for: coverID)
+        )
+        cacheTrackCover(.image(image), for: coverID)
     }
 
     static func deleteTrackCover(for coverID: UUID) {
@@ -277,6 +319,11 @@ enum ArtworkStorage {
         try? fileManager.removeItem(
             at: directoryURL.appendingPathComponent(trackCoverGIFFilename(for: coverID))
         )
+        trackCoverCache.removeObject(forKey: coverID.uuidString.lowercased() as NSString)
+    }
+
+    static func clearTrackCoverCache() {
+        trackCoverCache.removeAllObjects()
     }
 
     private static func image(filename: String) -> UIImage? {
@@ -298,6 +345,23 @@ enum ArtworkStorage {
             to: directoryURL.appendingPathComponent(filename),
             options: .atomic
         )
+    }
+
+    private static func removeObsoleteArtwork(
+        afterWriting newFilename: String,
+        obsoleteFilename: String
+    ) throws {
+        let obsoleteURL = directoryURL.appendingPathComponent(obsoleteFilename)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: obsoleteURL.path) else {
+            return
+        }
+        do {
+            try fileManager.removeItem(at: obsoleteURL)
+        } catch {
+            try? fileManager.removeItem(at: directoryURL.appendingPathComponent(newFilename))
+            throw error
+        }
     }
 
     private static func render(
@@ -336,8 +400,9 @@ enum ArtworkStorage {
         data.starts(with: Data("GIF".utf8))
     }
 
-    private static func playlistAnimatedGIFImage(from data: Data) -> UIImage? {
+    private static func animatedGIFImage(from data: Data) -> UIImage? {
         guard
+            data.count <= maximumPlaylistGIFSize,
             let source = CGImageSourceCreateWithData(data as CFData, nil),
             let typeIdentifier = CGImageSourceGetType(source),
             let type = UTType(typeIdentifier as String),
@@ -347,14 +412,14 @@ enum ArtworkStorage {
         }
 
         let frameCount = CGImageSourceGetCount(source)
-        guard frameCount > 0 else {
+        guard frameCount > 0, frameCount <= maximumSourceGIFFrames else {
             return nil
         }
 
-        let memoryBudget = 24 * 1_024 * 1_024
+        let retainedFrameCount = min(frameCount, maximumDecodedGIFFrames)
         let maximumPixelSize = min(
             Int(playlistOutputSize.width),
-            max(64, Int(sqrt(Double(memoryBudget) / Double(frameCount * 4))))
+            Int(sqrt(Double(maximumDecodedGIFBytes) / (Double(retainedFrameCount) * 4)))
         )
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -365,7 +430,14 @@ enum ArtworkStorage {
 
         var frames: [UIImage] = []
         var duration: TimeInterval = 0
+        var decodedBytes = 0
         for index in 0..<frameCount {
+            duration += gifFrameDuration(
+                CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+            )
+        }
+        for retainedIndex in 0..<retainedFrameCount {
+            let index = retainedIndex * frameCount / retainedFrameCount
             guard let image = CGImageSourceCreateThumbnailAtIndex(
                 source,
                 index,
@@ -374,9 +446,10 @@ enum ArtworkStorage {
                 return nil
             }
 
-            duration += gifFrameDuration(
-                CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
-            )
+            decodedBytes += image.width * image.height * 4
+            guard decodedBytes <= maximumDecodedGIFBytes else {
+                return nil
+            }
             frames.append(UIImage(cgImage: image))
         }
 
@@ -400,48 +473,30 @@ enum ArtworkStorage {
             image = value
         }
 
-        let frames = image.images ?? [image]
-        let cost = frames.reduce(0) { partialResult, frame in
-            partialResult + Int(frame.size.width * frame.scale)
-                * Int(frame.size.height * frame.scale) * 4
-        }
         playlistCoverCache.setObject(
             PlaylistCoverCacheEntry(media),
             forKey: artworkID.uuidString.lowercased() as NSString,
-            cost: cost
+            cost: decodedImageCost(image)
         )
     }
 
-    private static func animatedGIFImage(from data: Data) -> UIImage? {
-        guard
-            let source = CGImageSourceCreateWithData(data as CFData, nil),
-            let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
-        else {
-            return nil
+    private static func decodedImageCost(_ image: UIImage) -> Int {
+        (image.images ?? [image]).reduce(0) { cost, frame in
+            cost + (frame.cgImage?.width ?? Int(frame.size.width * frame.scale))
+                * (frame.cgImage?.height ?? Int(frame.size.height * frame.scale)) * 4
         }
+    }
 
-        let frameCount = CGImageSourceGetCount(source)
-        guard frameCount > 1 else {
-            return UIImage(cgImage: firstImage)
+    private static func cacheTrackCover(_ media: TrackCoverMedia, for coverID: UUID) {
+        let image: UIImage
+        switch media {
+        case .image(let value), .animatedGIF(let value):
+            image = value
         }
-
-        var frames: [UIImage] = []
-        var duration: TimeInterval = 0
-        for index in 0..<frameCount {
-            guard let image = CGImageSourceCreateImageAtIndex(source, index, nil) else {
-                continue
-            }
-
-            let frameDuration = gifFrameDuration(
-                CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
-            )
-            duration += frameDuration
-            frames.append(UIImage(cgImage: image))
-        }
-
-        return UIImage.animatedImage(
-            with: frames,
-            duration: max(duration, 0.1 * Double(frames.count))
+        trackCoverCache.setObject(
+            TrackCoverCacheEntry(media),
+            forKey: coverID.uuidString.lowercased() as NSString,
+            cost: decodedImageCost(image)
         )
     }
 

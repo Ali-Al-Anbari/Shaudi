@@ -1588,6 +1588,9 @@ struct SongEditorView: View {
             dismiss()
         } catch {
             errorMessage = "Could not save the custom cover."
+#if DEBUG
+            print("[Artwork] Track cover save failed: \(error.localizedDescription)")
+#endif
         }
     }
 }

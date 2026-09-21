@@ -7,13 +7,19 @@ import XCTest
 @MainActor
 final class PlaylistArtworkStorageTests: XCTestCase {
     private var artworkIDs: [UUID] = []
+    private var trackCoverIDs: [UUID] = []
 
     override func tearDown() {
         for artworkID in artworkIDs {
             ArtworkStorage.deletePlaylistImage(for: artworkID)
         }
+        for coverID in trackCoverIDs {
+            ArtworkStorage.deleteTrackCover(for: coverID)
+        }
         ArtworkStorage.clearPlaylistCoverCache()
+        ArtworkStorage.clearTrackCoverCache()
         artworkIDs = []
+        trackCoverIDs = []
         super.tearDown()
     }
 
@@ -92,6 +98,22 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         XCTAssertNil(ArtworkStorage.playlistCover(for: artworkID))
     }
 
+    func testFailedPlaylistGIFReplacementKeepsStaticCoverCached() throws {
+        let artworkID = makeArtworkID()
+        try ArtworkStorage.savePlaylistImage(makeImage(color: .red), for: artworkID)
+        guard case .image(let original) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected original cover")
+        }
+
+        XCTAssertThrowsError(try ArtworkStorage.savePlaylistGIF(Data("GIFbad".utf8), for: artworkID))
+        guard case .image(let retained) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected retained cover")
+        }
+        XCTAssertTrue(original === retained)
+        ArtworkStorage.clearPlaylistCoverCache()
+        XCTAssertNotNil(ArtworkStorage.playlistImage(for: artworkID))
+    }
+
     func testSingleFrameGIFLoadsAsAStaticRepresentation() throws {
         let artworkID = makeArtworkID()
         try ArtworkStorage.savePlaylistGIF(try makeGIFData(frameCount: 1), for: artworkID)
@@ -113,20 +135,161 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         }
     }
 
+    func testFailedTrackReplacementPreservesStaticCoverAndCache() throws {
+        let coverID = makeTrackCoverID()
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .red).pngData()!, for: coverID)
+        guard case .image(let original) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected original cover")
+        }
+
+        XCTAssertThrowsError(try ArtworkStorage.saveTrackCover(data: Data("GIFbad".utf8), for: coverID))
+        XCTAssertThrowsError(try ArtworkStorage.saveTrackCover(data: Data("bad image".utf8), for: coverID))
+        guard case .image(let retained) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected retained cover")
+        }
+        XCTAssertTrue(original === retained)
+    }
+
+    func testFailedGIFWritePreservesOldStaticCover() throws {
+        let coverID = makeTrackCoverID()
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .red).pngData()!, for: coverID)
+        let gifURL = trackGIFURL(for: coverID)
+        try FileManager.default.createDirectory(at: gifURL, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: gifURL) }
+
+        XCTAssertThrowsError(try ArtworkStorage.saveTrackCover(data: try makeGIFData(), for: coverID))
+        guard case .image = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected old cover after failed write")
+        }
+        ArtworkStorage.clearTrackCoverCache()
+        guard case .image = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected old cover to remain on disk")
+        }
+    }
+
+    func testFailedGIFReplacementPreservesOldGIFAndCache() throws {
+        let coverID = makeTrackCoverID()
+        try ArtworkStorage.saveTrackCover(data: try makeGIFData(), for: coverID)
+        guard case .animatedGIF(let original) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected original GIF")
+        }
+
+        XCTAssertThrowsError(try ArtworkStorage.saveTrackCover(data: Data("GIFbad".utf8), for: coverID))
+        guard case .animatedGIF(let retained) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected retained GIF")
+        }
+        XCTAssertTrue(original === retained)
+        ArtworkStorage.clearTrackCoverCache()
+        guard case .animatedGIF = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected original GIF on disk")
+        }
+    }
+
+    func testStaticToStaticTrackReplacement() throws {
+        let coverID = makeTrackCoverID()
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .red).pngData()!, for: coverID)
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .blue).pngData()!, for: coverID)
+        ArtworkStorage.clearTrackCoverCache()
+        guard case .image(let image) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected static cover")
+        }
+        XCTAssertGreaterThan(image.size.width, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trackGIFURL(for: coverID).path))
+    }
+
+    func testTrackCoverFormatTransitionsAndCacheReplacement() throws {
+        let coverID = makeTrackCoverID()
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .red).pngData()!, for: coverID)
+        guard case .image(let original) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected static cover")
+        }
+
+        try ArtworkStorage.saveTrackCover(data: try makeGIFData(), for: coverID)
+        guard case .animatedGIF(let firstGIF) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected GIF cover")
+        }
+        XCTAssertGreaterThan(firstGIF.images?.count ?? 0, 1)
+        XCTAssertFalse(original === firstGIF)
+
+        try ArtworkStorage.saveTrackCover(data: try makeGIFData(frameCount: 3), for: coverID)
+        guard case .animatedGIF(let secondGIF) = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected replacement GIF")
+        }
+        XCTAssertFalse(firstGIF === secondGIF)
+        XCTAssertEqual(secondGIF.images?.count, 3)
+
+        try ArtworkStorage.saveTrackCover(data: makeImage(color: .blue).pngData()!, for: coverID)
+        guard case .image = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected replacement static cover")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trackGIFURL(for: coverID).path))
+        ArtworkStorage.clearTrackCoverCache()
+        guard case .image = ArtworkStorage.trackCover(for: coverID) else {
+            return XCTFail("Expected static cover after cache reload")
+        }
+    }
+
+    func testTrackAndPlaylistGIFsUseBoundedFrames() throws {
+        let data = try makeGIFData(frameCount: 150, size: CGSize(width: 8, height: 8))
+        let coverID = makeTrackCoverID()
+        let artworkID = makeArtworkID()
+        try ArtworkStorage.saveTrackCover(data: data, for: coverID)
+        try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
+
+        guard case .animatedGIF(let trackImage) = ArtworkStorage.trackCover(for: coverID),
+              case .animatedGIF(let playlistImage) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected animated covers")
+        }
+        for image in [trackImage, playlistImage] {
+            let frames = image.images ?? [image]
+            XCTAssertEqual(frames.count, ArtworkStorage.maximumDecodedGIFFrames)
+            let decodedBytes = frames.reduce(0) { $0 + ($1.cgImage?.width ?? 0) * ($1.cgImage?.height ?? 0) * 4 }
+            XCTAssertLessThanOrEqual(decodedBytes, ArtworkStorage.maximumDecodedGIFBytes)
+        }
+    }
+
+    func testLargeSourceGIFIsDownsampledForTrackAndPlaylist() throws {
+        let data = try makeGIFData(frameCount: 2, size: CGSize(width: 2_048, height: 2_048))
+        let coverID = makeTrackCoverID()
+        let artworkID = makeArtworkID()
+        try ArtworkStorage.saveTrackCover(data: data, for: coverID)
+        try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
+
+        guard case .animatedGIF(let trackImage) = ArtworkStorage.trackCover(for: coverID),
+              case .animatedGIF(let playlistImage) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected animated covers")
+        }
+        for image in [trackImage, playlistImage] {
+            XCTAssertLessThanOrEqual(image.images?.first?.cgImage?.width ?? 0, Int(ArtworkStorage.playlistOutputSize.width))
+        }
+    }
+
+    private func makeTrackCoverID() -> UUID {
+        let coverID = UUID()
+        trackCoverIDs.append(coverID)
+        return coverID
+    }
+
+    private func trackGIFURL(for coverID: UUID) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Artwork", isDirectory: true)
+            .appendingPathComponent("track-cover-\(coverID.uuidString.lowercased()).gif")
+    }
+
     private func makeArtworkID() -> UUID {
         let artworkID = UUID()
         artworkIDs.append(artworkID)
         return artworkID
     }
 
-    private func makeImage(color: UIColor) -> UIImage {
-        UIGraphicsImageRenderer(size: CGSize(width: 4, height: 4)).image { context in
+    private func makeImage(color: UIColor, size: CGSize = CGSize(width: 4, height: 4)) -> UIImage {
+        UIGraphicsImageRenderer(size: size).image { context in
             color.setFill()
-            context.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+            context.fill(CGRect(origin: .zero, size: size))
         }
     }
 
-    private func makeGIFData(frameCount: Int = 2) throws -> Data {
+    private func makeGIFData(frameCount: Int = 2, size: CGSize = CGSize(width: 4, height: 4)) throws -> Data {
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,
@@ -147,7 +310,7 @@ final class PlaylistArtworkStorageTests: XCTestCase {
 
         for index in 0..<frameCount {
             let color = index.isMultiple(of: 2) ? UIColor.red : UIColor.blue
-            guard let frame = makeImage(color: color).cgImage else {
+            guard let frame = makeImage(color: color, size: size).cgImage else {
                 throw CocoaError(.fileWriteUnknown)
             }
             CGImageDestinationAddImage(destination, frame, frameProperties)
