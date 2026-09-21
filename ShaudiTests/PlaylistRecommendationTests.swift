@@ -353,7 +353,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
         var officialCalls = 0
 
-        let initialVisible = (1...3).map { makeResolved(artist: "Visible \($0)", title: "V\($0)", videoID: "v\($0)") }
+        let initialVisible = (1...3).map { makeResolved(artist: "Visible \($0)", title: "V\($0)", videoID: "visible\($0)") }
         let deferred = (1...4).map {
             ScoredPlaylistCandidate(
                 track: makeSimilar(artist: "Deferred \($0)", title: "D\($0)", match: 0.8),
@@ -390,7 +390,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
         var officialCalls = 0
 
-        let initialVisible = (1...4).map { makeResolved(artist: "Visible \($0)", title: "V\($0)", videoID: "v\($0)") }
+        let initialVisible = (1...4).map { makeResolved(artist: "Visible \($0)", title: "V\($0)", videoID: "visible\($0)") }
         let deferred = (1...10).map {
             ScoredPlaylistCandidate(
                 track: makeSimilar(artist: "Deferred \($0)", title: "D\($0)", match: 0.8),

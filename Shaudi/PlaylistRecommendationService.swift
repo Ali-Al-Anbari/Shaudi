@@ -364,17 +364,28 @@ final class PlaylistRecommendationService {
         for tracks: [Track],
         playlistID: String? = nil,
         rotation: Int = 0,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        currentTracks: (() -> [Track])? = nil,
+        isCurrent: () -> Bool = { true }
     ) async throws -> PlaylistRecommendationResult {
         let signature = trackSignature(for: tracks)
 
         if !forceRefresh, let playlistID {
             if let cached = cache.get(playlistID: playlistID, trackSignature: signature) {
+                try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
+                let valid = revalidate(cached, for: currentTracks?() ?? tracks, playlistID: playlistID)
+                if !cached.visibleRecommendations.isEmpty
+                    && valid.visibleRecommendations.isEmpty
+                    && valid.deferredCandidates.isEmpty {
+                    cache.remove(playlistID: playlistID)
+                } else {
+                    cache.updateResult(for: playlistID, result: valid)
 #if DEBUG
-                print("[PlaylistRecommendations] cache hit playlistID=\(playlistID)")
-                print("[PlaylistRecommendations] visible result count=\(cached.visibleRecommendations.count)")
+                    print("[PlaylistRecommendations] cache hit playlistID=\(playlistID)")
+                    print("[PlaylistRecommendations] visible result count=\(valid.visibleRecommendations.count)")
 #endif
-                return cached
+                    return valid
+                }
             }
         }
 
@@ -411,6 +422,8 @@ final class PlaylistRecommendationService {
             spareResolved: spare,
             deferredCandidates: deferred
         )
+        try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
+        let valid = revalidate(result, for: currentTracks?() ?? tracks, playlistID: playlistID)
 
 #if DEBUG
         print("[PlaylistRecommendations] visible result count=\(result.visibleRecommendations.count)")
@@ -420,36 +433,45 @@ final class PlaylistRecommendationService {
 #endif
 
         if let playlistID {
-            cache.set(playlistID: playlistID, trackSignature: signature, result: result)
+            cache.set(playlistID: playlistID, trackSignature: signature, result: valid)
         }
 
-        return result
+        return valid
     }
 
     func findMore(
         for tracks: [Track],
         playlistID: String?,
-        currentResult: PlaylistRecommendationResult
+        currentResult: PlaylistRecommendationResult,
+        currentTracks: (() -> [Track])? = nil,
+        isCurrent: () -> Bool = { true }
     ) async throws -> PlaylistRecommendationResult {
-        let neededCount = max(0, 5 - currentResult.visibleRecommendations.count)
-        guard neededCount > 0, !currentResult.deferredCandidates.isEmpty else {
-            return currentResult
+        let signature = trackSignature(for: tracks)
+        try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
+        let startingResult = revalidate(currentResult, for: tracks, playlistID: playlistID)
+        let neededCount = max(0, 5 - startingResult.visibleRecommendations.count)
+        guard neededCount > 0, !startingResult.deferredCandidates.isEmpty else {
+            return startingResult
         }
 
 #if DEBUG
         print("[PlaylistRecommendations] officialSearch requestedByUser=true needed=\(neededCount)")
 #endif
 
-        var visible = currentResult.visibleRecommendations
-        var remainingDeferred = currentResult.deferredCandidates
-        var seenVideoIDs = Set(visible.map { $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) })
-        var seenIdentities = Set(visible.map(\.songIdentity))
+        var visible = startingResult.visibleRecommendations
+        var remainingDeferred = startingResult.deferredCandidates
+        let profile = PlaylistVibeProfile.build(from: tracks)
+        var seenVideoIDs = profile.existingVideoIDs.union(
+            visible.map { $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) }
+        )
+        var seenIdentities = profile.existingIdentities.union(visible.map(\.songIdentity))
 
         while !remainingDeferred.isEmpty && visible.count < 5 {
-            try Task.checkCancellation()
+            try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
             let candidate = remainingDeferred.removeFirst()
 
-            if let playlistID, rejectionStore.isRejected(candidate.identity, for: playlistID) {
+            if !allows(candidate, profile: profile, playlistID: playlistID)
+                || seenIdentities.contains(candidate.identity) {
                 continue
             }
 
@@ -459,43 +481,44 @@ final class PlaylistRecommendationService {
             guard let recommendation = try await officialResolverOperation(candidate.track) else {
                 continue
             }
+            try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
 
             let videoID = recommendation.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !videoID.isEmpty,
-                  seenVideoIDs.insert(videoID).inserted,
-                  seenIdentities.insert(recommendation.songIdentity).inserted else {
+                  !seenVideoIDs.contains(videoID),
+                  !seenIdentities.contains(recommendation.songIdentity),
+                  allows(recommendation, profile: profile, playlistID: playlistID) else {
                 continue
             }
-
-            if let playlistID, rejectionStore.isRejected(recommendation.songIdentity, videoID: videoID, for: playlistID) {
-                continue
-            }
-
+            seenVideoIDs.insert(videoID)
+            seenIdentities.insert(recommendation.songIdentity)
             visible.append(recommendation)
         }
 
         let updated = PlaylistRecommendationResult(
             visibleRecommendations: visible,
-            spareResolved: currentResult.spareResolved,
+            spareResolved: startingResult.spareResolved,
             deferredCandidates: remainingDeferred
         )
+        try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
+        let valid = revalidate(updated, for: currentTracks?() ?? tracks, playlistID: playlistID)
 
 #if DEBUG
         print("[PlaylistRecommendations] visible result count=\(updated.visibleRecommendations.count)")
 #endif
 
         if let playlistID {
-            let signature = trackSignature(for: tracks)
-            cache.set(playlistID: playlistID, trackSignature: signature, result: updated)
+            cache.set(playlistID: playlistID, trackSignature: signature, result: valid)
         }
 
-        return updated
+        return valid
     }
 
     func rejectRecommendation(
         _ item: ResolvedRecommendation,
         from currentResult: PlaylistRecommendationResult,
-        playlistID: String
+        playlistID: String,
+        currentTracks: [Track]? = nil
     ) -> PlaylistRecommendationResult {
         rejectionStore.reject(
             item.songIdentity,
@@ -503,66 +526,44 @@ final class PlaylistRecommendationService {
             for: playlistID
         )
 
-        var visible = currentResult.visibleRecommendations
-        var spare = currentResult.spareResolved
-
         let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-        visible.removeAll {
-            $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) == videoID
-        }
-
-        while visible.count < 5 && !spare.isEmpty {
-            let nextSpare = spare.removeFirst()
-            let spareVideoID = nextSpare.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !rejectionStore.isRejected(nextSpare.songIdentity, videoID: spareVideoID, for: playlistID) {
-                visible.append(nextSpare)
-                break
-            }
-        }
-
-        let updated = PlaylistRecommendationResult(
-            visibleRecommendations: visible,
-            spareResolved: spare,
+        let updated = revalidate(PlaylistRecommendationResult(
+            visibleRecommendations: currentResult.visibleRecommendations.filter {
+                $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) != videoID
+            },
+            spareResolved: currentResult.spareResolved,
             deferredCandidates: currentResult.deferredCandidates
-        )
+        ), for: currentTracks ?? [], playlistID: playlistID)
 
-        cache.updateResult(for: playlistID, result: updated)
+        if let currentTracks {
+            cache.set(playlistID: playlistID, trackSignature: trackSignature(for: currentTracks), result: updated)
+        } else {
+            cache.updateResult(for: playlistID, result: updated)
+        }
         return updated
     }
 
     func consumeVisibleRecommendation(
         _ item: ResolvedRecommendation,
         from currentResult: PlaylistRecommendationResult,
-        playlistID: String?
+        playlistID: String?,
+        currentTracks: [Track]? = nil
     ) -> PlaylistRecommendationResult {
-        var visible = currentResult.visibleRecommendations
-        var spare = currentResult.spareResolved
-
         let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-        visible.removeAll {
-            $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) == videoID
-        }
-
-        while visible.count < 5 && !spare.isEmpty {
-            let nextSpare = spare.removeFirst()
-            if let playlistID {
-                let spareVideoID = nextSpare.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-                if rejectionStore.isRejected(nextSpare.songIdentity, videoID: spareVideoID, for: playlistID) {
-                    continue
-                }
-            }
-            visible.append(nextSpare)
-            break
-        }
-
-        let updated = PlaylistRecommendationResult(
-            visibleRecommendations: visible,
-            spareResolved: spare,
+        let updated = revalidate(PlaylistRecommendationResult(
+            visibleRecommendations: currentResult.visibleRecommendations.filter {
+                $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) != videoID
+            },
+            spareResolved: currentResult.spareResolved,
             deferredCandidates: currentResult.deferredCandidates
-        )
+        ), for: currentTracks ?? [], playlistID: playlistID)
 
         if let playlistID {
-            cache.updateResult(for: playlistID, result: updated)
+            if let currentTracks {
+                cache.set(playlistID: playlistID, trackSignature: trackSignature(for: currentTracks), result: updated)
+            } else {
+                cache.updateResult(for: playlistID, result: updated)
+            }
         }
         return updated
     }
@@ -570,8 +571,86 @@ final class PlaylistRecommendationService {
     func trackSignature(for tracks: [Track]) -> [String] {
         tracks.map { track in
             let id = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-            return id.isEmpty ? String(describing: track.persistentModelID) : id
+            let identity = RecommendationSeed(persistedTrack: track).songIdentity.cacheKey
+            return "\(id)\u{1F}\(track.persistentModelID)\u{1F}\(identity)"
         }
+    }
+
+    private func validateRequest(
+        signature: [String], currentTracks: [Track], isCurrent: () -> Bool
+    ) throws {
+        try Task.checkCancellation()
+        guard isCurrent(), trackSignature(for: currentTracks) == signature else {
+            throw CancellationError()
+        }
+    }
+
+    private func allows(
+        _ item: ResolvedRecommendation,
+        profile: PlaylistVibeProfile,
+        playlistID: String?
+    ) -> Bool {
+        let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !videoID.isEmpty,
+              !profile.existingVideoIDs.contains(videoID),
+              !profile.existingIdentities.contains(item.songIdentity),
+              !isAlternateVersion(item.title, identity: item.songIdentity, existing: profile.existingIdentities),
+              feedbackStore.snapshot.allowsAutomaticRecommendation(item.songIdentity)
+        else { return false }
+        if let playlistID,
+           rejectionStore.isRejected(item.songIdentity, videoID: videoID, for: playlistID) {
+            return false
+        }
+        return true
+    }
+
+    private func allows(
+        _ candidate: ScoredPlaylistCandidate,
+        profile: PlaylistVibeProfile,
+        playlistID: String?
+    ) -> Bool {
+        guard !profile.existingIdentities.contains(candidate.identity),
+              !isAlternateVersion(candidate.identity.title, identity: candidate.identity, existing: profile.existingIdentities),
+              feedbackStore.snapshot.allowsAutomaticRecommendation(candidate.identity)
+        else { return false }
+        if let playlistID, rejectionStore.isRejected(candidate.identity, for: playlistID) {
+            return false
+        }
+        return true
+    }
+
+    /// Keep the existing order while applying current membership, feedback and dedupe rules.
+    func revalidate(
+        _ result: PlaylistRecommendationResult,
+        for tracks: [Track],
+        playlistID: String?
+    ) -> PlaylistRecommendationResult {
+        let profile = PlaylistVibeProfile.build(from: tracks)
+        var seenVideoIDs = profile.existingVideoIDs
+        var seenIdentities = profile.existingIdentities
+        var visible: [ResolvedRecommendation] = []
+        var spare: [ResolvedRecommendation] = []
+
+        for item in result.visibleRecommendations + result.spareResolved {
+            let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard allows(item, profile: profile, playlistID: playlistID),
+                  !seenVideoIDs.contains(videoID),
+                  !seenIdentities.contains(item.songIdentity) else { continue }
+            seenVideoIDs.insert(videoID)
+            seenIdentities.insert(item.songIdentity)
+            if visible.count < 5 { visible.append(item) }
+            else { spare.append(item) }
+        }
+
+        var deferred: [ScoredPlaylistCandidate] = []
+        for candidate in result.deferredCandidates {
+            guard allows(candidate, profile: profile, playlistID: playlistID),
+                  seenIdentities.insert(candidate.identity).inserted else { continue }
+            deferred.append(candidate)
+        }
+        return PlaylistRecommendationResult(
+            visibleRecommendations: visible, spareResolved: spare, deferredCandidates: deferred
+        )
     }
 
     func fetchAndRankCandidates(

@@ -409,10 +409,31 @@ struct ShaudiAddToPlaylistModal: View {
     }
 }
 
+struct PlaylistRecommendationRequestState {
+    private(set) var activeID: UUID?
+    private(set) var signature: [String] = []
+
+    mutating func begin(signature: [String]) -> UUID {
+        let id = UUID()
+        activeID = id
+        self.signature = signature
+        return id
+    }
+
+    mutating func invalidate() {
+        activeID = nil
+    }
+
+    func matches(_ id: UUID, signature currentSignature: [String]) -> Bool {
+        activeID == id && signature == currentSignature
+    }
+}
+
 struct PlaylistDetailView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var playbackManager: PlaybackManager
+    @ObservedObject private var feedbackStore = RecommendationFeedbackStore.shared
 
     let playlist: Playlist
 
@@ -441,6 +462,8 @@ struct PlaylistDetailView: View {
     @State private var isFindingMore = false
     @State private var recommendationsErrorMessage: String?
     @State private var recommendationTask: Task<Void, Never>?
+    @State private var findMoreTask: Task<Void, Never>?
+    @State private var recommendationRequest = PlaylistRecommendationRequestState()
     @State private var recommendationRotation = 0
     @State private var manualAddedVideoIDs: Set<String> = []
     @State private var quickAddErrorMessage: String?
@@ -476,11 +499,7 @@ struct PlaylistDetailView: View {
     }
 
     private var trackOrderSignature: [String] {
-        tracks.map {
-            let videoID = $0.youtubeVideoID
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return videoID.isEmpty ? String(describing: $0.persistentModelID) : videoID
-        }
+        PlaylistRecommendationService.shared.trackSignature(for: tracks)
     }
 
     private func playlistWarmupCandidates(
@@ -640,11 +659,18 @@ struct PlaylistDetailView: View {
         .onDisappear {
             isPlaylistVisible = false
             playbackManager.cancelPlaylistWarmup()
-            recommendationTask?.cancel()
+            invalidateRecommendationRequests()
         }
         .onChange(of: trackOrderSignature) { oldSignature, newSignature in
             updatePlaylistWarmup()
             handleTrackSignatureChange(oldSignature: oldSignature, newSignature: newSignature)
+        }
+        .onChange(of: feedbackStore.snapshot.excludedArtistNames) {
+            invalidateRecommendationRequests()
+            let playlistID = String(describing: playlist.persistentModelID)
+            recommendationResult = PlaylistRecommendationService.shared.revalidate(
+                recommendationResult, for: tracks, playlistID: playlistID
+            )
         }
         .onChange(of: playbackManager.isShuffleEnabled) {
             updatePlaylistWarmup()
@@ -1199,7 +1225,7 @@ struct PlaylistDetailView: View {
     }
 
     private func loadRecommendations(forceRefresh: Bool = false) {
-        recommendationTask?.cancel()
+        invalidateRecommendationRequests()
         guard !tracks.isEmpty else {
             recommendationResult = PlaylistRecommendationResult(
                 visibleRecommendations: [],
@@ -1207,31 +1233,44 @@ struct PlaylistDetailView: View {
                 deferredCandidates: []
             )
             isRecommendationsLoading = false
+            recommendationsErrorMessage = nil
             return
         }
 
         let currentTracks = tracks
+        let signature = trackOrderSignature
+        let requestID = recommendationRequest.begin(signature: signature)
         let playlistID = String(describing: playlist.persistentModelID)
         let rotation = recommendationRotation
+        isRecommendationsLoading = true
+        recommendationsErrorMessage = nil
 
         recommendationTask = Task { @MainActor in
-            isRecommendationsLoading = true
-            recommendationsErrorMessage = nil
-
             do {
                 let results = try await PlaylistRecommendationService.shared.recommendations(
                     for: currentTracks,
                     playlistID: playlistID,
                     rotation: rotation,
-                    forceRefresh: forceRefresh
+                    forceRefresh: forceRefresh,
+                    currentTracks: { tracks },
+                    isCurrent: {
+                        isPlaylistVisible && recommendationRequest.matches(
+                            requestID, signature: trackOrderSignature
+                        )
+                    }
                 )
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, isPlaylistVisible,
+                      recommendationRequest.matches(requestID, signature: trackOrderSignature)
+                else { return }
                 recommendationResult = results
                 isRecommendationsLoading = false
             } catch is CancellationError {
-                // Cancelled
+                guard recommendationRequest.matches(requestID, signature: trackOrderSignature) else { return }
+                isRecommendationsLoading = false
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, isPlaylistVisible,
+                      recommendationRequest.matches(requestID, signature: trackOrderSignature)
+                else { return }
                 recommendationsErrorMessage = error.localizedDescription
                 isRecommendationsLoading = false
             }
@@ -1240,28 +1279,54 @@ struct PlaylistDetailView: View {
 
     private func handleFindMore() {
         guard !isFindingMore, recommendationResult.canFindMore else { return }
+        invalidateRecommendationRequests()
         let currentTracks = tracks
+        let signature = trackOrderSignature
+        let requestID = recommendationRequest.begin(signature: signature)
         let playlistID = String(describing: playlist.persistentModelID)
+        let startingResult = recommendationResult
+        isFindingMore = true
 
-        Task { @MainActor in
-            isFindingMore = true
+        findMoreTask = Task { @MainActor in
             do {
                 let updated = try await PlaylistRecommendationService.shared.findMore(
                     for: currentTracks,
                     playlistID: playlistID,
-                    currentResult: recommendationResult
+                    currentResult: startingResult,
+                    currentTracks: { tracks },
+                    isCurrent: {
+                        isPlaylistVisible && recommendationRequest.matches(
+                            requestID, signature: trackOrderSignature
+                        )
+                    }
                 )
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, isPlaylistVisible,
+                      recommendationRequest.matches(requestID, signature: trackOrderSignature)
+                else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
                     recommendationResult = updated
                 }
                 isFindingMore = false
             } catch is CancellationError {
+                guard recommendationRequest.matches(requestID, signature: trackOrderSignature) else { return }
                 isFindingMore = false
             } catch {
+                guard !Task.isCancelled, isPlaylistVisible,
+                      recommendationRequest.matches(requestID, signature: trackOrderSignature)
+                else { return }
                 isFindingMore = false
             }
         }
+    }
+
+    private func invalidateRecommendationRequests() {
+        recommendationRequest.invalidate()
+        recommendationTask?.cancel()
+        findMoreTask?.cancel()
+        recommendationTask = nil
+        findMoreTask = nil
+        isRecommendationsLoading = false
+        isFindingMore = false
     }
 
     private func handleRefreshRecommendations() {
@@ -1296,7 +1361,8 @@ struct PlaylistDetailView: View {
             recommendationResult = PlaylistRecommendationService.shared.consumeVisibleRecommendation(
                 item,
                 from: recommendationResult,
-                playlistID: playlistID
+                playlistID: playlistID,
+                currentTracks: tracks
             )
         }
     }
@@ -1307,17 +1373,25 @@ struct PlaylistDetailView: View {
             recommendationResult = PlaylistRecommendationService.shared.rejectRecommendation(
                 item,
                 from: recommendationResult,
-                playlistID: playlistID
+                playlistID: playlistID,
+                currentTracks: tracks
             )
         }
     }
 
     private func handleTrackSignatureChange(oldSignature: [String], newSignature: [String]) {
-        let newlyAdded = Set(newSignature).subtracting(oldSignature)
+        invalidateRecommendationRequests()
+        let playlistID = String(describing: playlist.persistentModelID)
+        recommendationResult = PlaylistRecommendationService.shared.revalidate(
+            recommendationResult, for: tracks, playlistID: playlistID
+        )
+        func videoIDs(in signature: [String]) -> Set<String> {
+            Set(signature.map { String($0.prefix { $0 != "\u{1F}" }) })
+        }
+        let newlyAdded = videoIDs(in: newSignature).subtracting(videoIDs(in: oldSignature))
         if !newlyAdded.isEmpty && newlyAdded.isSubset(of: manualAddedVideoIDs) {
             return
         }
-        let playlistID = String(describing: playlist.persistentModelID)
         PlaylistRecommendationService.shared.cache.remove(playlistID: playlistID)
         loadRecommendations(forceRefresh: true)
     }
