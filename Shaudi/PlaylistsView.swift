@@ -109,306 +109,6 @@ struct PlaylistsView: View {
     }
 }
 
-struct PlaylistNameEditor: View {
-    @Environment(\.dismiss) private var dismiss
-
-    let title: String
-    let actionTitle: String
-    let onSave: (String) -> Void
-
-    @State private var name: String
-
-    init(
-        title: String,
-        actionTitle: String,
-        initialName: String = "",
-        onSave: @escaping (String) -> Void
-    ) {
-        self.title = title
-        self.actionTitle = actionTitle
-        self.onSave = onSave
-        _name = State(initialValue: initialName)
-    }
-
-    private var trimmedName: String {
-        name.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                TextField("Playlist Name", text: $name)
-            }
-            .scrollContentBackground(.hidden)
-            .background(ShaudiTheme.canvas)
-            .tint(ShaudiTheme.accent)
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(actionTitle) {
-                        onSave(trimmedName)
-                        dismiss()
-                    }
-                    .disabled(trimmedName.isEmpty)
-                }
-            }
-        }
-    }
-}
-
-struct ShaudiPlaylistNameModal: View {
-    let title: String
-    @Binding var isPresented: Bool
-    let onCreate: (String) -> Void
-
-    @State private var name = ""
-    @FocusState private var isNameFocused: Bool
-
-    private var trimmedName: String {
-        name.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.48)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: dismiss)
-
-            VStack(alignment: .leading, spacing: 18) {
-                Text(title)
-                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
-                    .foregroundStyle(.white)
-
-                TextField("Playlist Name", text: $name)
-                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
-                    .textInputAutocapitalization(.words)
-                    .focused($isNameFocused)
-                    .padding(.horizontal, 14)
-                    .frame(minHeight: 46)
-                    .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 13))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 13)
-                            .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
-                    }
-
-                HStack {
-                    Button("Cancel", action: dismiss)
-                        .foregroundStyle(.white.opacity(0.76))
-
-                    Spacer()
-
-                    Button("Create") {
-                        guard !trimmedName.isEmpty else { return }
-                        onCreate(trimmedName)
-                        dismiss()
-                    }
-                    .fontWeight(.semibold)
-                    .disabled(trimmedName.isEmpty)
-                }
-                .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
-            }
-            .padding(22)
-            .frame(maxWidth: 340)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-            .background(ShaudiTheme.lavender.opacity(0.18), in: RoundedRectangle(cornerRadius: 24))
-            .overlay {
-                RoundedRectangle(cornerRadius: 24)
-                    .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
-            }
-            .shadow(color: ShaudiTheme.accent.opacity(0.32), radius: 22, y: 8)
-            .padding(.horizontal, 28)
-            .contentShape(RoundedRectangle(cornerRadius: 24))
-            .onTapGesture {}
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.96)))
-        .onAppear { isNameFocused = true }
-    }
-
-    private func dismiss() {
-        isNameFocused = false
-        isPresented = false
-    }
-}
-
-struct ShaudiAddToPlaylistModal: View {
-    @Environment(\.modelContext) private var modelContext
-
-    @Query(sort: \Playlist.dateCreated, order: .reverse)
-    private var playlists: [Playlist]
-    @Query(sort: \Track.dateAdded, order: .reverse)
-    private var libraryTracks: [Track]
-
-    @Binding var isPresented: Bool
-    let transientTrack: Track?
-    let playableTrack: PlayableTrack?
-
-    @State private var isShowingNewPlaylist = false
-    @State private var errorMessage: String?
-
-    init(
-        isPresented: Binding<Bool>,
-        transientTrack: Track? = nil,
-        playableTrack: PlayableTrack? = nil
-    ) {
-        _isPresented = isPresented
-        self.transientTrack = transientTrack
-        self.playableTrack = playableTrack
-    }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.48)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: dismiss)
-
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Add to Playlist")
-                    .font(ShaudiTheme.scriptFont(size: 30, relativeTo: .title2))
-                    .foregroundStyle(.white)
-
-                Button {
-                    isShowingNewPlaylist = true
-                } label: {
-                    Label("New Playlist", systemImage: "plus")
-                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body).weight(.semibold))
-                        .foregroundStyle(ShaudiTheme.accent)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .buttonStyle(.plain)
-
-                if playlists.isEmpty {
-                    Text("Create a playlist to add this song.")
-                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
-                        .foregroundStyle(.white.opacity(0.72))
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 4) {
-                            ForEach(playlists) { playlist in
-                                Button {
-                                    addCurrentTrack(to: playlist)
-                                } label: {
-                                    HStack {
-                                        Text(playlist.name)
-                                            .foregroundStyle(.white)
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Image(systemName: containsCurrentTrack(in: playlist)
-                                            ? "checkmark.circle.fill" : "plus.circle")
-                                            .foregroundStyle(ShaudiTheme.accent)
-                                    }
-                                    .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body))
-                                    .padding(.vertical, 8)
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(containsCurrentTrack(in: playlist))
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 250)
-                }
-
-                HStack {
-                    Spacer()
-                    Button("Done", action: dismiss)
-                        .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .body).weight(.semibold))
-                        .foregroundStyle(ShaudiTheme.accent)
-                }
-            }
-            .padding(22)
-            .frame(maxWidth: 340)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 24))
-            .background(ShaudiTheme.lavender.opacity(0.18), in: RoundedRectangle(cornerRadius: 24))
-            .overlay {
-                RoundedRectangle(cornerRadius: 24)
-                    .stroke(ShaudiTheme.accent.opacity(0.42), lineWidth: 1)
-            }
-            .shadow(color: ShaudiTheme.accent.opacity(0.32), radius: 22, y: 8)
-            .padding(.horizontal, 28)
-            .contentShape(RoundedRectangle(cornerRadius: 24))
-            .onTapGesture {}
-
-            if isShowingNewPlaylist {
-                ShaudiPlaylistNameModal(
-                    title: "Create Playlist",
-                    isPresented: $isShowingNewPlaylist
-                ) { name in
-                    let playlist = Playlist(name: name)
-                    modelContext.insert(playlist)
-                    if addCurrentTrack(to: playlist) {
-                        dismiss()
-                    } else {
-                        modelContext.delete(playlist)
-                    }
-                }
-            }
-        }
-        .alert(
-            "Couldn’t Add to Playlist",
-            isPresented: Binding(
-                get: { errorMessage != nil },
-                set: { if !$0 { errorMessage = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) {
-                errorMessage = nil
-            }
-        } message: {
-            Text(errorMessage ?? "Please try again.")
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.96)))
-    }
-
-    private var currentVideoID: String? {
-        let videoID = playableTrack?.youtubeVideoID
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? transientTrack?.youtubeVideoID ?? ""
-        return videoID.isEmpty ? nil : videoID
-    }
-
-    private func containsCurrentTrack(in playlist: Playlist) -> Bool {
-        guard let currentVideoID else { return false }
-        return playlist.tracks.contains {
-            $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) == currentVideoID
-        }
-    }
-
-    @discardableResult
-    private func addCurrentTrack(to playlist: Playlist) -> Bool {
-        guard !containsCurrentTrack(in: playlist) else {
-            return false
-        }
-        do {
-            try TrackPersistence.promoteOrReuse(
-                transientTrack: transientTrack,
-                playableTrack: playableTrack,
-                in: modelContext,
-                targetPlaylist: playlist,
-                existingLibraryTracks: libraryTracks
-            )
-            return true
-        } catch {
-            #if DEBUG
-            print("[ShaudiAddToPlaylistModal] addCurrentTrack failed: \(error)")
-            #endif
-            errorMessage = "Couldn’t add song to playlist. Please try again."
-            return false
-        }
-    }
-
-    private func dismiss() {
-        isShowingNewPlaylist = false
-        isPresented = false
-    }
-}
-
 struct PlaylistRecommendationRequestState {
     private(set) var activeID: UUID?
     private(set) var signature: [String] = []
@@ -582,7 +282,15 @@ struct PlaylistDetailView: View {
             playlistSurface
 
             VStack(spacing: 0) {
-                playlistControlStrip
+                PlaylistDetailControlStripView(
+                    playlist: playlist,
+                    hasPlayableTrack: hasPlayableTrack,
+                    isShuffleEnabled: playbackManager.isShuffleEnabled,
+                    repeatMode: playbackManager.repeatMode,
+                    onPlay: { handlePlaylistPlayButton() },
+                    onToggleShuffle: { playbackManager.toggleShuffle() },
+                    onToggleRepeat: { playbackManager.toggleRepeatMode() }
+                )
 
                 Group {
                     if tracks.isEmpty {
@@ -597,9 +305,25 @@ struct PlaylistDetailView: View {
                                 let isCurrentlyPlaying = playbackManager.isCurrentTrack(track)
                                     || playbackManager.isCurrentPlayable(track.youtubeVideoID)
 
-                                playlistTrackRow(
-                                    track,
-                                    isCurrentlyPlaying: isCurrentlyPlaying
+                                PlaylistTrackRowView(
+                                    track: track,
+                                    isCurrentlyPlaying: isCurrentlyPlaying,
+                                    onPlay: {
+                                        playbackManager.play(
+                                            track,
+                                            in: tracks,
+                                            origin: .playlist(playlist.persistentModelID)
+                                        )
+                                    },
+                                    onShowInfo: { infoTrack = track },
+                                    onTrim: { trimmingTrack = track },
+                                    onEdit: { editingTrack = track },
+                                    onAddToPlaylist: { playlistTrack = track },
+                                    onPlayNext: { playbackManager.playNext(track) },
+                                    onAddToQueue: { playbackManager.addToQueue(track) },
+                                    onRemoveFromPlaylist: {
+                                        playlist.tracks.removeAll { $0 === track }
+                                    }
                                 )
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(
@@ -608,7 +332,30 @@ struct PlaylistDetailView: View {
                                 .listRowSeparator(.hidden)
                             }
 
-                            recommendationsSection
+                            PlaylistRecommendationsSectionView(
+                                result: recommendationResult,
+                                isLoading: isRecommendationsLoading,
+                                isFindingMore: isFindingMore,
+                                errorMessage: recommendationsErrorMessage,
+                                onRefresh: { handleRefreshRecommendations() },
+                                onRetry: { loadRecommendations(forceRefresh: true) },
+                                onFindMore: { handleFindMore() },
+                                onPlay: { item in handlePlayRecommendation(item) },
+                                onAdd: { item in handleAddRecommendation(item) },
+                                onPlayNext: { item in
+                                    let track = trackForRecommendation(item)
+                                    playbackManager.playNext(track)
+                                },
+                                onAddToQueue: { item in
+                                    let track = trackForRecommendation(item)
+                                    playbackManager.addToQueue(track)
+                                },
+                                onAddToPlaylist: { item in
+                                    let track = trackForRecommendation(item)
+                                    playlistTrack = track
+                                },
+                                onReject: { item in handleRejectRecommendation(item) }
+                            )
                         }
                         .listStyle(.plain)
                         .scrollContentBackground(.hidden)
@@ -783,66 +530,6 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private var playlistControlStrip: some View {
-        HStack(spacing: 10) {
-            Button {
-                handlePlaylistPlayButton()
-            } label: {
-                Image(systemName: "play.fill")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 40, height: 40)
-                    .background(ShaudiTheme.accent, in: Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(!hasPlayableTrack)
-            .opacity(hasPlayableTrack ? 1 : 0.45)
-            .accessibilityLabel("Start Playlist")
-
-            PlaylistArtworkView(playlist: playlist)
-                .frame(width: 40, height: 40)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .accessibilityHidden(true)
-
-            Text(playlist.name)
-                .font(ShaudiTheme.scriptFont(size: 25, relativeTo: .title3))
-                .foregroundStyle(ShaudiTheme.accent)
-                .lineLimit(1)
-                .accessibilityAddTraits(.isHeader)
-
-            Spacer(minLength: 4)
-
-            playbackModeButton(
-                title: "Shuffle",
-                systemImage: "shuffle",
-                isActive: playbackManager.isShuffleEnabled
-            ) {
-                playbackManager.toggleShuffle()
-            }
-
-            playbackModeButton(
-                title: "Repeat",
-                systemImage: playbackManager.repeatMode == .one ? "repeat.1" : "repeat",
-                isActive: playbackManager.repeatMode != .off,
-                stateDescription: repeatModeDescription
-            ) {
-                playbackManager.toggleRepeatMode()
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .background {
-            LinearGradient(
-                colors: [
-                    ShaudiTheme.card,
-                    ShaudiTheme.card.opacity(0.62),
-                    ShaudiTheme.canvas.opacity(0.12)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-    }
 
     private var playlistSurface: some View {
         ZStack {
@@ -860,354 +547,6 @@ struct PlaylistDetailView: View {
         .ignoresSafeArea()
     }
 
-    private func playbackModeButton(
-        title: String,
-        systemImage: String,
-        isActive: Bool,
-        stateDescription: String? = nil,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(isActive ? ShaudiTheme.accent : Color.secondary)
-                .frame(width: 38, height: 38)
-                .background(
-                    isActive ? ShaudiTheme.accent.opacity(0.16) : Color.clear,
-                    in: Circle()
-                )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
-        .accessibilityValue(stateDescription ?? (isActive ? "On" : "Off"))
-    }
-
-    private var repeatModeDescription: String {
-        switch playbackManager.repeatMode {
-        case .off:
-            return "Off"
-        case .playlist:
-            return "Playlist"
-        case .one:
-            return "One song"
-        }
-    }
-
-    private func playlistTrackRow(
-        _ track: Track,
-        isCurrentlyPlaying: Bool
-    ) -> some View {
-        HStack(spacing: 8) {
-            Button {
-                playbackManager.play(
-                    track,
-                    in: tracks,
-                    origin: .playlist(playlist.persistentModelID)
-                )
-            } label: {
-                HStack(spacing: 13) {
-                    trackArtwork(track)
-
-                    Text(track.displayTitle)
-                        .font(
-                            isCurrentlyPlaying
-                                ? ShaudiTheme.bodyFont(size: 17, relativeTo: .headline).weight(.semibold)
-                                : ShaudiTheme.bodyFont(size: 17, relativeTo: .headline)
-                        )
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-
-                    Spacer(minLength: 4)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            Menu {
-                Button {
-                    infoTrack = track
-                } label: {
-                    Label("Show Info", systemImage: "info.circle")
-                }
-
-                Button {
-                    trimmingTrack = track
-                } label: {
-                    Label("Trim Song", systemImage: "scissors")
-                }
-
-                Button {
-                    editingTrack = track
-                } label: {
-                    Label("Edit Song", systemImage: "pencil")
-                }
-
-                Button {
-                    playlistTrack = track
-                } label: {
-                    Label("Add to Playlist", systemImage: "text.badge.plus")
-                }
-
-                Button {
-                    playbackManager.playNext(track)
-                } label: {
-                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
-                }
-
-                Button {
-                    playbackManager.addToQueue(track)
-                } label: {
-                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
-                }
-
-                Button(role: .destructive) {
-                    playlist.tracks.removeAll { $0 === track }
-                } label: {
-                    Label("Remove from Playlist", systemImage: "minus.circle")
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.headline)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Song actions")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 9)
-        .background(
-            isCurrentlyPlaying
-                ? ShaudiTheme.accent.opacity(0.16)
-                : ShaudiTheme.card.opacity(0.58),
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-        )
-    }
-
-    private func trackArtwork(_ track: Track) -> some View {
-        Group {
-            if let thumbnailURL = track.thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        trackArtworkPlaceholder
-                    }
-                }
-            } else {
-                trackArtworkPlaceholder
-            }
-        }
-        .frame(width: 44, height: 44)
-        .background(ShaudiTheme.lavender.opacity(0.14))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-
-    private var trackArtworkPlaceholder: some View {
-        Image(systemName: "music.note")
-            .font(.headline)
-            .foregroundStyle(ShaudiTheme.lavender)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    // MARK: - Playlist Recommendations
-
-    @ViewBuilder
-    private var recommendationsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Recommended for this playlist")
-                    .font(ShaudiTheme.bodyFont(size: 19, relativeTo: .headline).weight(.semibold))
-                    .foregroundStyle(.primary)
-
-                Spacer()
-
-                Button {
-                    handleRefreshRecommendations()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(isRecommendationsLoading ? ShaudiTheme.accent.opacity(0.4) : ShaudiTheme.accent)
-                        .frame(width: 32, height: 32)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(isRecommendationsLoading || isFindingMore)
-                .accessibilityLabel("Refresh recommendations")
-            }
-            .padding(.horizontal, 4)
-            .padding(.top, 16)
-
-            if isRecommendationsLoading && recommendationResult.visibleRecommendations.isEmpty {
-                HStack(spacing: 10) {
-                    ProgressView()
-                        .tint(ShaudiTheme.accent)
-                    Text("Finding recommendations…")
-                        .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 16)
-            } else if recommendationsErrorMessage != nil && recommendationResult.visibleRecommendations.isEmpty {
-                VStack(spacing: 6) {
-                    Text("Couldn’t load recommendations.")
-                        .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
-                        .foregroundStyle(.secondary)
-
-                    Button("Retry") {
-                        loadRecommendations(forceRefresh: true)
-                    }
-                    .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .footnote).weight(.semibold))
-                    .foregroundStyle(ShaudiTheme.accent)
-                }
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 14)
-            } else {
-                ForEach(recommendationResult.visibleRecommendations, id: \.youtubeResult.youtubeVideoID) { item in
-                    recommendationRow(item)
-                }
-
-                if recommendationResult.canFindMore {
-                    findMoreButton
-                }
-            }
-        }
-        .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 12, trailing: 12))
-        .listRowSeparator(.hidden)
-    }
-
-    private var findMoreButton: some View {
-        Button {
-            handleFindMore()
-        } label: {
-            HStack(spacing: 8) {
-                if isFindingMore {
-                    ProgressView()
-                        .tint(ShaudiTheme.accent)
-                        .scaleEffect(0.85)
-                } else {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 14, weight: .semibold))
-                }
-                Text(isFindingMore ? "Finding more…" : "Find More")
-                    .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline).weight(.semibold))
-            }
-            .foregroundStyle(ShaudiTheme.accent)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 11)
-            .background(
-                ShaudiTheme.card.opacity(0.58),
-                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(ShaudiTheme.accent.opacity(0.28), lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .disabled(isFindingMore)
-        .padding(.top, 4)
-        .accessibilityLabel(isFindingMore ? "Finding more recommendations" : "Find more recommendations")
-    }
-
-    private func recommendationRow(_ item: ResolvedRecommendation) -> some View {
-        HStack(spacing: 12) {
-            Button {
-                handlePlayRecommendation(item)
-            } label: {
-                HStack(spacing: 12) {
-                    AsyncImage(url: item.youtubeResult.thumbnailURL) { phase in
-                        if case .success(let image) = phase {
-                            image
-                                .resizable()
-                                .scaledToFill()
-                        } else {
-                            trackArtworkPlaceholder
-                        }
-                    }
-                    .frame(width: 44, height: 44)
-                    .background(ShaudiTheme.lavender.opacity(0.14))
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title)
-                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .headline))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-
-                        Text(item.artist)
-                            .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Play \(item.title) by \(item.artist)")
-
-            Spacer(minLength: 4)
-
-            Button {
-                handleAddRecommendation(item)
-            } label: {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 24))
-                    .foregroundStyle(ShaudiTheme.accent)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Add to playlist")
-
-            Menu {
-                Button {
-                    let track = trackForRecommendation(item)
-                    playbackManager.playNext(track)
-                } label: {
-                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
-                }
-
-                Button {
-                    let track = trackForRecommendation(item)
-                    playbackManager.addToQueue(track)
-                } label: {
-                    Label("Add to Queue", systemImage: "text.badge.plus.fill")
-                }
-
-                Button {
-                    let track = trackForRecommendation(item)
-                    playlistTrack = track
-                } label: {
-                    Label("Add to Playlist", systemImage: "text.badge.plus")
-                }
-
-                Button(role: .destructive) {
-                    handleRejectRecommendation(item)
-                } label: {
-                    Label("Not for this playlist", systemImage: "hand.thumbsdown")
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.headline)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Song actions")
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 9)
-        .background(
-            ShaudiTheme.card.opacity(0.58),
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-        )
-    }
 
     private func trackForRecommendation(_ item: ResolvedRecommendation) -> Track {
         TrackPersistence.transientTrack(for: item)
@@ -1512,163 +851,5 @@ struct PlaylistDetailView: View {
             playlist.artworkID = artworkID
             artworkErrorMessage = error.localizedDescription
         }
-    }
-}
-
-private struct AddTracksView: View {
-    @Environment(\.dismiss) private var dismiss
-    @Environment(\.modelContext) private var modelContext
-
-    @Query(sort: \Track.dateAdded, order: .reverse)
-    private var libraryTracks: [Track]
-
-    let playlist: Playlist
-
-    @State private var selectedTracks: Set<ObjectIdentifier> = []
-    @State private var isShowingNewTrack = false
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    Button {
-                        isShowingNewTrack = true
-                    } label: {
-                        Label("Create New Track", systemImage: "plus")
-                    }
-                }
-
-                Section("Library") {
-                    if libraryTracks.isEmpty {
-                        Text("No tracks in Library.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(libraryTracks) { track in
-                            Button {
-                                toggleSelection(of: track)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text(track.displayTitle)
-                                            .foregroundStyle(.primary)
-
-                                        if isAlreadyAdded(track) {
-                                            Text("Already in Playlist")
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-
-                                    Spacer()
-
-                                    Image(
-                                        systemName: isAlreadyAdded(track) || isSelected(track)
-                                            ? "checkmark.circle.fill"
-                                            : "circle"
-                                    )
-                                }
-                            }
-                            .disabled(isAlreadyAdded(track))
-                        }
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden)
-            .background(ShaudiTheme.canvas)
-            .tint(ShaudiTheme.accent)
-            .navigationTitle("Add Tracks")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(addButtonTitle) {
-                        addSelectedTracks()
-                        dismiss()
-                    }
-                    .disabled(selectedTracks.isEmpty)
-                }
-            }
-            .sheet(isPresented: $isShowingNewTrack) {
-                TrackEditorView(
-                    title: "New Track",
-                    actionTitle: "Create"
-                ) { request in
-                    if let existingTrack = libraryTracks.first(where: {
-                        $0.youtubeVideoID == request.youtubeVideo.id
-                    }) {
-                        guard !isAlreadyAdded(existingTrack) else {
-                            return "This YouTube video is already in this Playlist."
-                        }
-
-                        add(existingTrack)
-                        return nil
-                    }
-
-                    guard let metadata = request.metadata else {
-                        return "Fetch the YouTube metadata before creating this track."
-                    }
-
-                    let track = Track(
-                        title: metadata.title,
-                        youtubeURL: request.youtubeVideo.url,
-                        youtubeVideoID: request.youtubeVideo.id,
-                        channelTitle: metadata.channelTitle,
-                        thumbnailURL: metadata.thumbnailURL,
-                        duration: metadata.duration,
-                        metadataLastRefreshed: .now
-                    )
-
-                    modelContext.insert(track)
-                    add(track)
-                    return nil
-                }
-            }
-        }
-    }
-
-    private var addButtonTitle: String {
-        selectedTracks.isEmpty ? "Add" : "Add (\(selectedTracks.count))"
-    }
-
-    private func isAlreadyAdded(_ track: Track) -> Bool {
-        playlist.tracks.contains { $0 === track }
-    }
-
-    private func isSelected(_ track: Track) -> Bool {
-        selectedTracks.contains(ObjectIdentifier(track))
-    }
-
-    private func toggleSelection(of track: Track) {
-        guard !isAlreadyAdded(track) else {
-            return
-        }
-
-        let identifier = ObjectIdentifier(track)
-
-        if selectedTracks.contains(identifier) {
-            selectedTracks.remove(identifier)
-        } else {
-            selectedTracks.insert(identifier)
-        }
-    }
-
-    private func addSelectedTracks() {
-        for track in libraryTracks where isSelected(track) {
-            add(track)
-        }
-    }
-
-    private func add(_ track: Track) {
-        guard !isAlreadyAdded(track) else {
-            return
-        }
-
-        playlist.tracks.append(track)
     }
 }
