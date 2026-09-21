@@ -6,10 +6,21 @@ import XCTest
 final class PersistenceActionTests: XCTestCase {
     private enum SimulatedFailure: Error { case save }
 
+    // Callers keep the container alive through their final ModelContext operation.
     private func context() throws -> (ModelContainer, ModelContext) {
+        let schema = Schema([
+            Track.self,
+            Playlist.self
+        ])
+
+        let configuration = ModelConfiguration(
+            schema: schema,
+            isStoredInMemoryOnly: true
+        )
+
         let container = try ModelContainer(
-            for: Track.self, Playlist.self,
-            configurations: ModelConfiguration(isStoredInMemoryOnly: true)
+            for: schema,
+            configurations: [configuration]
         )
         return (container, container.mainContext)
     }
@@ -30,7 +41,8 @@ final class PersistenceActionTests: XCTestCase {
     }
 
     func testPickerOpenCancelAndRecommendationQueueActionsRemainTransient() throws {
-        let (_, modelContext) = try context()
+        let (container, modelContext) = try context()
+        defer { withExtendedLifetime(container) {} }
         let item = recommendation()
         let pickerTrack = TrackPersistence.transientTrack(for: item)
         XCTAssertNil(pickerTrack.modelContext)
@@ -100,7 +112,8 @@ final class PersistenceActionTests: XCTestCase {
     }
 
     func testOpeningPickerDoesNotEnrichExistingLibraryTrack() throws {
-        let (_, modelContext) = try context()
+        let (container, modelContext) = try context()
+        defer { withExtendedLifetime(container) {} }
         let existing = Track(
             title: "User Title", youtubeURL: URL(string: "https://www.youtube.com/watch?v=phase3video")!,
             youtubeVideoID: "phase3video", channelTitle: "Original Uploader"
@@ -115,7 +128,8 @@ final class PersistenceActionTests: XCTestCase {
     }
 
     func testFailedCreationReportsFailureAndLeavesRecommendationAndLibraryIntact() throws {
-        let (_, modelContext) = try context()
+        let (container, modelContext) = try context()
+        defer { withExtendedLifetime(container) {} }
         let playlist = Playlist(name: "Target")
         modelContext.insert(playlist)
         let item = recommendation()
@@ -150,7 +164,8 @@ final class PersistenceActionTests: XCTestCase {
     }
 
     func testFailedReuseRestoresExistingTrackAndMembership() throws {
-        let (_, modelContext) = try context()
+        let (container, modelContext) = try context()
+        defer { withExtendedLifetime(container) {} }
         let existing = Track(
             title: "User Title", youtubeURL: URL(string: "https://www.youtube.com/watch?v=phase3video")!,
             youtubeVideoID: "phase3video", channelTitle: "Original Uploader"
@@ -174,7 +189,8 @@ final class PersistenceActionTests: XCTestCase {
     }
 
     func testSearchStyleTransientTrackOnlyPersistsAfterConfirmation() throws {
-        let (_, modelContext) = try context()
+        let (container, modelContext) = try context()
+        defer { withExtendedLifetime(container) {} }
         let playable = PlayableTrack(
             youtubeVideoID: "searchvideo", title: "Search Song",
             channelTitle: "Search Artist", thumbnailURL: nil, duration: 180

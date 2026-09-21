@@ -55,7 +55,7 @@ final class PlaybackCompletionTests: XCTestCase {
         manager.triggerPlaybackCompletionForTesting(for: item, requestID: requestID, source: .normalEnd)
 
         XCTAssertEqual(manager.currentIndex, 1, "Playback should advance to index 1 on normal completion")
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, requestID, "Completion gate should record requestID")
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Clearing the completed player resets the gate")
     }
 
     // MARK: - 2. Boundary callback + didPlayToEnd both firing advances exactly once
@@ -99,7 +99,7 @@ final class PlaybackCompletionTests: XCTestCase {
         )
 
         XCTAssertEqual(manager.currentIndex, 1, "Near-EOF failure should count as natural completion and advance")
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, requestID, "Completion gate should be locked")
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Advancing clears the completed request")
     }
 
     // MARK: - 4. Failed-to-end in middle of song does NOT count as natural completion
@@ -194,7 +194,7 @@ final class PlaybackCompletionTests: XCTestCase {
         )
 
         XCTAssertEqual(manager.currentIndex, 1, "Unrecovered near-EOF stall should trigger completion fallback")
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, requestID)
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Advancing clears the completed request")
     }
 
     // MARK: - 8. New playback request resets completion gate
@@ -209,7 +209,7 @@ final class PlaybackCompletionTests: XCTestCase {
         manager.seedInterruptionStateForTesting(state: .playing, requestID: request1, player: player1)
         manager.triggerPlaybackCompletionForTesting(for: item1, requestID: request1, source: .normalEnd)
 
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, request1)
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "The old gate is cleared before the next request")
         XCTAssertEqual(manager.currentIndex, 1)
 
         // Next track begins with a fresh request ID
@@ -219,7 +219,8 @@ final class PlaybackCompletionTests: XCTestCase {
 
         // Completion gate should allow request 2 to complete
         manager.triggerPlaybackCompletionForTesting(for: item2, requestID: request2, source: .normalEnd)
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, request2, "New request should complete normally")
+        XCTAssertNil(manager.currentIndex, "Completing the final track should stop playback")
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Stopping clears the second request gate")
     }
 
     // MARK: - 9. Stale completion event from old item/request cannot advance current playback
@@ -331,7 +332,7 @@ final class PlaybackCompletionTests: XCTestCase {
         manager.triggerPlaybackCompletionForTesting(for: item, requestID: requestID, source: .normalEnd)
 
         XCTAssertEqual(manager.currentIndex, 0, "Repeat-one must not advance to next track (remains at index 0)")
-        XCTAssertEqual(manager.completedPlaybackRequestIDForTesting, requestID)
+        XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Restarting repeat-one clears the old request")
     }
 
     // MARK: - 14. Manual queue and normal auto-advance remain intact

@@ -250,6 +250,10 @@ final class PlaylistArtworkStorageTests: XCTestCase {
 
     func testLargeSourceGIFIsDownsampledForTrackAndPlaylist() throws {
         let data = try makeGIFData(frameCount: 2, size: CGSize(width: 2_048, height: 2_048))
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let firstFrame = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        XCTAssertEqual(firstFrame.width, 2_048)
+        XCTAssertEqual(firstFrame.height, 2_048)
         let coverID = makeTrackCoverID()
         let artworkID = makeArtworkID()
         try ArtworkStorage.saveTrackCover(data: data, for: coverID)
@@ -283,7 +287,9 @@ final class PlaylistArtworkStorageTests: XCTestCase {
     }
 
     private func makeImage(color: UIColor, size: CGSize = CGSize(width: 4, height: 4)) -> UIImage {
-        UIGraphicsImageRenderer(size: size).image { context in
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1 // GIF fixtures use pixel dimensions, independent of device screen scale.
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
             color.setFill()
             context.fill(CGRect(origin: .zero, size: size))
         }

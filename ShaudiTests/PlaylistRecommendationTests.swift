@@ -9,6 +9,15 @@ import XCTest
 
 @MainActor
 final class PlaylistRecommendationTests: XCTestCase {
+    private var defaultsSuiteNames: [String] = []
+
+    override func tearDown() {
+        for suiteName in defaultsSuiteNames {
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        defaultsSuiteNames = []
+        super.tearDown()
+    }
 
     // MARK: - Helpers
 
@@ -16,7 +25,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         id: String = UUID().uuidString,
         title: String = "Test Song",
         artist: String = "Test Artist",
-        dateAdded: Date = .now
+        dateAdded: Date = .now,
+        authoritativeIdentity: Bool = true
     ) -> Track {
         Track(
             title: title,
@@ -26,7 +36,28 @@ final class PlaylistRecommendationTests: XCTestCase {
             channelTitle: artist,
             thumbnailURL: URL(string: "https://i.ytimg.com/vi/\(id)/hqdefault.jpg"),
             duration: 200,
-            metadataLastRefreshed: .now
+            metadataLastRefreshed: .now,
+            authoritativeRecommendationTitle: authoritativeIdentity ? title : nil,
+            authoritativeRecommendationArtist: authoritativeIdentity ? artist : nil
+        )
+    }
+
+    private func makeService(
+        similarTracks: @escaping PlaylistRecommendationService.SimilarTracksOperation,
+        safeResolve: @escaping PlaylistRecommendationService.SafeResolverOperation,
+        officialResolve: @escaping PlaylistRecommendationService.OfficialResolverOperation = { _ in nil }
+    ) -> PlaylistRecommendationService {
+        let suiteName = "shaudi.tests.playlist.\(UUID().uuidString)"
+        defaultsSuiteNames.append(suiteName)
+        let defaults = UserDefaults(suiteName: suiteName)!
+        return PlaylistRecommendationService(
+            similarTracks: similarTracks,
+            safeResolve: safeResolve,
+            officialResolve: officialResolve,
+            feedbackStore: RecommendationFeedbackStore(defaults: defaults),
+            personalizationStore: RecommendationPersonalizationStore(),
+            rejectionStore: PlaylistRejectionStore(defaults: defaults),
+            cache: PlaylistRecommendationCache()
         )
     }
 
@@ -92,7 +123,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let t1 = makeTrack(id: "v1", title: "Boulevard of Broken Dreams", artist: "Green Day")
         var lastFMQueried = false
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { artist, title, _, _ in
                 lastFMQueried = true
                 return [self.makeSimilar(artist: "blink-182", title: "Dammit", match: 0.9)]
@@ -116,7 +147,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         }
 
         var callCount = 0
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 callCount += 1
                 return [self.makeSimilar(artist: "RecArtist", title: "RecSong", match: 0.8)]
@@ -135,7 +166,7 @@ final class PlaylistRecommendationTests: XCTestCase {
     func testCacheHitAvoidsRepeatLastFMWork() async throws {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
         var callCount = 0
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 callCount += 1
                 return [self.makeSimilar(artist: "RecArtist", title: "RecSong", match: 0.8)]
@@ -160,7 +191,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         var safeResolverCalled = false
         var officialResolverCalled = false
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [self.makeSimilar(artist: "Cached Artist", title: "Cached Song", match: 0.9)]
             },
@@ -186,7 +217,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
         var structuredResolverUsed = false
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [self.makeSimilar(artist: "Structured Artist", title: "Structured Song", match: 0.88)]
             },
@@ -206,7 +237,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
         var officialResolveCalls = 0
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [self.makeSimilar(artist: "Artist A", title: "Song A", match: 0.85)]
             },
@@ -229,7 +260,7 @@ final class PlaylistRecommendationTests: XCTestCase {
     func testCandidateRequiringOfficialSearchIsDeferred() async throws {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [self.makeSimilar(artist: "Needs Official", title: "Fallback Track", match: 0.85)]
             },
@@ -246,7 +277,7 @@ final class PlaylistRecommendationTests: XCTestCase {
     func testLowerRankedSafeCandidateCanStillResolveAfterADeferredOne() async throws {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [
                     self.makeSimilar(artist: "High Rank Artist", title: "High Rank Song", match: 0.95),
@@ -271,9 +302,9 @@ final class PlaylistRecommendationTests: XCTestCase {
 
     // 9. fewer than 5 safe results produces Find More state
     func testFewerThan5SafeResultsProducesFindMoreState() async throws {
-        let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
+        let tracks = [makeTrack(id: "v1", title: "Seed Song", artist: "Seed Artist")]
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [
                     self.makeSimilar(artist: "Artist 1", title: "Song 1", match: 0.9),
@@ -297,9 +328,9 @@ final class PlaylistRecommendationTests: XCTestCase {
 
     // 10. 5 safe results does NOT show Find More unnecessarily
     func test5SafeResultsDoesNotShowFindMoreUnnecessarily() async throws {
-        let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
+        let tracks = [makeTrack(id: "v1", title: "Seed Song", artist: "Seed Artist")]
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 (1...5).map { self.makeSimilar(artist: "Artist \($0)", title: "Song \($0)", match: 0.9 - Double($0) * 0.01) }
             },
@@ -315,10 +346,10 @@ final class PlaylistRecommendationTests: XCTestCase {
 
     // 11. tapping Find More permits official search fallback
     func testTappingFindMorePermitsOfficialSearchFallback() async throws {
-        let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
+        let tracks = [makeTrack(id: "v1", title: "Seed Song", artist: "Seed Artist")]
         var officialResolveCalls = 0
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [
                     self.makeSimilar(artist: "Artist 1", title: "Song 1", match: 0.9),
@@ -368,7 +399,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             deferredCandidates: deferred
         )
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil },
             officialResolve: { candidate in
@@ -404,7 +435,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             deferredCandidates: deferred
         )
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil },
             officialResolve: { candidate in
@@ -422,7 +453,7 @@ final class PlaylistRecommendationTests: XCTestCase {
     // 14. quick Add does not trigger new official search
     func testQuickAddDoesNotTriggerNewOfficialSearch() {
         var officialCalls = 0
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil },
             officialResolve: { _ in
@@ -449,7 +480,7 @@ final class PlaylistRecommendationTests: XCTestCase {
     // 15. Reject does not trigger new official search
     func testRejectDoesNotTriggerNewOfficialSearch() {
         var officialCalls = 0
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil },
             officialResolve: { _ in
@@ -474,7 +505,7 @@ final class PlaylistRecommendationTests: XCTestCase {
 
     // 16. Reject remains playlist-specific
     func testRejectRemainsPlaylistSpecific() {
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -497,7 +528,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let tracks = [makeTrack(id: "v1", title: "Song 1", artist: "Artist 1")]
 
         let item = makeResolved(artist: "Artist A", title: "Song A", videoID: "vidA")
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [
                     self.makeSimilar(artist: "Artist A", title: "Song A", match: 0.95),
@@ -545,7 +576,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         context.insert(playlist)
 
         let item = makeResolved(artist: "Artist A", title: "Song A", videoID: "vid123")
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -567,7 +598,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         let t2 = makeTrack(id: "v2", title: "Song 2", artist: "Artist 2")
         var officialCalls = 0
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 [self.makeSimilar(artist: "RecArtist", title: "RecSong", match: 0.9)]
             },
@@ -597,7 +628,7 @@ final class PlaylistRecommendationTests: XCTestCase {
         var lastFMCalls = 0
         var officialCalls = 0
 
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in
                 lastFMCalls += 1
                 return [self.makeSimilar(artist: "RecArtist", title: "RecSong", match: 0.85)]
@@ -656,7 +687,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             title: "West Coast",
             videoID: "canonical01"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -695,7 +726,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             youtubeTitle: "West Coast (fan upload)",
             uploader: "SomeFanArchive"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -735,7 +766,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             title: "Home",
             videoID: "same-title2"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -778,7 +809,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             title: "Canonical Song",
             videoID: "override001"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -816,7 +847,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             title: "Canonical Song",
             videoID: "override002"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -846,7 +877,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         let legacy = makeTrack(
             id: "legacy00001",
             title: "Legacy Artist - Legacy Song",
-            artist: "Archive Uploader"
+            artist: "Archive Uploader",
+            authoritativeIdentity: false
         )
 
         XCTAssertNil(legacy.authoritativeRecommendationTitle)
@@ -865,7 +897,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         let existing = makeTrack(
             id: "existing001",
             title: "West Coast",
-            artist: "SomeFanArchive"
+            artist: "SomeFanArchive",
+            authoritativeIdentity: false
         )
         context.insert(playlist)
         context.insert(existing)
@@ -877,7 +910,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             youtubeTitle: "West Coast (fan upload)",
             uploader: "SomeFanArchive"
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -920,7 +953,7 @@ final class PlaylistRecommendationTests: XCTestCase {
                 duration: 321
             )
         )
-        let service = PlaylistRecommendationService(
+        let service = makeService(
             similarTracks: { _, _, _, _ in [] },
             safeResolve: { _ in nil }
         )
@@ -949,7 +982,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         let manual = makeTrack(
             id: "manual00001",
             title: "Artist Name - Song Name",
-            artist: "Artist Name"
+            artist: "Artist Name",
+            authoritativeIdentity: false
         )
 
         XCTAssertNil(manual.persistedAuthoritativeRecommendationIdentity)
@@ -964,7 +998,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         let upload = makeTrack(
             id: "uploader001",
             title: "A Song Without Artist Attribution",
-            artist: "Random Upload Channel"
+            artist: "Random Upload Channel",
+            authoritativeIdentity: false
         )
 
         let profile = PlaylistVibeProfile.build(from: [upload])
