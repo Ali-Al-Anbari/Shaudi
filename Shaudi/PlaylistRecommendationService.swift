@@ -10,17 +10,11 @@ struct PlaylistVibeProfile {
     let representativeAnchors: [RecommendationSeed]
     let existingIdentities: Set<SongIdentity>
     let existingVideoIDs: Set<String>
-    let artistFrequencies: [String: Int]
-    let cachedGenres: [String]
-    let totalTracks: Int
-    let uniqueArtistCount: Int
 
     static func build(from tracks: [Track], rotation: Int = 0) -> PlaylistVibeProfile {
         var existingIdentities = Set<SongIdentity>()
         var existingVideoIDs = Set<String>()
         var validSeeds: [RecommendationSeed] = []
-        var artistFrequencies: [String: Int] = [:]
-        var allGenres: [String] = []
 
         for track in tracks {
             let videoID = track.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -36,10 +30,6 @@ struct PlaylistVibeProfile {
 
             existingIdentities.insert(seed.songIdentity)
             validSeeds.append(seed)
-
-            let normArtist = SongNormalization.text(seed.cleanedArtist)
-            artistFrequencies[normArtist, default: 0] += 1
-            allGenres.append(contentsOf: track.cachedGenreTags)
         }
 
         var seenIdentities = Set<SongIdentity>()
@@ -55,11 +45,7 @@ struct PlaylistVibeProfile {
         return PlaylistVibeProfile(
             representativeAnchors: anchors,
             existingIdentities: existingIdentities,
-            existingVideoIDs: existingVideoIDs,
-            artistFrequencies: artistFrequencies,
-            cachedGenres: Array(Set(allGenres)),
-            totalTracks: tracks.count,
-            uniqueArtistCount: artistFrequencies.count
+            existingVideoIDs: existingVideoIDs
         )
     }
 
@@ -124,7 +110,6 @@ struct ScoredPlaylistCandidate: Hashable {
     let track: LastFMSimilarTrack
     let identity: SongIdentity
     let score: Double
-    let supportingAnchorCount: Int
 }
 
 struct PlaylistRecommendationResult {
@@ -188,7 +173,6 @@ final class PlaylistRecommendationCache {
     struct Entry {
         let result: PlaylistRecommendationResult
         let trackSignature: [String]
-        let timestamp: Date
     }
 
     private var storage: [String: Entry] = [:]
@@ -205,8 +189,7 @@ final class PlaylistRecommendationCache {
     func set(playlistID: String, trackSignature: [String], result: PlaylistRecommendationResult) {
         storage[playlistID] = Entry(
             result: result,
-            trackSignature: trackSignature,
-            timestamp: Date()
+            trackSignature: trackSignature
         )
     }
 
@@ -214,8 +197,7 @@ final class PlaylistRecommendationCache {
         if let existing = storage[playlistID] {
             storage[playlistID] = Entry(
                 result: result,
-                trackSignature: existing.trackSignature,
-                timestamp: existing.timestamp
+                trackSignature: existing.trackSignature
             )
         }
     }
@@ -742,8 +724,7 @@ final class PlaylistRecommendationService {
             scoredList.append(ScoredPlaylistCandidate(
                 track: track,
                 identity: identity,
-                score: score,
-                supportingAnchorCount: supportCount
+                score: score
             ))
         }
 

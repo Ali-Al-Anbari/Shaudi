@@ -338,9 +338,9 @@ final class RecommendationPersonalizationTests: XCTestCase {
         )
         func vibe(_ anchors: [RecommendationSeed]) -> PlaylistVibeProfile {
             PlaylistVibeProfile(
-                representativeAnchors: anchors, existingIdentities: [],
-                existingVideoIDs: [], artistFrequencies: [:], cachedGenres: [],
-                totalTracks: anchors.count, uniqueArtistCount: anchors.count
+                representativeAnchors: anchors,
+                existingIdentities: [],
+                existingVideoIDs: []
             )
         }
         let oneCandidates = try await playlist.fetchAndRankCandidates(profile: vibe([firstSeed]))
@@ -354,7 +354,6 @@ final class RecommendationPersonalizationTests: XCTestCase {
         )
         XCTAssertEqual(one.score, 0.8 + shared.combined, accuracy: 0.0001)
         XCTAssertEqual(two.score - one.score, 0.25, accuracy: 0.0001)
-        XCTAssertEqual(two.supportingAnchorCount, 2)
     }
 
     func testEqualInputsKeepDeterministicArtistOrder() async throws {

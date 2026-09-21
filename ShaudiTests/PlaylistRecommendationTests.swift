@@ -358,8 +358,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             ScoredPlaylistCandidate(
                 track: makeSimilar(artist: "Deferred \($0)", title: "D\($0)", match: 0.8),
                 identity: SongIdentity(artist: "Deferred \($0)", title: "D\($0)"),
-                score: 0.8,
-                supportingAnchorCount: 1
+                score: 0.8
             )
         }
 
@@ -395,8 +394,7 @@ final class PlaylistRecommendationTests: XCTestCase {
             ScoredPlaylistCandidate(
                 track: makeSimilar(artist: "Deferred \($0)", title: "D\($0)", match: 0.8),
                 identity: SongIdentity(artist: "Deferred \($0)", title: "D\($0)"),
-                score: 0.8,
-                supportingAnchorCount: 1
+                score: 0.8
             )
         }
 
@@ -521,8 +519,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         XCTAssertTrue(result2.visibleRecommendations.contains { $0.title == "Song A" })
     }
 
-    // 18. recommendation row tap plays normally
-    func testRecommendationRowTapPlaysNormally() {
+    // 18. recommendation maps to playable track fields
+    func testRecommendationMapsToPlayableTrackForPlayback() {
         let item = makeResolved(artist: "Artist A", title: "Song A", videoID: "vid123")
         let playable = PlayableTrack(
             youtubeVideoID: item.youtubeResult.youtubeVideoID,
@@ -539,8 +537,8 @@ final class PlaylistRecommendationTests: XCTestCase {
         XCTAssertEqual(item.songIdentity.title, "Song A")
     }
 
-    // 19. normal ... actions remain available
-    func testNormalEllipsisActionsRemainAvailable() throws {
+    // 19. recommendation can be added to playlist and converted to transient track
+    func testRecommendationCanBeAddedToPlaylistAndInstantiatedAsTransientTrack() throws {
         let (container, context) = try makeTestContainer()
         _ = container
         let playlist = Playlist(name: "Test Playlist")
@@ -556,17 +554,11 @@ final class PlaylistRecommendationTests: XCTestCase {
         XCTAssertNotNil(added)
         XCTAssertEqual(playlist.tracks.count, 1)
 
-        let transient = Track(
-            title: item.title,
-            youtubeURL: URL(string: "https://www.youtube.com/watch?v=\(item.youtubeResult.youtubeVideoID)")!,
-            youtubeVideoID: item.youtubeResult.youtubeVideoID,
-            channelTitle: item.artist,
-            thumbnailURL: item.youtubeResult.thumbnailURL,
-            duration: item.youtubeResult.duration,
-            metadataLastRefreshed: .now
-        )
+        let transient = TrackPersistence.transientTrack(for: item)
         context.insert(transient)
         XCTAssertEqual(transient.youtubeVideoID, "vid123")
+        XCTAssertEqual(transient.title, "Song A")
+        XCTAssertEqual(transient.channelTitle, "Artist A")
     }
 
     // 20. external playlist change invalidates cache while preserving no-automatic-official-search rule

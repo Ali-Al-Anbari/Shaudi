@@ -4291,6 +4291,7 @@ final class PlaybackManager: ObservableObject {
         endLog("Active playback metadata updated for \(videoID)")
     }
 
+#if DEBUG
     private func logDurationDiagnostics(
         for item: AVPlayerItem,
         videoID: String,
@@ -4427,6 +4428,25 @@ final class PlaybackManager: ObservableObject {
             )
         }
     }
+#else
+    private func logDurationDiagnostics(
+        for item: AVPlayerItem,
+        videoID: String,
+        trackDuration: TimeInterval?,
+        requestID: UUID
+    ) {}
+
+    private func logSelectedStream(
+        videoID: String,
+        diagnostics: StreamDiagnostics?,
+        source: StreamResolutionSource
+    ) {}
+
+    private func logPlayerItemFailureDiagnostics(
+        for item: AVPlayerItem,
+        videoID: String
+    ) {}
+#endif
 
     private func recordPlaybackStarted(
         videoID: String,
@@ -5534,6 +5554,7 @@ final class PlaybackManager: ObservableObject {
         ProcessInfo.processInfo.systemUptime
     }
 
+#if DEBUG
     private func logTiming(_ label: String, seconds: TimeInterval, videoID: String) {
         log("\(label) for \(videoID): \(String(format: "%.3f", seconds)) s")
     }
@@ -5542,7 +5563,6 @@ final class PlaybackManager: ObservableObject {
         print("[Playback] \(message)")
     }
 
-#if DEBUG
     private func lifecycleLog(_ message: String) {
         print("[PlaybackLifecycle] \(message)")
     }
@@ -5563,6 +5583,8 @@ final class PlaybackManager: ObservableObject {
         print("[AudioInterruption] \(message)")
     }
 #else
+    private func logTiming(_ label: String, seconds: TimeInterval, videoID: String) {}
+    private func log(_ message: String) {}
     private func lifecycleLog(_ message: String) {}
     private func endLog(_ message: String) {}
     private func timingLog(_ message: String) {}
@@ -5841,6 +5863,7 @@ final class PlaybackManager: ObservableObject {
         return error.localizedDescription
     }
 
+#if DEBUG
     private static func redactedDiagnosticText(_ text: String) -> String {
         guard let expression = try? NSRegularExpression(
             pattern: #"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+"#
@@ -5868,4 +5891,5 @@ final class PlaybackManager: ObservableObject {
 
         return redactedText
     }
+#endif
 }

@@ -125,9 +125,9 @@ final class PlaybackCompletionTests: XCTestCase {
         XCTAssertNil(manager.completedPlaybackRequestIDForTesting, "Completion gate must remain unlocked")
     }
 
-    // MARK: - 5. Temporary stall away from EOF does NOT advance
+    // MARK: - 5. Simulated stall away from EOF does NOT advance
 
-    func testTemporaryStallAwayFromEOFDoesNotAdvance() {
+    func testSimulatedStallAwayFromEOFDoesNotAdvance() {
         let t1 = makeTrack(id: "t1", duration: 215.0)
         let t2 = makeTrack(id: "t2")
         let manager = makeManager(tracks: [t1, t2], currentIndex: 0)
@@ -149,9 +149,9 @@ final class PlaybackCompletionTests: XCTestCase {
         XCTAssertNil(manager.completedPlaybackRequestIDForTesting)
     }
 
-    // MARK: - 6. Temporary stall near EOF that recovers does NOT falsely advance
+    // MARK: - 6. Simulated stall near EOF that recovers does NOT falsely advance
 
-    func testTemporaryStallNearEOFThatRecoversDoesNotAdvance() {
+    func testSimulatedStallNearEOFThatRecoversDoesNotAdvance() {
         let t1 = makeTrack(id: "t1", duration: 215.0)
         let t2 = makeTrack(id: "t2")
         let manager = makeManager(tracks: [t1, t2], currentIndex: 0)
@@ -173,9 +173,9 @@ final class PlaybackCompletionTests: XCTestCase {
         XCTAssertNil(manager.completedPlaybackRequestIDForTesting)
     }
 
-    // MARK: - 7. Unrecovered near-EOF stall advances exactly once
+    // MARK: - 7. Simulated unrecovered near-EOF stall advances exactly once
 
-    func testUnrecoveredNearEOFStallAdvancesExactlyOnce() {
+    func testSimulatedUnrecoveredNearEOFStallAdvancesExactlyOnce() {
         let t1 = makeTrack(id: "t1", duration: 215.0)
         let t2 = makeTrack(id: "t2")
         let manager = makeManager(tracks: [t1, t2], currentIndex: 0)

@@ -680,7 +680,7 @@ final class RecommendationPipelineTests: XCTestCase {
         let resolver = YouTubeRecommendationResolver(
             primarySearch: { _ in
                 requestCount += 1
-                throw YouTubeWebSearchClient.SearchError.httpStatus(429)
+                throw YouTubeStructuredSearchClient.ClientError.httpStatus(429)
             },
             dataAPISearch: { _ in [] }
         )
@@ -837,15 +837,6 @@ final class RecommendationPipelineTests: XCTestCase {
 
         XCTAssertEqual(webRequests, 1)
         XCTAssertEqual(dataAPIRequests, 2)
-    }
-
-    func testWebAbuseChallengeURLIsRecognized() {
-        XCTAssertTrue(YouTubeWebSearchClient.isAbuseChallengeURL(
-            URL(string: "https://www.google.com/sorry/index?continue=youtube")
-        ))
-        XCTAssertFalse(YouTubeWebSearchClient.isAbuseChallengeURL(
-            URL(string: "https://www.youtube.com/results?search_query=Song")
-        ))
     }
 
     func testBothResolverCircuitsOpenWithoutRepeatedAttempts() async throws {
@@ -1166,7 +1157,7 @@ final class RecommendationPipelineTests: XCTestCase {
         let resolver = YouTubeRecommendationResolver(
             primarySearch: { _ in
                 webRequests += 1
-                throw YouTubeWebSearchClient.SearchError.tooManyHTTPRedirects
+                throw URLError(.httpTooManyRedirects)
             },
             dataAPISearch: { _ in dataAPIRequests += 1; return [] },
             fallbackBudget: isolatedFallbackBudget()
@@ -1191,7 +1182,7 @@ final class RecommendationPipelineTests: XCTestCase {
         let resolver = YouTubeRecommendationResolver(
             primarySearch: { _ in
                 webRequests += 1
-                throw YouTubeWebSearchClient.SearchError.abuseChallenge
+                throw YouTubeStructuredSearchClient.ClientError.httpStatus(403)
             },
             dataAPISearch: { _ in dataAPIRequests += 1; return [] },
             fallbackBudget: isolatedFallbackBudget()

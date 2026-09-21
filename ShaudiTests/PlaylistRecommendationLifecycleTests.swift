@@ -27,7 +27,7 @@ final class PlaylistRecommendationLifecycleTests: XCTestCase {
         ScoredPlaylistCandidate(
             track: LastFMSimilarTrack(artist: artist, title: title, match: 0.8, url: nil),
             identity: SongIdentity(artist: artist, title: title),
-            score: 0.8, supportingAnchorCount: 1
+            score: 0.8
         )
     }
 
