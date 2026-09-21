@@ -52,7 +52,7 @@ enum YouTubeURLParser {
         return Video(url: url, id: videoID)
     }
 
-    private static func isUsableVideoID(_ videoID: String) -> Bool {
+    static func isUsableVideoID(_ videoID: String) -> Bool {
         let allowedCharacters = CharacterSet(
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
         )
