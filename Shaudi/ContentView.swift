@@ -1416,6 +1416,7 @@ private struct NowPlayingPlaylistPicker: View {
     let playableTrack: PlayableTrack?
 
     @State private var isShowingNewPlaylist = false
+    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -1473,16 +1474,31 @@ private struct NowPlayingPlaylistPicker: View {
                     ) { name in
                         let playlist = Playlist(name: name)
                         modelContext.insert(playlist)
-                        addCurrentTrack(to: playlist)
+                        if !addCurrentTrack(to: playlist) {
+                            modelContext.delete(playlist)
+                        }
                     }
                 }
             }
+        }
+        .alert(
+            "Couldn’t Add to Playlist",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Please try again.")
         }
     }
 
     private var currentVideoID: String? {
         let videoID = playableTrack?.youtubeVideoID
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? transientTrack?.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? ""
         return videoID.isEmpty ? nil : videoID
     }
 
@@ -1497,54 +1513,23 @@ private struct NowPlayingPlaylistPicker: View {
         }
     }
 
-    private func addCurrentTrack(to playlist: Playlist) {
-        guard
-            !containsCurrentTrack(in: playlist),
-            let track = persistentCurrentTrack()
-        else {
-            return
+    @discardableResult
+    private func addCurrentTrack(to playlist: Playlist) -> Bool {
+        guard !containsCurrentTrack(in: playlist) else { return false }
+        do {
+            try TrackPersistence.promoteOrReuse(
+                transientTrack: transientTrack, playableTrack: playableTrack,
+                in: modelContext, targetPlaylist: playlist,
+                existingLibraryTracks: libraryTracks
+            )
+            return true
+        } catch {
+            #if DEBUG
+            print("[NowPlayingPlaylistPicker] addCurrentTrack failed: \(error)")
+            #endif
+            errorMessage = "Couldn’t add song to playlist. Please try again."
+            return false
         }
-
-        playlist.tracks.append(track)
-        try? modelContext.save()
-    }
-
-    private func persistentCurrentTrack() -> Track? {
-        guard let currentVideoID else {
-            return nil
-        }
-
-        if let existingTrack = libraryTracks.first(where: {
-            $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-                == currentVideoID
-        }) {
-            return existingTrack
-        }
-
-        if let transientTrack {
-            modelContext.insert(transientTrack)
-            return transientTrack
-        }
-
-        guard let playableTrack else {
-            return nil
-        }
-
-        var components = URLComponents(string: "https://www.youtube.com/watch")!
-        components.queryItems = [URLQueryItem(name: "v", value: currentVideoID)]
-        let track = Track(
-            title: playableTrack.title,
-            youtubeURL: components.url!,
-            youtubeVideoID: currentVideoID,
-            channelTitle: playableTrack.channelTitle,
-            thumbnailURL: playableTrack.thumbnailURL,
-            duration: playableTrack.duration,
-            metadataLastRefreshed: .now,
-            playbackStartTime: playableTrack.playbackStartTime,
-            playbackEndTime: playableTrack.playbackEndTime
-        )
-        modelContext.insert(track)
-        return track
     }
 }
 

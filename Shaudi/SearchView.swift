@@ -661,11 +661,15 @@ struct SearchView: View {
                 }
 
                 let track = makeTrack(for: result, metadata: metadata)
-                modelContext.insert(track)
-                try modelContext.save()
+                let persistedTrack = try TrackPersistence.promoteOrReuse(
+                    track: track,
+                    in: modelContext,
+                    targetPlaylist: nil,
+                    existingLibraryTracks: libraryTracks
+                )
                 teachResolution(result: result, metadata: metadata, source: .library)
-                noticeMessage = "Added “\(track.displayTitle)” to Library"
-                searchLog("Created Library track \(result.youtubeVideoID)")
+                noticeMessage = "Added “\(persistedTrack.displayTitle)” to Library"
+                searchLog("Saved Library track \(result.youtubeVideoID)")
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -688,30 +692,16 @@ struct SearchView: View {
                     return
                 }
 
-                let track: Track
-                let reusedLibraryTrack: Bool
-
-                if let existingTrack = existingTrack(for: result.youtubeVideoID) {
-                    track = existingTrack
-                    reusedLibraryTrack = true
-                } else {
-                    track = makeTrack(for: result, metadata: metadata)
-                    modelContext.insert(track)
-                    reusedLibraryTrack = false
-                }
-
-                playlist.tracks.append(track)
-                try modelContext.save()
+                let track = makeTrack(for: result, metadata: metadata)
+                let persistedTrack = try TrackPersistence.promoteOrReuse(
+                    track: track,
+                    in: modelContext,
+                    targetPlaylist: playlist,
+                    existingLibraryTracks: libraryTracks
+                )
                 teachResolution(result: result, metadata: metadata, source: .playlist)
-                noticeMessage = "Added “\(track.displayTitle)” to \(playlist.name)"
-
-                if reusedLibraryTrack {
-                    searchLog(
-                        "Added existing Library track \(result.youtubeVideoID) to playlist"
-                    )
-                } else {
-                    searchLog("Created Library track \(result.youtubeVideoID)")
-                }
+                noticeMessage = "Added “\(persistedTrack.displayTitle)” to \(playlist.name)"
+                searchLog("Added track \(result.youtubeVideoID) to playlist")
             } catch {
                 errorMessage = error.localizedDescription
             }

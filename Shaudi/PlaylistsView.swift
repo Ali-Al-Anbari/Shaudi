@@ -251,6 +251,7 @@ struct ShaudiAddToPlaylistModal: View {
     let playableTrack: PlayableTrack?
 
     @State private var isShowingNewPlaylist = false
+    @State private var errorMessage: String?
 
     init(
         isPresented: Binding<Bool>,
@@ -342,10 +343,26 @@ struct ShaudiAddToPlaylistModal: View {
                 ) { name in
                     let playlist = Playlist(name: name)
                     modelContext.insert(playlist)
-                    addCurrentTrack(to: playlist)
-                    dismiss()
+                    if addCurrentTrack(to: playlist) {
+                        dismiss()
+                    } else {
+                        modelContext.delete(playlist)
+                    }
                 }
             }
+        }
+        .alert(
+            "Couldn’t Add to Playlist",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                errorMessage = nil
+            }
+        } message: {
+            Text(errorMessage ?? "Please try again.")
         }
         .transition(.opacity.combined(with: .scale(scale: 0.96)))
     }
@@ -358,43 +375,32 @@ struct ShaudiAddToPlaylistModal: View {
 
     private func containsCurrentTrack(in playlist: Playlist) -> Bool {
         guard let currentVideoID else { return false }
-        return playlist.tracks.contains { $0.youtubeVideoID == currentVideoID }
+        return playlist.tracks.contains {
+            $0.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines) == currentVideoID
+        }
     }
 
-    private func addCurrentTrack(to playlist: Playlist) {
-        guard !containsCurrentTrack(in: playlist), let track = persistentCurrentTrack() else {
-            return
+    @discardableResult
+    private func addCurrentTrack(to playlist: Playlist) -> Bool {
+        guard !containsCurrentTrack(in: playlist) else {
+            return false
         }
-        playlist.tracks.append(track)
-        try? modelContext.save()
-    }
-
-    private func persistentCurrentTrack() -> Track? {
-        guard let currentVideoID else { return nil }
-        if let existing = libraryTracks.first(where: { $0.youtubeVideoID == currentVideoID }) {
-            return existing
+        do {
+            try TrackPersistence.promoteOrReuse(
+                transientTrack: transientTrack,
+                playableTrack: playableTrack,
+                in: modelContext,
+                targetPlaylist: playlist,
+                existingLibraryTracks: libraryTracks
+            )
+            return true
+        } catch {
+            #if DEBUG
+            print("[ShaudiAddToPlaylistModal] addCurrentTrack failed: \(error)")
+            #endif
+            errorMessage = "Couldn’t add song to playlist. Please try again."
+            return false
         }
-        if let transientTrack {
-            modelContext.insert(transientTrack)
-            return transientTrack
-        }
-        guard let playableTrack,
-              let url = URL(string: "https://www.youtube.com/watch?v=\(currentVideoID)") else {
-            return nil
-        }
-        let track = Track(
-            title: playableTrack.title,
-            youtubeURL: url,
-            youtubeVideoID: currentVideoID,
-            channelTitle: playableTrack.channelTitle,
-            thumbnailURL: playableTrack.thumbnailURL,
-            duration: playableTrack.duration,
-            metadataLastRefreshed: .now,
-            playbackStartTime: playableTrack.playbackStartTime,
-            playbackEndTime: playableTrack.playbackEndTime
-        )
-        modelContext.insert(track)
-        return track
     }
 
     private func dismiss() {
@@ -437,6 +443,7 @@ struct PlaylistDetailView: View {
     @State private var recommendationTask: Task<Void, Never>?
     @State private var recommendationRotation = 0
     @State private var manualAddedVideoIDs: Set<String> = []
+    @State private var quickAddErrorMessage: String?
 
     private let warmupTrackLimit = 10
 
@@ -698,6 +705,19 @@ struct PlaylistDetailView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(artworkErrorMessage ?? "Please choose a different image.")
+        }
+        .alert(
+            "Couldn’t Add to Playlist",
+            isPresented: Binding(
+                get: { quickAddErrorMessage != nil },
+                set: { if !$0 { quickAddErrorMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                quickAddErrorMessage = nil
+            }
+        } message: {
+            Text(quickAddErrorMessage ?? "Please try again.")
         }
         .sheet(isPresented: $isShowingRename) {
             PlaylistNameEditor(
@@ -1164,25 +1184,7 @@ struct PlaylistDetailView: View {
     }
 
     private func trackForRecommendation(_ item: ResolvedRecommendation) -> Track {
-        let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let existing = libraryTracks.first(where: { $0.youtubeVideoID == videoID }) {
-            existing.preserveAuthoritativeRecommendationIdentity(item.songIdentity)
-            return existing
-        }
-        let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") ?? URL(string: "https://www.youtube.com")!
-        let track = Track(
-            title: item.title,
-            youtubeURL: url,
-            youtubeVideoID: videoID,
-            channelTitle: item.artist,
-            thumbnailURL: item.youtubeResult.thumbnailURL,
-            duration: item.youtubeResult.duration,
-            metadataLastRefreshed: .now,
-            authoritativeRecommendationTitle: item.songIdentity.title,
-            authoritativeRecommendationArtist: item.songIdentity.artist
-        )
-        modelContext.insert(track)
-        return track
+        TrackPersistence.transientTrack(for: item)
     }
 
     private func handlePlayRecommendation(_ item: ResolvedRecommendation) {
@@ -1274,14 +1276,20 @@ struct PlaylistDetailView: View {
         let videoID = item.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !videoID.isEmpty else { return }
 
-        manualAddedVideoIDs.insert(videoID)
-
-        _ = PlaylistRecommendationService.shared.addRecommendation(
+        guard let _ = PlaylistRecommendationService.shared.addRecommendation(
             item,
             to: playlist,
             in: modelContext,
             existingLibraryTracks: libraryTracks
-        )
+        ) else {
+            #if DEBUG
+            print("[PlaylistRecommendations] Quick add failed for videoID: \(videoID)")
+            #endif
+            quickAddErrorMessage = "Couldn’t add song to playlist. Please try again."
+            return
+        }
+
+        manualAddedVideoIDs.insert(videoID)
 
         let playlistID = String(describing: playlist.persistentModelID)
         withAnimation(.easeInOut(duration: 0.2)) {

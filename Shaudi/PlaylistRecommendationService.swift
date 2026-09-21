@@ -762,38 +762,19 @@ final class PlaylistRecommendationService {
         in modelContext: ModelContext,
         existingLibraryTracks: [Track]
     ) -> Track? {
-        let videoID = recommendation.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !videoID.isEmpty else { return nil }
-
-        guard !playlist.tracks.contains(where: { $0.youtubeVideoID == videoID }) else {
+        do {
+            return try TrackPersistence.promoteOrReuse(
+                recommendation: recommendation,
+                in: modelContext,
+                targetPlaylist: playlist,
+                existingLibraryTracks: existingLibraryTracks
+            )
+        } catch {
+            #if DEBUG
+            print("[PlaylistRecommendations] addRecommendation failed: \(error)")
+            #endif
             return nil
         }
-
-        let track: Track
-        if let existing = existingLibraryTracks.first(where: { $0.youtubeVideoID == videoID }) {
-            track = existing
-            track.preserveAuthoritativeRecommendationIdentity(recommendation.songIdentity)
-        } else {
-            guard let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") else {
-                return nil
-            }
-            track = Track(
-                title: recommendation.title,
-                youtubeURL: url,
-                youtubeVideoID: videoID,
-                channelTitle: recommendation.artist,
-                thumbnailURL: recommendation.youtubeResult.thumbnailURL,
-                duration: recommendation.youtubeResult.duration,
-                metadataLastRefreshed: .now,
-                authoritativeRecommendationTitle: recommendation.songIdentity.title,
-                authoritativeRecommendationArtist: recommendation.songIdentity.artist
-            )
-            modelContext.insert(track)
-        }
-
-        playlist.tracks.append(track)
-        try? modelContext.save()
-        return track
     }
 
     private func isAlternateVersion(
