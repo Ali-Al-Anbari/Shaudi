@@ -1,0 +1,91 @@
+# Correctness rules matter more than cosmetic style here. Large SwiftUI files are
+# review signals, not a reason to split working code. Avoid broad auto-fix runs.
+
+included:
+  - Shaudi
+  - ShaudiTests
+
+excluded:
+  - .build
+  - DerivedData
+  - build
+
+only_rules:
+  - contains_over_filter_count
+  - cyclomatic_complexity
+  - duplicate_conditions
+  - duplicate_imports
+  - empty_count
+  - file_length
+  - first_where
+  - force_cast
+  - force_try
+  - function_body_length
+  - identifier_name
+  - implicitly_unwrapped_optional
+  - last_where
+  - line_length
+  - trailing_whitespace
+  - type_body_length
+  - unused_import
+  - unused_declaration
+  - unused_optional_binding
+
+duplicate_conditions:
+  severity: error
+
+duplicate_imports:
+  severity: error
+
+force_cast:
+  severity: warning
+
+force_try:
+  severity: warning
+
+implicitly_unwrapped_optional:
+  severity: warning
+  mode: all_except_iboutlets
+
+file_length:
+  warning: 2000
+  error: 8000
+  ignore_comment_only_lines: true
+
+type_body_length:
+  warning: 2000
+  error: 7000
+
+function_body_length:
+  warning: 200
+  error: 400
+
+cyclomatic_complexity:
+  warning: 30
+  error: 70
+
+line_length:
+  warning: 260
+  error: 400
+  ignores_urls: true
+  ignores_comments: true
+  ignores_multiline_strings: true
+
+# Short fixture names (including t0/t1/t2) are useful in tests. Keep the same
+# permissive rule project-wide so tests retain all correctness checks.
+identifier_name:
+  min_length:
+    warning: 1
+  max_length:
+    warning: 75
+    error: 120
+  excluded:
+    - id
+    - t0
+    - t1
+    - t2
+
+trailing_whitespace:
+  severity: warning
+  ignores_empty_lines: true
+  ignores_comments: true
