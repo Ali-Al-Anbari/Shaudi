@@ -298,6 +298,7 @@ final class PlaybackCompletionTests: XCTestCase {
         let track = makeTrack(id: "video789", duration: nil)
         let manager = makeManager(tracks: [track], currentIndex: 0)
         let requestID = UUID()
+        manager.seedInterruptionStateForTesting(state: .playing, requestID: requestID)
 
         XCTAssertNil(manager.currentEffectivePlaybackDuration, "Effective duration should be nil before hydration")
 

@@ -267,7 +267,6 @@ final class PlaybackManager: ObservableObject {
     private var recommendationTasks: [String: Task<Void, Never>] = [:]
     private var recommendationRefillTask: Task<Void, Never>?
     private var recommendationRefillID: UUID?
-    private var recommendationMetadataTasks: [String: Task<Void, Never>] = [:]
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
     private var nextItemStatusObservation: NSKeyValueObservation?
@@ -330,9 +329,15 @@ final class PlaybackManager: ObservableObject {
     private var stallFallbackTask: Task<Void, Never>?
     private var timingFallbackTask: Task<Void, Never>?
 
-    /// Tracks requested video IDs for duration hydration to avoid redundant API queries.
-    private var durationHydrationRequestedVideoIDs: Set<String> = []
-    private var durationHydrationTasks: [String: Task<Void, Never>] = [:]
+    private struct MetadataHydrationFlight {
+        let task: Task<Void, Never>
+        var tracks: [Track]
+        var playbackRequestIDs: Set<UUID>
+    }
+    /// One authoritative metadata request per video, shared across playback attempts.
+    private var metadataHydrationFlights: [String: MetadataHydrationFlight] = [:]
+    private var authoritativeMetadataByVideoID: [String: YouTubeMetadata] = [:]
+    private var authoritativeMetadataOrder: [String] = []
 
     /// Temporary validated UI fallback duration when Track.duration is missing.
     /// Strictly kept in-memory and NEVER persisted to Track.duration.
@@ -352,7 +357,6 @@ final class PlaybackManager: ObservableObject {
     private var recommendationTransportMetadata: [String: RecommendationTransportMetadata] = [:]
     private var recommendationManualSeeds: [String: RecommendationSeed] = [:]
     private var recommendationRadioSession: RecommendationRadioSession?
-    private var recommendationMetadataRequestedIDs: Set<String> = []
     private var resolvedStreamCache: [String: URL] = [:]
     private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
     private var inFlightResolutions: [String: InFlightResolution] = [:]
@@ -1435,7 +1439,6 @@ final class PlaybackManager: ObservableObject {
         }
 
         let track = queue[currentIndex]
-        hydrateRecommendationMetadataIfNeeded(for: track)
         startPlaybackContext(
             PlayableTrack(track: track),
             persistentTrack: track,
@@ -4166,86 +4169,126 @@ final class PlaybackManager: ObservableObject {
         let videoID = normalizedVideoID(playableTrack.youtubeVideoID)
         guard !videoID.isEmpty else { return }
 
-        if let currentDuration = validDuration(track?.duration ?? playableTrack.duration) {
+        if let cached = authoritativeMetadataByVideoID[videoID],
+           validDuration(track?.duration) == nil || track?.thumbnailURL == nil {
+            applyHydratedMetadata(
+                cached, videoID: videoID,
+                tracks: track.map { [$0] } ?? [],
+                playbackRequestIDs: [requestID]
+            )
+            return
+        }
+        if let currentDuration = validDuration(track?.duration) {
             endLog("hydrateTrackDurationIfNeeded: duration already known (\(currentDuration)s) for \(videoID)")
             return
         }
+        if track == nil, validDuration(playableTrack.duration) != nil { return }
 
-        guard durationHydrationRequestedVideoIDs.insert(videoID).inserted else {
-            endLog("hydrateTrackDurationIfNeeded: hydration already in flight or requested for \(videoID)")
+        if var flight = metadataHydrationFlights[videoID] {
+            if let track, !flight.tracks.contains(where: { $0 === track }) {
+                flight.tracks.append(track)
+            }
+            flight.playbackRequestIDs.insert(requestID)
+            metadataHydrationFlights[videoID] = flight
+            endLog("Joining metadata hydration for \(videoID)")
             return
         }
 
-        durationHydrationTasks[videoID] = Task { [weak self] in
-            defer {
-                Task { @MainActor [weak self] in
-                    self?.durationHydrationTasks[videoID] = nil
-                }
-            }
-
+        let task = Task { [weak self] in
+            guard let self else { return }
             do {
                 let metadata: YouTubeMetadata
 #if DEBUG
-                if let self, let provider = self.testMetadataProvider {
+                if let provider = self.testMetadataProvider {
                     metadata = try await provider(videoID)
-                } else if let self {
-                    metadata = try await self.metadataClient.metadata(for: videoID)
                 } else {
-                    return
+                    metadata = try await self.metadataClient.metadata(for: videoID)
                 }
 #else
-                guard let self else { return }
                 metadata = try await self.metadataClient.metadata(for: videoID)
 #endif
-
-                guard let self else { return }
-                guard let authoritativeDuration = self.validDuration(metadata.duration) else {
-                    self.endLog("Hydration returned nil/invalid duration for \(videoID)")
-                    return
-                }
-
-                if let targetTrack = track ?? self.currentTrack, targetTrack.youtubeVideoID == videoID {
-                    targetTrack.duration = authoritativeDuration
-                    if let thumb = metadata.thumbnailURL {
-                        targetTrack.thumbnailURL = thumb
-                    }
-                    targetTrack.metadataLastRefreshed = .now
-                    try? targetTrack.modelContext?.save()
-                    self.endLog("Successfully hydrated and persisted Track.duration=\(authoritativeDuration)s for \(videoID)")
-                }
-
-                guard self.isActive(requestID), self.currentPlayableTrack?.youtubeVideoID == videoID else {
-                    return
-                }
-
-                self.temporaryValidatedUIDuration = nil
-                if let updatedPlayable = self.currentPlayableTrack {
-                    self.currentPlayableTrack = PlayableTrack(
-                        youtubeVideoID: updatedPlayable.youtubeVideoID,
-                        title: updatedPlayable.title,
-                        channelTitle: updatedPlayable.channelTitle,
-                        thumbnailURL: metadata.thumbnailURL ?? updatedPlayable.thumbnailURL,
-                        duration: authoritativeDuration,
-                        playbackStartTime: updatedPlayable.playbackStartTime,
-                        playbackEndTime: updatedPlayable.playbackEndTime
-                    )
-                }
-
-                let newRange = self.effectivePlaybackRange(for: self.currentPlayableTrack)
-                self.updateActivePlaybackRange(newRange)
-#if os(iOS)
-                if let currentPlayableTrack = self.currentPlayableTrack {
-                    self.publishNowPlaying(currentPlayableTrack, requestID: requestID)
-                    self.synchronizeNowPlayingPlaybackState()
-                }
-#endif
-                self.endLog("Active playback range and Now Playing updated with hydrated duration for \(videoID)")
+                guard let flight = self.metadataHydrationFlights.removeValue(forKey: videoID) else { return }
+                self.applyHydratedMetadata(
+                    metadata, videoID: videoID,
+                    tracks: flight.tracks,
+                    playbackRequestIDs: flight.playbackRequestIDs
+                )
             } catch is CancellationError {
-                return
+                self.metadataHydrationFlights[videoID] = nil
             } catch {
-                self?.endLog("Duration hydration failed for \(videoID): \(error.localizedDescription)")
+                self.metadataHydrationFlights[videoID] = nil
+                self.endLog("Metadata hydration failed for \(videoID): \(error.localizedDescription)")
             }
         }
+        metadataHydrationFlights[videoID] = MetadataHydrationFlight(
+            task: task,
+            tracks: track.map { [$0] } ?? [],
+            playbackRequestIDs: [requestID]
+        )
+    }
+
+    private func applyHydratedMetadata(
+        _ metadata: YouTubeMetadata,
+        videoID: String,
+        tracks: [Track],
+        playbackRequestIDs: Set<UUID>
+    ) {
+        let authoritativeDuration = validDuration(metadata.duration)
+        guard authoritativeDuration != nil || metadata.thumbnailURL != nil else {
+            endLog("Hydration returned no valid duration or artwork for \(videoID)")
+            return
+        }
+        if authoritativeDuration != nil {
+            if authoritativeMetadataByVideoID[videoID] == nil {
+                authoritativeMetadataOrder.append(videoID)
+            }
+            authoritativeMetadataByVideoID[videoID] = metadata
+            if authoritativeMetadataOrder.count > 64 {
+                let oldest = authoritativeMetadataOrder.removeFirst()
+                authoritativeMetadataByVideoID[oldest] = nil
+            }
+        }
+
+        for track in tracks where normalizedVideoID(track.youtubeVideoID) == videoID {
+            if let authoritativeDuration { track.duration = authoritativeDuration }
+            if let thumbnailURL = metadata.thumbnailURL { track.thumbnailURL = thumbnailURL }
+            track.metadataLastRefreshed = .now
+            do {
+                try track.modelContext?.save()
+            } catch {
+                #if DEBUG
+                endLog("Could not persist hydrated metadata for \(videoID): \(error)")
+                #endif
+            }
+        }
+
+        guard let activeRequestID,
+              playbackRequestIDs.contains(activeRequestID),
+              isActive(activeRequestID),
+              normalizedVideoID(currentPlayableTrack?.youtubeVideoID ?? "") == videoID,
+              let updatedPlayable = currentPlayableTrack
+        else { return }
+
+        if authoritativeDuration != nil { temporaryValidatedUIDuration = nil }
+        currentPlayableTrack = PlayableTrack(
+            youtubeVideoID: updatedPlayable.youtubeVideoID,
+            title: updatedPlayable.title,
+            channelTitle: updatedPlayable.channelTitle,
+            thumbnailURL: metadata.thumbnailURL ?? updatedPlayable.thumbnailURL,
+            duration: authoritativeDuration ?? updatedPlayable.duration,
+            playbackStartTime: updatedPlayable.playbackStartTime,
+            playbackEndTime: updatedPlayable.playbackEndTime
+        )
+        if authoritativeDuration != nil {
+            updateActivePlaybackRange(effectivePlaybackRange(for: currentPlayableTrack))
+        }
+#if os(iOS)
+        if let currentPlayableTrack {
+            publishNowPlaying(currentPlayableTrack, requestID: activeRequestID)
+            synchronizeNowPlayingPlaybackState()
+        }
+#endif
+        endLog("Active playback metadata updated for \(videoID)")
     }
 
     private func logDurationDiagnostics(
@@ -4550,14 +4593,10 @@ final class PlaybackManager: ObservableObject {
         for task in recommendationTasks.values {
             task.cancel()
         }
-        for task in recommendationMetadataTasks.values {
-            task.cancel()
-        }
         recommendationRefillTask?.cancel()
         recommendationTasks = [:]
         recommendationRefillTask = nil
         recommendationRefillID = nil
-        recommendationMetadataTasks = [:]
         recommendationSessionID = nil
         recommendationRadioSession = nil
         recommendationSeenVideoIDs = []
@@ -4565,72 +4604,7 @@ final class PlaybackManager: ObservableObject {
         recommendationSeenSongIdentities = []
         recommendationTransportMetadata = [:]
         recommendationManualSeeds = [:]
-        recommendationMetadataRequestedIDs = []
         recommendationLog("mode ended for \(reason)")
-    }
-
-    private func hydrateRecommendationMetadataIfNeeded(for track: Track) {
-        guard
-            playbackOrigin == .recommendations,
-            validDuration(track.duration) == nil
-        else {
-            return
-        }
-
-        let videoID = normalizedVideoID(track.youtubeVideoID)
-        guard
-            !videoID.isEmpty,
-            let sessionID = recommendationSessionID,
-            recommendationMetadataRequestedIDs.insert(videoID).inserted
-        else {
-            return
-        }
-
-        recommendationMetadataTasks[videoID] = Task { [weak self] in
-            do {
-                let metadata = try await metadataClient.metadata(for: videoID)
-                guard let self else {
-                    return
-                }
-                if recommendationSessionID == sessionID {
-                    recommendationMetadataTasks[videoID] = nil
-                }
-
-                track.thumbnailURL = metadata.thumbnailURL ?? track.thumbnailURL
-                track.duration = metadata.duration
-                track.metadataLastRefreshed = .now
-
-                guard currentTrack === track else {
-                    return
-                }
-
-                currentPlayableTrack = PlayableTrack(track: track)
-                updateActivePlaybackRange(
-                    effectivePlaybackRange(for: currentPlayableTrack)
-                )
-#if os(iOS)
-                if let activeRequestID, let currentPlayableTrack {
-                    publishNowPlaying(currentPlayableTrack, requestID: activeRequestID)
-                }
-#endif
-                recommendationLog("metadata ready track=\(videoID)")
-            } catch is CancellationError {
-                guard let self else {
-                    return
-                }
-                if recommendationSessionID == sessionID {
-                    recommendationMetadataTasks[videoID] = nil
-                }
-            } catch {
-                guard let self else {
-                    return
-                }
-                if recommendationSessionID == sessionID {
-                    recommendationMetadataTasks[videoID] = nil
-                }
-                recommendationLog("metadata failed track=\(videoID)")
-            }
-        }
     }
 
     private func handleConfirmedRecommendationPlaybackStart(
@@ -5806,9 +5780,20 @@ final class PlaybackManager: ObservableObject {
         for track: Track,
         requestID: UUID
     ) async {
-        let playable = PlayableTrack(track: track)
-        hydrateTrackDurationIfNeeded(for: track, playableTrack: playable, requestID: requestID)
-        if let task = durationHydrationTasks[track.youtubeVideoID] {
+        startMetadataHydrationForTesting(for: track, requestID: requestID)
+        if let task = metadataHydrationFlights[normalizedVideoID(track.youtubeVideoID)]?.task {
+            _ = await task.result
+        }
+    }
+
+    func startMetadataHydrationForTesting(for track: Track, requestID: UUID) {
+        hydrateTrackDurationIfNeeded(
+            for: track, playableTrack: PlayableTrack(track: track), requestID: requestID
+        )
+    }
+
+    func waitForMetadataHydrationForTesting(videoID: String) async {
+        if let task = metadataHydrationFlights[normalizedVideoID(videoID)]?.task {
             _ = await task.result
         }
     }
