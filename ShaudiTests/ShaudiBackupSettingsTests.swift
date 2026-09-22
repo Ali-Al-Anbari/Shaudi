@@ -69,7 +69,8 @@ final class ShaudiBackupSettingsTests: XCTestCase {
     }
 
     func testPreviewAndCancelDoNotMutateLibrary() throws {
-        let (_, context) = try context()
+        let (container, context) = try context()
+        defer { withExtendedLifetime(container) {} }
         let backup = ShaudiBackupCoordinator()
         let csv = header + "Library,Song,Artist,abcdefghijk,https://www.youtube.com/watch?v=abcdefghijk\r\n"
         try backup.prepareImport(data: Data(csv.utf8))
@@ -82,7 +83,8 @@ final class ShaudiBackupSettingsTests: XCTestCase {
     }
 
     func testApplyRequiresConfirmationAndDuplicateStartIsRejected() throws {
-        let (_, context) = try context()
+        let (container, context) = try context()
+        defer { withExtendedLifetime(container) {} }
         let backup = ShaudiBackupCoordinator()
         let csv = header + ",Song,Artist,abcdefghijk,https://www.youtube.com/watch?v=abcdefghijk\r\n"
         try backup.prepareImport(data: Data(csv.utf8))
