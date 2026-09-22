@@ -1,6 +1,7 @@
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
@@ -8,6 +9,10 @@ struct SettingsView: View {
 
     @State private var isShowingResetConfirmation = false
     @State private var isShowingFeedbackResetConfirmation = false
+    @State private var isShowingExportBackup = false
+    @State private var isShowingImportBackup = false
+    @State private var isShowingImportPreview = false
+    @State private var backup = ShaudiBackupCoordinator()
 
     var body: some View {
         NavigationStack {
@@ -73,6 +78,28 @@ struct SettingsView: View {
                                 .foregroundStyle(ShaudiTheme.dashboardPrimaryText)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .contentShape(Rectangle())
+                        }
+                    }
+
+                    settingsSection("Backup & Restore") {
+                        Text("Save your library and playlists so they can be restored on another device.")
+                            .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                            .foregroundStyle(ShaudiTheme.dashboardSecondaryText)
+
+                        Button {
+                            isShowingExportBackup = true
+                        } label: {
+                            Label("Export Backup", systemImage: "square.and.arrow.up")
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        Divider()
+
+                        Button {
+                            isShowingImportBackup = true
+                        } label: {
+                            Label("Import Backup", systemImage: "square.and.arrow.down")
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
 
@@ -153,6 +180,35 @@ struct SettingsView: View {
                 }
             } message: {
                 Text("This clears More Like This, Less Like This, and all excluded artists.")
+            }
+            .sheet(isPresented: $isShowingExportBackup) {
+                ShaudiBackupExportSheet()
+            }
+            .fileImporter(
+                isPresented: $isShowingImportBackup,
+                allowedContentTypes: [.commaSeparatedText, .plainText, .text],
+                allowsMultipleSelection: false
+            ) { result in
+                do {
+                    guard let url = try result.get().first else { return }
+                    try backup.prepareImport(from: url)
+                    isShowingImportPreview = true
+                } catch {
+                    backup.errorMessage = error.localizedDescription
+                }
+            }
+            .sheet(isPresented: $isShowingImportPreview, onDismiss: {
+                backup.cancelImport()
+            }) {
+                ShaudiBackupImportSheet(backup: backup)
+            }
+            .alert("Backup & Restore", isPresented: Binding(
+                get: { backup.errorMessage != nil && !isShowingImportPreview },
+                set: { if !$0 { backup.errorMessage = nil } }
+            )) {
+                Button("OK") { backup.errorMessage = nil }
+            } message: {
+                Text(backup.errorMessage ?? "")
             }
         }
         .tint(appearanceSettings.primaryColor)

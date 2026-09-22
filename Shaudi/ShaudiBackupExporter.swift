@@ -41,6 +41,7 @@ struct ShaudiBackupSkippedTrack {
 struct ShaudiBackupExportResult {
     let csvData: Data
     let exportedRowCount: Int
+    let exportedSongCount: Int
     let skippedTracks: [ShaudiBackupSkippedTrack]
     let suggestedFilename: String
 
@@ -157,6 +158,7 @@ enum ShaudiBackupExporter {
         return ShaudiBackupExportResult(
             csvData: csvData,
             exportedRowCount: rows.count,
+            exportedSongCount: validRowCount,
             skippedTracks: skipped,
             suggestedFilename: suggestedFilename(for: selection, date: date)
         )
