@@ -17,6 +17,7 @@ struct PlaylistsView: View {
     private var playlists: [Playlist]
 
     @State private var isShowingNewPlaylist = false
+    @State private var isShowingYouTubePlaylistImport = false
 
     var body: some View {
         NavigationStack {
@@ -33,6 +34,9 @@ struct PlaylistsView: View {
                 }
             }
         }
+        .sheet(isPresented: $isShowingYouTubePlaylistImport) {
+            YouTubePlaylistImportView()
+        }
         .tint(appearanceSettings.primaryColor)
         .toolbarBackground(ShaudiTheme.canvas, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
@@ -48,8 +52,18 @@ struct PlaylistsView: View {
 
                 Spacer(minLength: 12)
 
-                Button {
-                    isShowingNewPlaylist = true
+                Menu {
+                    Button {
+                        isShowingNewPlaylist = true
+                    } label: {
+                        Label("New Playlist", systemImage: "plus")
+                    }
+
+                    Button {
+                        isShowingYouTubePlaylistImport = true
+                    } label: {
+                        Label("Import YouTube Playlist", systemImage: "square.and.arrow.down")
+                    }
                 } label: {
                     Image(systemName: "plus")
                         .font(.title3.weight(.semibold))
@@ -57,8 +71,7 @@ struct PlaylistsView: View {
                         .frame(width: 36, height: 36)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("New Playlist")
+                .accessibilityLabel("New Playlist or Import")
             }
                 .padding(.horizontal)
                 .padding(.top, 12)

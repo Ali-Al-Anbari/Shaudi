@@ -52,6 +52,69 @@ enum YouTubeURLParser {
         return Video(url: url, id: videoID)
     }
 
+    struct PlaylistReference: Equatable {
+        let url: URL
+        let id: String
+    }
+
+    static func parsePlaylist(_ urlString: String) -> PlaylistReference? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if isUsablePlaylistID(trimmed),
+           !trimmed.contains("/"),
+           !trimmed.contains("?"),
+           !trimmed.contains("&"),
+           let canonicalURL = URL(string: "https://www.youtube.com/playlist?list=\(trimmed)") {
+            return PlaylistReference(url: canonicalURL, id: trimmed)
+        }
+
+        guard
+            let components = URLComponents(string: trimmed),
+            let scheme = components.scheme?.lowercased(),
+            scheme == "http" || scheme == "https",
+            let host = components.host?.lowercased(),
+            components.user == nil,
+            components.password == nil,
+            components.port == nil
+        else {
+            return nil
+        }
+
+        let playlistID: String?
+        switch host {
+        case "youtu.be", "www.youtu.be":
+            playlistID = components.queryItems?.first(where: { $0.name == "list" })?.value
+
+        case "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com":
+            playlistID = components.queryItems?.first(where: { $0.name == "list" })?.value
+
+        default:
+            playlistID = nil
+        }
+
+        guard let playlistID, isUsablePlaylistID(playlistID) else {
+            return nil
+        }
+
+        guard let canonicalURL = URL(string: "https://www.youtube.com/playlist?list=\(playlistID)") else {
+            return nil
+        }
+
+        return PlaylistReference(url: canonicalURL, id: playlistID)
+    }
+
+    static func isUsablePlaylistID(_ playlistID: String) -> Bool {
+        let trimmed = playlistID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowedCharacters = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        )
+
+        return trimmed.utf8.count >= 2
+            && trimmed.utf8.count <= 128
+            && trimmed.unicodeScalars.allSatisfy(allowedCharacters.contains)
+    }
+
     static func isUsableVideoID(_ videoID: String) -> Bool {
         let allowedCharacters = CharacterSet(
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"

@@ -267,6 +267,7 @@ struct SearchView: View {
     @State private var noticeMessage: String?
     @State private var errorMessage: String?
     @State private var isShowingManualTrackAdd = false
+    @State private var isShowingYouTubePlaylistImport = false
     @State private var playlistResult: YouTubeSearchResult?
 
     var body: some View {
@@ -281,17 +282,30 @@ struct SearchView: View {
 
                     searchField
 
-                    Button {
-                        isShowingManualTrackAdd = true
-                    } label: {
-                        Label("Add by URL", systemImage: "link")
-                            .font(ShaudiTheme.bodyFont(size: 16, relativeTo: .subheadline))
-                            .foregroundStyle(ShaudiTheme.accent)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(spacing: 10) {
+                        Button {
+                            isShowingManualTrackAdd = true
+                        } label: {
+                            Label("Add by URL", systemImage: "link")
+                                .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                                .foregroundStyle(ShaudiTheme.accent)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(ShaudiTheme.accent)
+
+                        Button {
+                            isShowingYouTubePlaylistImport = true
+                        } label: {
+                            Label("Import Playlist", systemImage: "square.and.arrow.down")
+                                .font(ShaudiTheme.bodyFont(size: 15, relativeTo: .subheadline))
+                                .foregroundStyle(ShaudiTheme.accent)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(ShaudiTheme.accent)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(ShaudiTheme.accent)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity)
 
                     if let noticeMessage {
                         Label(noticeMessage, systemImage: "checkmark.circle.fill")
@@ -313,6 +327,9 @@ struct SearchView: View {
         .tint(appearanceSettings.primaryColor)
         .sheet(isPresented: $isShowingManualTrackAdd) {
             ManualTrackAdditionView()
+        }
+        .sheet(isPresented: $isShowingYouTubePlaylistImport) {
+            YouTubePlaylistImportView()
         }
         .overlay {
             if let playlistResult {
