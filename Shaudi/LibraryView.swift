@@ -17,6 +17,7 @@ struct LibraryView: View {
 
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @EnvironmentObject private var playbackManager: PlaybackManager
     @EnvironmentObject private var appearanceSettings: AppearanceSettings
 
@@ -26,7 +27,7 @@ struct LibraryView: View {
     @Query(sort: \Playlist.dateCreated, order: .reverse)
     private var playlists: [Playlist]
 
-    @State private var heroImage: UIImage?
+    @State private var heroMedia: BannerMedia?
     @State private var selectedPlaylistPage = 0
     @State private var dashboardContentWidth: CGFloat = 360
     @State private var isLibraryVisible = false
@@ -257,10 +258,8 @@ struct LibraryView: View {
     private var heroBanner: some View {
         GeometryReader { geometry in
             ZStack {
-                if let heroImage {
-                    Image(uiImage: heroImage)
-                        .resizable()
-                        .scaledToFill()
+                if let heroMedia {
+                    bannerContent(heroMedia, in: geometry.size)
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
                 } else {
@@ -279,6 +278,42 @@ struct LibraryView: View {
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .shadow(color: ShaudiTheme.accent.opacity(0.18), radius: 12, y: 6)
         .accessibilityLabel("Library poster")
+    }
+
+    @ViewBuilder
+    private func bannerContent(
+        _ media: BannerMedia,
+        in viewportSize: CGSize
+    ) -> some View {
+        switch media {
+        case .image(let image):
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: viewportSize.width, height: viewportSize.height)
+                .clipped()
+        case .animatedGIF(let image, let crop):
+            let baseSize = ArtworkCrop.baseImageSize(for: image.size, in: viewportSize)
+            let effectiveScale = max(1, crop.scale)
+            let scaledSize = CGSize(
+                width: baseSize.width * effectiveScale,
+                height: baseSize.height * effectiveScale
+            )
+            let offset = crop.clampedOffset(
+                scaledSize: scaledSize,
+                viewportSize: viewportSize
+            )
+
+            AnimatedPlaylistCoverImage(
+                image: image,
+                showsFirstFrameOnly: reduceMotion
+            )
+            .frame(width: baseSize.width, height: baseSize.height)
+            .scaleEffect(effectiveScale)
+            .offset(offset)
+            .frame(width: viewportSize.width, height: viewportSize.height)
+            .clipped()
+        }
     }
 
     private var playlistPager: some View {
@@ -508,25 +543,25 @@ struct LibraryView: View {
     }
 
     private func loadBannerImage() {
-        if let storedImage = ArtworkStorage.bannerImage() {
-            heroImage = storedImage
+        if let storedMedia = ArtworkStorage.bannerMedia() {
+            heroMedia = storedMedia
             return
         }
 
         guard let legacyImage = ArtworkStorage.migratedLegacyBannerImage() else {
-            heroImage = nil
+            heroMedia = nil
             return
         }
 
         do {
             try ArtworkStorage.saveBannerImage(legacyImage)
-            heroImage = legacyImage
+            heroMedia = .image(legacyImage)
             ArtworkStorage.clearLegacyBannerStorage()
         } catch {
 #if DEBUG
             print("[Artwork] Banner migration failed: \(error.localizedDescription)")
 #endif
-            heroImage = legacyImage
+            heroMedia = .image(legacyImage)
         }
     }
 

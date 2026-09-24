@@ -242,7 +242,9 @@ private struct LibraryBannerEditor: View {
     @State private var isShowingPhotoPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingImage: UIImage?
+    @State private var pendingGIFData: Data?
     @State private var isShowingCropEditor = false
+    @State private var bannerErrorMessage: String?
 
     var body: some View {
         Button("Change Banner") {
@@ -258,18 +260,41 @@ private struct LibraryBannerEditor: View {
         .onChange(of: selectedPhoto) { _, photo in
             prepareSelectedPhoto(photo)
         }
-        .sheet(isPresented: $isShowingCropEditor) {
+        .sheet(
+            isPresented: $isShowingCropEditor,
+            onDismiss: {
+                editingImage = nil
+                pendingGIFData = nil
+            }
+        ) {
             if let editingImage {
                 ImageCropEditor(
                     image: editingImage,
-                    title: "Adjust Banner",
+                    title: pendingGIFData != nil ? "Adjust Banner GIF" : "Adjust Banner",
                     cropAspectRatio: ArtworkStorage.bannerAspectRatio,
                     outputSize: ArtworkStorage.bannerOutputSize,
-                    cornerRadius: 18
-                ) { image in
-                    saveBannerImage(image)
-                }
+                    cornerRadius: 18,
+                    onSave: { image in
+                        saveBannerImage(image)
+                    },
+                    onSaveCrop: pendingGIFData != nil ? { crop in
+                        if let pendingGIFData {
+                            saveBannerGIF(pendingGIFData, crop: crop)
+                        }
+                    } : nil
+                )
             }
+        }
+        .alert(
+            "Banner Artwork",
+            isPresented: Binding(
+                get: { bannerErrorMessage != nil },
+                set: { if !$0 { bannerErrorMessage = nil } }
+            )
+        ) {
+            Button("OK") { bannerErrorMessage = nil }
+        } message: {
+            Text(bannerErrorMessage ?? "")
         }
     }
 
@@ -280,13 +305,50 @@ private struct LibraryBannerEditor: View {
 
         Task { @MainActor in
             defer { self.selectedPhoto = nil }
-            guard
-                let data = try? await selectedPhoto.loadTransferable(type: Data.self),
-                let image = UIImage(data: data)
-            else {
+
+            var gifData: Data?
+            if selectedPhoto.supportedContentTypes.contains(where: { $0.conforms(to: .gif) }) {
+                if let gifTransfer = try? await selectedPhoto.loadTransferable(type: GIFDataTransferable.self),
+                   ArtworkStorage.isGIFData(gifTransfer.data) {
+                    gifData = gifTransfer.data
+                }
+            }
+
+            let data: Data
+            if let gifData {
+                data = gifData
+            } else if let rawData = try? await selectedPhoto.loadTransferable(type: Data.self) {
+                data = rawData
+            } else {
+                bannerErrorMessage = "The selected image could not be loaded."
                 return
             }
 
+            if ArtworkStorage.isGIFData(data) {
+                guard data.count <= ArtworkStorage.maximumBannerGIFSize else {
+                    bannerErrorMessage = ArtworkStorageError.gifTooLarge(
+                        maximumMegabytes: ArtworkStorage.maximumBannerGIFSize / 1_024 / 1_024
+                    ).localizedDescription
+                    return
+                }
+
+                guard let gifImage = ArtworkStorage.animatedGIFImage(from: data) else {
+                    bannerErrorMessage = ArtworkStorageError.invalidGIF.localizedDescription
+                    return
+                }
+
+                pendingGIFData = data
+                editingImage = gifImage
+                isShowingCropEditor = true
+                return
+            }
+
+            guard let image = UIImage(data: data) else {
+                bannerErrorMessage = "The selected image format is not supported."
+                return
+            }
+
+            pendingGIFData = nil
             editingImage = image
             isShowingCropEditor = true
         }
@@ -298,8 +360,22 @@ private struct LibraryBannerEditor: View {
             ArtworkStorage.clearLegacyBannerStorage()
             appearanceSettings.bannerDidChange()
         } catch {
+            bannerErrorMessage = error.localizedDescription
 #if DEBUG
             print("[Artwork] Banner save failed: \(error.localizedDescription)")
+#endif
+        }
+    }
+
+    private func saveBannerGIF(_ data: Data, crop: ArtworkCrop) {
+        do {
+            try ArtworkStorage.saveBannerGIF(data, crop: crop)
+            ArtworkStorage.clearLegacyBannerStorage()
+            appearanceSettings.bannerDidChange()
+        } catch {
+            bannerErrorMessage = error.localizedDescription
+#if DEBUG
+            print("[Artwork] Banner GIF save failed: \(error.localizedDescription)")
 #endif
         }
     }

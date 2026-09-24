@@ -15,6 +15,46 @@ struct ArtworkCrop: Codable, Equatable {
     var normalizedOffsetY: Double
 
     static let `default` = ArtworkCrop(scale: 1, normalizedOffsetX: 0, normalizedOffsetY: 0)
+
+    static func baseImageSize(
+        for imageSize: CGSize,
+        in viewportSize: CGSize
+    ) -> CGSize {
+        guard viewportSize.width > 0, viewportSize.height > 0 else {
+            return .zero
+        }
+        let imageAspectRatio = imageSize.width / max(1, imageSize.height)
+        let viewportAspectRatio = viewportSize.width / max(1, viewportSize.height)
+
+        if imageAspectRatio > viewportAspectRatio {
+            return CGSize(
+                width: viewportSize.height * imageAspectRatio,
+                height: viewportSize.height
+            )
+        } else {
+            return CGSize(
+                width: viewportSize.width,
+                height: viewportSize.width / max(imageAspectRatio, 0.001)
+            )
+        }
+    }
+
+    func clampedOffset(
+        scaledSize: CGSize,
+        viewportSize: CGSize
+    ) -> CGSize {
+        let proposedOffset = CGSize(
+            width: normalizedOffsetX * viewportSize.width,
+            height: normalizedOffsetY * viewportSize.height
+        )
+        let maximumX = max(0, (scaledSize.width - viewportSize.width) / 2)
+        let maximumY = max(0, (scaledSize.height - viewportSize.height) / 2)
+
+        return CGSize(
+            width: min(max(proposedOffset.width, -maximumX), maximumX),
+            height: min(max(proposedOffset.height, -maximumY), maximumY)
+        )
+    }
 }
 
 struct GIFDataTransferable: Transferable {
@@ -28,6 +68,18 @@ struct GIFDataTransferable: Transferable {
 }
 
 enum PlaylistCoverMedia {
+    case image(UIImage)
+    case animatedGIF(UIImage, crop: ArtworkCrop)
+
+    var image: UIImage {
+        switch self {
+        case .image(let image), .animatedGIF(let image, _):
+            return image
+        }
+    }
+}
+
+enum BannerMedia {
     case image(UIImage)
     case animatedGIF(UIImage, crop: ArtworkCrop)
 
@@ -95,20 +147,143 @@ enum ArtworkStorage {
         return cache
     }()
 
+    static let maximumBannerGIFSize = 25 * 1_024 * 1_024
     private static let bannerFilename = "library-banner.jpg"
+    private static let bannerGIFFilename = "library-banner.gif"
+    private static let bannerCropFilename = "library-banner.crop.json"
+
+    private final class BannerCacheEntry {
+        let media: BannerMedia
+
+        init(_ media: BannerMedia) {
+            self.media = media
+        }
+    }
+
+    private static let bannerCache: NSCache<NSString, BannerCacheEntry> = {
+        let cache = NSCache<NSString, BannerCacheEntry>()
+        cache.totalCostLimit = 48 * 1_024 * 1_024
+        return cache
+    }()
+
+    static func bannerMedia() -> BannerMedia? {
+        if let cached = bannerCache.object(forKey: "banner") {
+            return cached.media
+        }
+
+        if
+            let data = bannerGIFData(),
+            let image = animatedGIFImage(from: data)
+        {
+            let crop = bannerCrop() ?? .default
+            let media = BannerMedia.animatedGIF(image, crop: crop)
+            cacheBanner(media)
+            return media
+        }
+
+        guard let image = image(filename: bannerFilename) else {
+            return nil
+        }
+
+        let media = BannerMedia.image(image)
+        cacheBanner(media)
+        return media
+    }
 
     static func bannerImage() -> UIImage? {
-        image(filename: bannerFilename)
+        bannerMedia()?.image
+    }
+
+    static func bannerGIFData() -> Data? {
+        try? Data(
+            contentsOf: directoryURL.appendingPathComponent(bannerGIFFilename)
+        )
+    }
+
+    static func bannerCrop() -> ArtworkCrop? {
+        let url = directoryURL.appendingPathComponent(bannerCropFilename)
+        guard let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ArtworkCrop.self, from: data)
+    }
+
+    static func saveBannerCrop(_ crop: ArtworkCrop) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(crop)
+        try data.write(
+            to: directoryURL.appendingPathComponent(bannerCropFilename),
+            options: .atomic
+        )
+    }
+
+    static func deleteBannerCrop() {
+        let url = directoryURL.appendingPathComponent(bannerCropFilename)
+        try? FileManager.default.removeItem(at: url)
     }
 
     static func saveBannerImage(_ image: UIImage) throws {
         try save(image, filename: bannerFilename)
+        try removeObsoleteArtwork(
+            afterWriting: bannerFilename,
+            obsoleteFilename: bannerGIFFilename
+        )
+        deleteBannerCrop()
+        cacheBanner(.image(image))
+    }
+
+    static func saveBannerGIF(
+        _ data: Data,
+        crop: ArtworkCrop = .default
+    ) throws {
+        guard data.count <= maximumBannerGIFSize else {
+            throw ArtworkStorageError.gifTooLarge(
+                maximumMegabytes: maximumBannerGIFSize / 1_024 / 1_024
+            )
+        }
+        guard isGIFData(data), let image = animatedGIFImage(from: data) else {
+            throw ArtworkStorageError.invalidGIF
+        }
+
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        try data.write(
+            to: directoryURL.appendingPathComponent(bannerGIFFilename),
+            options: .atomic
+        )
+        try saveBannerCrop(crop)
+        try removeObsoleteArtwork(
+            afterWriting: bannerGIFFilename,
+            obsoleteFilename: bannerFilename
+        )
+        cacheBanner(.animatedGIF(image, crop: crop))
     }
 
     static func resetBannerImage() {
-        let url = directoryURL.appendingPathComponent(bannerFilename)
-        try? FileManager.default.removeItem(at: url)
+        let fileManager = FileManager.default
+        try? fileManager.removeItem(at: directoryURL.appendingPathComponent(bannerFilename))
+        try? fileManager.removeItem(at: directoryURL.appendingPathComponent(bannerGIFFilename))
+        deleteBannerCrop()
+        clearBannerCache()
         clearLegacyBannerStorage()
+    }
+
+    static func clearBannerCache() {
+        bannerCache.removeAllObjects()
+    }
+
+    private static func cacheBanner(_ media: BannerMedia) {
+        let image = media.image
+        bannerCache.setObject(
+            BannerCacheEntry(media),
+            forKey: "banner",
+            cost: decodedImageCost(image)
+        )
     }
 
     static func migratedLegacyBannerImage() -> UIImage? {
@@ -481,7 +656,7 @@ enum ArtworkStorage {
 
         let retainedFrameCount = min(frameCount, maximumDecodedGIFFrames)
         let maximumPixelSize = min(
-            Int(playlistOutputSize.width),
+            Int(max(playlistOutputSize.width, bannerOutputSize.width)),
             Int(sqrt(Double(maximumDecodedGIFBytes) / (Double(retainedFrameCount) * 4)))
         )
         let options: [CFString: Any] = [
