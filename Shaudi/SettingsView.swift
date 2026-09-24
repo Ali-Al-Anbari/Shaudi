@@ -65,6 +65,10 @@ struct SettingsView: View {
                         )
                     }
 
+                    settingsSection("App Icon") {
+                        AppIconSettings()
+                    }
+
                     settingsSection("Ambient") {
                         Toggle("Love Letters", isOn: $appearanceSettings.loveLettersEnabled)
                     }
