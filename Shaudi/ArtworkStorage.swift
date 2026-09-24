@@ -3,14 +3,40 @@
 //  Shaudi
 //
 
+import CoreTransferable
 import Foundation
 import ImageIO
 import UIKit
 import UniformTypeIdentifiers
 
+struct ArtworkCrop: Codable, Equatable {
+    var scale: Double
+    var normalizedOffsetX: Double
+    var normalizedOffsetY: Double
+
+    static let `default` = ArtworkCrop(scale: 1, normalizedOffsetX: 0, normalizedOffsetY: 0)
+}
+
+struct GIFDataTransferable: Transferable {
+    let data: Data
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .gif) { data in
+            GIFDataTransferable(data: data)
+        }
+    }
+}
+
 enum PlaylistCoverMedia {
     case image(UIImage)
-    case animatedGIF(UIImage)
+    case animatedGIF(UIImage, crop: ArtworkCrop)
+
+    var image: UIImage {
+        switch self {
+        case .image(let image), .animatedGIF(let image, _):
+            return image
+        }
+    }
 }
 
 enum ArtworkStorageError: LocalizedError {
@@ -154,6 +180,31 @@ enum ArtworkStorage {
         image(filename: playlistFilename(for: artworkID))
     }
 
+    static func playlistCrop(for artworkID: UUID) -> ArtworkCrop? {
+        let url = directoryURL.appendingPathComponent(playlistCropFilename(for: artworkID))
+        guard let data = try? Data(contentsOf: url) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ArtworkCrop.self, from: data)
+    }
+
+    static func savePlaylistCrop(_ crop: ArtworkCrop, for artworkID: UUID) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        let data = try JSONEncoder().encode(crop)
+        try data.write(
+            to: directoryURL.appendingPathComponent(playlistCropFilename(for: artworkID)),
+            options: .atomic
+        )
+    }
+
+    static func deletePlaylistCrop(for artworkID: UUID) {
+        let url = directoryURL.appendingPathComponent(playlistCropFilename(for: artworkID))
+        try? FileManager.default.removeItem(at: url)
+    }
+
     static func playlistCover(for artworkID: UUID) -> PlaylistCoverMedia? {
         let cacheKey = artworkID.uuidString.lowercased() as NSString
         if let cached = playlistCoverCache.object(forKey: cacheKey) {
@@ -164,7 +215,8 @@ enum ArtworkStorage {
             let data = playlistGIFData(for: artworkID),
             let image = animatedGIFImage(from: data)
         {
-            let media = PlaylistCoverMedia.animatedGIF(image)
+            let crop = playlistCrop(for: artworkID) ?? .default
+            let media = PlaylistCoverMedia.animatedGIF(image, crop: crop)
             cachePlaylistCover(media, for: artworkID)
             return media
         }
@@ -185,10 +237,15 @@ enum ArtworkStorage {
             afterWriting: filename,
             obsoleteFilename: playlistGIFFilename(for: artworkID)
         )
+        deletePlaylistCrop(for: artworkID)
         cachePlaylistCover(.image(image), for: artworkID)
     }
 
-    static func savePlaylistGIF(_ data: Data, for artworkID: UUID) throws {
+    static func savePlaylistGIF(
+        _ data: Data,
+        crop: ArtworkCrop = .default,
+        for artworkID: UUID
+    ) throws {
         guard data.count <= maximumPlaylistGIFSize else {
             throw ArtworkStorageError.gifTooLarge(
                 maximumMegabytes: maximumPlaylistGIFSize / 1_024 / 1_024
@@ -206,11 +263,12 @@ enum ArtworkStorage {
             to: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID)),
             options: .atomic
         )
+        try savePlaylistCrop(crop, for: artworkID)
         try removeObsoleteArtwork(
             afterWriting: playlistGIFFilename(for: artworkID),
             obsoleteFilename: playlistFilename(for: artworkID)
         )
-        cachePlaylistCover(.animatedGIF(image), for: artworkID)
+        cachePlaylistCover(.animatedGIF(image, crop: crop), for: artworkID)
     }
 
     static func playlistGIFData(for artworkID: UUID) -> Data? {
@@ -227,6 +285,7 @@ enum ArtworkStorage {
         try? fileManager.removeItem(
             at: directoryURL.appendingPathComponent(playlistGIFFilename(for: artworkID))
         )
+        deletePlaylistCrop(for: artworkID)
         playlistCoverCache.removeObject(forKey: artworkID.uuidString.lowercased() as NSString)
     }
 
@@ -388,6 +447,10 @@ enum ArtworkStorage {
         "playlist-\(artworkID.uuidString.lowercased()).gif"
     }
 
+    private static func playlistCropFilename(for artworkID: UUID) -> String {
+        "playlist-\(artworkID.uuidString.lowercased()).crop.json"
+    }
+
     private static func trackCoverImageFilename(for coverID: UUID) -> String {
         "track-cover-\(coverID.uuidString.lowercased()).jpg"
     }
@@ -400,7 +463,7 @@ enum ArtworkStorage {
         data.starts(with: Data("GIF".utf8))
     }
 
-    private static func animatedGIFImage(from data: Data) -> UIImage? {
+    static func animatedGIFImage(from data: Data) -> UIImage? {
         guard
             data.count <= maximumPlaylistGIFSize,
             let source = CGImageSourceCreateWithData(data as CFData, nil),
@@ -469,7 +532,9 @@ enum ArtworkStorage {
     private static func cachePlaylistCover(_ media: PlaylistCoverMedia, for artworkID: UUID) {
         let image: UIImage
         switch media {
-        case .image(let value), .animatedGIF(let value):
+        case .image(let value):
+            image = value
+        case .animatedGIF(let value, _):
             image = value
         }
 

@@ -14,7 +14,8 @@ struct ImageCropEditor: View {
     let cropAspectRatio: CGFloat
     let outputSize: CGSize
     let cornerRadius: CGFloat
-    let onSave: (UIImage) -> Void
+    var onSave: ((UIImage) -> Void)? = nil
+    var onSaveCrop: ((ArtworkCrop) -> Void)? = nil
 
     @State private var scale: CGFloat = 1
     @State private var offset: CGSize = .zero
@@ -41,25 +42,34 @@ struct ImageCropEditor: View {
                 VStack(spacing: 20) {
                     Spacer(minLength: 12)
 
-                    Image(uiImage: image)
-                        .resizable()
-                        .interpolation(.high)
-                        .frame(width: imageSize.width, height: imageSize.height)
-                        .scaleEffect(effectiveScale)
-                        .offset(effectiveOffset)
-                        .frame(width: viewportSize.width, height: viewportSize.height)
-                        .clipped()
-                        .clipShape(
-                            RoundedRectangle(
-                                cornerRadius: cornerRadius,
-                                style: .continuous
+                    Group {
+                        if image.images != nil {
+                            AnimatedPlaylistCoverImage(
+                                image: image,
+                                showsFirstFrameOnly: false
                             )
+                        } else {
+                            Image(uiImage: image)
+                                .resizable()
+                                .interpolation(.high)
+                        }
+                    }
+                    .frame(width: imageSize.width, height: imageSize.height)
+                    .scaleEffect(effectiveScale)
+                    .offset(effectiveOffset)
+                    .frame(width: viewportSize.width, height: viewportSize.height)
+                    .clipped()
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: cornerRadius,
+                            style: .continuous
                         )
-                        .contentShape(Rectangle())
-                        .gesture(
-                            dragGesture(viewportSize: viewportSize)
-                                .simultaneously(with: magnificationGesture(viewportSize: viewportSize))
-                        )
+                    )
+                    .contentShape(Rectangle())
+                    .gesture(
+                        dragGesture(viewportSize: viewportSize)
+                            .simultaneously(with: magnificationGesture(viewportSize: viewportSize))
+                    )
 
                     Text("Drag and pinch to position your photo")
                         .font(ShaudiTheme.bodyFont(size: 16))
@@ -82,13 +92,26 @@ struct ImageCropEditor: View {
                                 scale: scale,
                                 viewportSize: viewportSize
                             )
-                            onSave(
-                                renderCroppedImage(
-                                    viewportSize: viewportSize,
+                            if let onSaveCrop {
+                                let crop = ArtworkCrop(
                                     scale: scale,
-                                    offset: finalOffset
+                                    normalizedOffsetX: viewportSize.width > 0
+                                        ? finalOffset.width / viewportSize.width
+                                        : 0,
+                                    normalizedOffsetY: viewportSize.height > 0
+                                        ? finalOffset.height / viewportSize.height
+                                        : 0
                                 )
-                            )
+                                onSaveCrop(crop)
+                            } else if let onSave {
+                                onSave(
+                                    renderCroppedImage(
+                                        viewportSize: viewportSize,
+                                        scale: scale,
+                                        offset: finalOffset
+                                    )
+                                )
+                            }
                             dismiss()
                         }
                     }

@@ -158,6 +158,7 @@ struct PlaylistDetailView: View {
     @State private var isShowingPhotoPicker = false
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var editingArtworkImage: UIImage?
+    @State private var pendingGIFData: Data?
     @State private var isShowingArtworkCropper = false
     @State private var artworkErrorMessage: String?
     @State private var isPlaylistVisible = false
@@ -517,17 +518,29 @@ struct PlaylistDetailView: View {
         .sheet(isPresented: $isShowingAddTracks) {
             AddTracksView(playlist: playlist)
         }
-        .sheet(isPresented: $isShowingArtworkCropper) {
+        .sheet(
+            isPresented: $isShowingArtworkCropper,
+            onDismiss: {
+                editingArtworkImage = nil
+                pendingGIFData = nil
+            }
+        ) {
             if let editingArtworkImage {
                 ImageCropEditor(
                     image: editingArtworkImage,
-                    title: "Adjust Playlist Photo",
+                    title: pendingGIFData != nil ? "Adjust Playlist GIF" : "Adjust Playlist Photo",
                     cropAspectRatio: 1,
                     outputSize: ArtworkStorage.playlistOutputSize,
-                    cornerRadius: 18
-                ) { croppedImage in
-                    savePlaylistArtwork(croppedImage)
-                }
+                    cornerRadius: 18,
+                    onSave: { croppedImage in
+                        savePlaylistArtwork(croppedImage)
+                    },
+                    onSaveCrop: pendingGIFData != nil ? { crop in
+                        if let pendingGIFData {
+                            savePlaylistGIFArtwork(pendingGIFData, crop: crop)
+                        }
+                    } : nil
+                )
             }
         }
         .overlay {
@@ -788,16 +801,41 @@ struct PlaylistDetailView: View {
 
         Task { @MainActor in
             defer { self.selectedPhoto = nil }
-            guard let data = try? await selectedPhoto.loadTransferable(type: Data.self) else {
+
+            var gifData: Data?
+            if selectedPhoto.supportedContentTypes.contains(where: { $0.conforms(to: .gif) }) {
+                if let gifTransfer = try? await selectedPhoto.loadTransferable(type: GIFDataTransferable.self),
+                   ArtworkStorage.isGIFData(gifTransfer.data) {
+                    gifData = gifTransfer.data
+                }
+            }
+
+            let data: Data
+            if let gifData {
+                data = gifData
+            } else if let rawData = try? await selectedPhoto.loadTransferable(type: Data.self) {
+                data = rawData
+            } else {
                 artworkErrorMessage = "The selected image could not be loaded."
                 return
             }
 
-            let declaresGIF = selectedPhoto.supportedContentTypes.contains {
-                $0.conforms(to: .gif)
-            }
-            if declaresGIF || ArtworkStorage.isGIFData(data) {
-                savePlaylistGIFArtwork(data)
+            if ArtworkStorage.isGIFData(data) {
+                guard data.count <= ArtworkStorage.maximumPlaylistGIFSize else {
+                    artworkErrorMessage = ArtworkStorageError.gifTooLarge(
+                        maximumMegabytes: ArtworkStorage.maximumPlaylistGIFSize / 1_024 / 1_024
+                    ).localizedDescription
+                    return
+                }
+
+                guard let gifImage = ArtworkStorage.animatedGIFImage(from: data) else {
+                    artworkErrorMessage = ArtworkStorageError.invalidGIF.localizedDescription
+                    return
+                }
+
+                pendingGIFData = data
+                editingArtworkImage = gifImage
+                isShowingArtworkCropper = true
                 return
             }
 
@@ -805,6 +843,8 @@ struct PlaylistDetailView: View {
                 artworkErrorMessage = "The selected image format is not supported."
                 return
             }
+
+            pendingGIFData = nil
             editingArtworkImage = image
             isShowingArtworkCropper = true
         }
@@ -816,9 +856,9 @@ struct PlaylistDetailView: View {
         }
     }
 
-    private func savePlaylistGIFArtwork(_ data: Data) {
+    private func savePlaylistGIFArtwork(_ data: Data, crop: ArtworkCrop) {
         replacePlaylistArtwork { artworkID in
-            try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
+            try ArtworkStorage.savePlaylistGIF(data, crop: crop, for: artworkID)
         }
     }
 

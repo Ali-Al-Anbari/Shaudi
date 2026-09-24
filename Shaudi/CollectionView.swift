@@ -8,13 +8,40 @@ import SwiftUI
 
 struct CollectionView: View {
     private enum SortOption: String, CaseIterable, Identifiable {
-        case mostPlayed = "Most Played"
-        case mostListened = "Most Listened"
-        case recentlyPlayed = "Recently Played"
-        case dateAdded = "Date Added"
-        case alphabetical = "A–Z"
+        case mostPlayed = "mostPlayed"
+        case mostListened = "mostListened"
+        case recentlyPlayed = "recentlyPlayed"
+        case dateAdded = "dateAdded"
+        case alphabetical = "alphabetical"
 
         var id: Self { self }
+
+        var displayName: String {
+            switch self {
+            case .mostPlayed: return "Most Played"
+            case .mostListened: return "Most Listened"
+            case .recentlyPlayed: return "Recently Played"
+            case .dateAdded: return "Date Added"
+            case .alphabetical: return "A–Z"
+            }
+        }
+
+        init?(rawValue: String) {
+            switch rawValue {
+            case "mostPlayed", "Most Played":
+                self = .mostPlayed
+            case "mostListened", "Most Listened":
+                self = .mostListened
+            case "recentlyPlayed", "Recently Played":
+                self = .recentlyPlayed
+            case "dateAdded", "Date Added":
+                self = .dateAdded
+            case "alphabetical", "A–Z":
+                self = .alphabetical
+            default:
+                self = .mostPlayed
+            }
+        }
     }
 
     private enum FilterOption: String, CaseIterable, Identifiable {
@@ -39,7 +66,7 @@ struct CollectionView: View {
     @State private var trimmingTrack: Track?
     @State private var playlistTrack: Track?
     @State private var searchText = ""
-    @State private var sortOption: SortOption = .mostPlayed
+    @AppStorage("shaudi.collection.sortOption") private var sortOption: SortOption = .mostPlayed
     @State private var filterOption: FilterOption = .allSongs
 
     private var displayedTracks: [Track] {
@@ -203,14 +230,14 @@ struct CollectionView: View {
                         sortOption = option
                     } label: {
                         if sortOption == option {
-                            Label(option.rawValue, systemImage: "checkmark")
+                            Label(option.displayName, systemImage: "checkmark")
                         } else {
-                            Text(option.rawValue)
+                            Text(option.displayName)
                         }
                     }
                 }
             } label: {
-                Label(sortOption.rawValue, systemImage: "arrow.up.arrow.down")
+                Label(sortOption.displayName, systemImage: "arrow.up.arrow.down")
                     .font(ShaudiTheme.bodyFont(size: 14, relativeTo: .subheadline).weight(.semibold))
             }
             .frame(maxWidth: .infinity, alignment: .leading)

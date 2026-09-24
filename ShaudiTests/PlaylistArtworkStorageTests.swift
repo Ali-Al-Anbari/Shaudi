@@ -46,7 +46,7 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         XCTAssertEqual(ArtworkStorage.playlistGIFData(for: artworkID), data)
         ArtworkStorage.clearPlaylistCoverCache()
 
-        guard case .animatedGIF(let image) = ArtworkStorage.playlistCover(for: artworkID) else {
+        guard case .animatedGIF(let image, _) = ArtworkStorage.playlistCover(for: artworkID) else {
             return XCTFail("Expected a GIF after reloading from storage")
         }
         XCTAssertGreaterThan(image.images?.count ?? 0, 1)
@@ -118,7 +118,7 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         let artworkID = makeArtworkID()
         try ArtworkStorage.savePlaylistGIF(try makeGIFData(frameCount: 1), for: artworkID)
 
-        guard case .animatedGIF(let image) = ArtworkStorage.playlistCover(for: artworkID) else {
+        guard case .animatedGIF(let image, _) = ArtworkStorage.playlistCover(for: artworkID) else {
             return XCTFail("Expected stored GIF media")
         }
         XCTAssertNil(image.images)
@@ -237,7 +237,7 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
 
         guard case .animatedGIF(let trackImage) = ArtworkStorage.trackCover(for: coverID),
-              case .animatedGIF(let playlistImage) = ArtworkStorage.playlistCover(for: artworkID) else {
+              case .animatedGIF(let playlistImage, _) = ArtworkStorage.playlistCover(for: artworkID) else {
             return XCTFail("Expected animated covers")
         }
         for image in [trackImage, playlistImage] {
@@ -260,12 +260,108 @@ final class PlaylistArtworkStorageTests: XCTestCase {
         try ArtworkStorage.savePlaylistGIF(data, for: artworkID)
 
         guard case .animatedGIF(let trackImage) = ArtworkStorage.trackCover(for: coverID),
-              case .animatedGIF(let playlistImage) = ArtworkStorage.playlistCover(for: artworkID) else {
+              case .animatedGIF(let playlistImage, _) = ArtworkStorage.playlistCover(for: artworkID) else {
             return XCTFail("Expected animated covers")
         }
         for image in [trackImage, playlistImage] {
             XCTAssertLessThanOrEqual(image.images?.first?.cgImage?.width ?? 0, Int(ArtworkStorage.playlistOutputSize.width))
         }
+    }
+
+    func testGIFToGIFReplacementInvalidatesStaleCacheAndCrop() throws {
+        let artworkID = makeArtworkID()
+        let firstData = try makeGIFData(frameCount: 2)
+        let firstCrop = ArtworkCrop(scale: 1.5, normalizedOffsetX: 0.1, normalizedOffsetY: 0.2)
+        try ArtworkStorage.savePlaylistGIF(firstData, crop: firstCrop, for: artworkID)
+
+        guard case .animatedGIF(_, let loadedFirstCrop) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected first GIF cover")
+        }
+        XCTAssertEqual(loadedFirstCrop, firstCrop)
+
+        let secondData = try makeGIFData(frameCount: 3)
+        let secondCrop = ArtworkCrop(scale: 2.0, normalizedOffsetX: -0.2, normalizedOffsetY: 0.3)
+        try ArtworkStorage.savePlaylistGIF(secondData, crop: secondCrop, for: artworkID)
+
+        guard case .animatedGIF(let secondImage, let loadedSecondCrop) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected second GIF cover")
+        }
+        XCTAssertEqual(secondImage.images?.count, 3)
+        XCTAssertEqual(loadedSecondCrop, secondCrop)
+
+        ArtworkStorage.clearPlaylistCoverCache()
+        guard case .animatedGIF(let reloadedImage, let reloadedCrop) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected second GIF cover after cache reload")
+        }
+        XCTAssertEqual(reloadedImage.images?.count, 3)
+        XCTAssertEqual(reloadedCrop, secondCrop)
+    }
+
+    func testCropMetadataSurvivesPersistence() throws {
+        let artworkID = makeArtworkID()
+        let data = try makeGIFData()
+        let crop = ArtworkCrop(scale: 2.5, normalizedOffsetX: 0.35, normalizedOffsetY: -0.25)
+        try ArtworkStorage.savePlaylistGIF(data, crop: crop, for: artworkID)
+
+        ArtworkStorage.clearPlaylistCoverCache()
+        guard case .animatedGIF(_, let loadedCrop) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected GIF cover")
+        }
+        XCTAssertEqual(loadedCrop.scale, 2.5)
+        XCTAssertEqual(loadedCrop.normalizedOffsetX, 0.35)
+        XCTAssertEqual(loadedCrop.normalizedOffsetY, -0.25)
+    }
+
+    func testCropValuesAreDeviceIndependent() {
+        let crop = ArtworkCrop(scale: 1.5, normalizedOffsetX: 0.2, normalizedOffsetY: 0.0)
+        let imageSize = CGSize(width: 800, height: 400)
+
+        let viewportSmall = CGSize(width: 40, height: 40)
+        let baseWidthSmall = viewportSmall.height * (imageSize.width / imageSize.height)
+        let scaledWidthSmall = baseWidthSmall * crop.scale
+        let offsetSmall = crop.normalizedOffsetX * viewportSmall.width
+        let leftSmall = (scaledWidthSmall - viewportSmall.width) / 2 - offsetSmall
+        let fractionLeftSmall = leftSmall / scaledWidthSmall
+
+        let viewportLarge = CGSize(width: 200, height: 200)
+        let baseWidthLarge = viewportLarge.height * (imageSize.width / imageSize.height)
+        let scaledWidthLarge = baseWidthLarge * crop.scale
+        let offsetLarge = crop.normalizedOffsetX * viewportLarge.width
+        let leftLarge = (scaledWidthLarge - viewportLarge.width) / 2 - offsetLarge
+        let fractionLeftLarge = leftLarge / scaledWidthLarge
+
+        XCTAssertEqual(fractionLeftSmall, fractionLeftLarge, accuracy: 0.0001)
+    }
+
+    func testSavePlaylistImageRemovesObsoleteCrop() throws {
+        let artworkID = makeArtworkID()
+        let gifData = try makeGIFData()
+        let crop = ArtworkCrop(scale: 1.8, normalizedOffsetX: 0.1, normalizedOffsetY: 0.1)
+        try ArtworkStorage.savePlaylistGIF(gifData, crop: crop, for: artworkID)
+        XCTAssertNotNil(ArtworkStorage.playlistCrop(for: artworkID))
+
+        try ArtworkStorage.savePlaylistImage(makeImage(color: .purple), for: artworkID)
+        XCTAssertNil(ArtworkStorage.playlistCrop(for: artworkID))
+        guard case .image = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected static image cover")
+        }
+    }
+
+    func testMalformedCropFileFallsBackToDefault() throws {
+        let artworkID = makeArtworkID()
+        let gifData = try makeGIFData()
+        try ArtworkStorage.savePlaylistGIF(gifData, for: artworkID)
+
+        let cropURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Artwork", isDirectory: true)
+            .appendingPathComponent("playlist-\(artworkID.uuidString.lowercased()).crop.json")
+        try Data("corrupted json".utf8).write(to: cropURL)
+
+        ArtworkStorage.clearPlaylistCoverCache()
+        guard case .animatedGIF(_, let fallbackCrop) = ArtworkStorage.playlistCover(for: artworkID) else {
+            return XCTFail("Expected GIF cover")
+        }
+        XCTAssertEqual(fallbackCrop, ArtworkCrop.default)
     }
 
     private func makeTrackCoverID() -> UUID {
