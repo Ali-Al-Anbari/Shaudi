@@ -207,20 +207,8 @@ struct PlaylistTrackRowView: View {
     }
 
     private func trackArtwork(_ track: Track) -> some View {
-        Group {
-            if let thumbnailURL = track.thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        trackArtworkPlaceholder
-                    }
-                }
-            } else {
-                trackArtworkPlaceholder
-            }
+        YouTubeArtworkView(videoID: track.youtubeVideoID, fallback: track.thumbnailURL) {
+            trackArtworkPlaceholder
         }
         .frame(width: 44, height: 44)
         .background(ShaudiTheme.lavender.opacity(0.14))

@@ -14,6 +14,7 @@ struct MiniPlayerView: View {
     private struct PageContent {
         let title: String
         let artist: String?
+        let videoID: String
         let thumbnailURL: URL?
     }
 
@@ -147,6 +148,7 @@ struct MiniPlayerView: View {
             // A saved Track can carry an explicit artist override. Prefer that
             // display identity over the transient playback channel value.
             artist: playbackManager.currentTrack?.displayArtist ?? track.channelTitle,
+            videoID: track.youtubeVideoID,
             thumbnailURL: track.thumbnailURL
         )
     }
@@ -166,13 +168,14 @@ struct MiniPlayerView: View {
         return PageContent(
             title: track.displayTitle,
             artist: track.displayArtist,
+            videoID: track.youtubeVideoID,
             thumbnailURL: track.thumbnailURL
         )
     }
 
     private func miniPlayerPage(_ content: PageContent) -> some View {
         HStack(spacing: 12) {
-            artwork(thumbnailURL: content.thumbnailURL)
+            artwork(videoID: content.videoID, thumbnailURL: content.thumbnailURL)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(content.title)
@@ -203,21 +206,9 @@ struct MiniPlayerView: View {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func artwork(thumbnailURL: URL?) -> some View {
-        Group {
-            if let thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        artworkPlaceholder
-                    }
-                }
-            } else {
-                artworkPlaceholder
-            }
+    private func artwork(videoID: String, thumbnailURL: URL?) -> some View {
+        YouTubeArtworkView(videoID: videoID, fallback: thumbnailURL) {
+            artworkPlaceholder
         }
         .frame(width: 44, height: 44)
         .background(ShaudiTheme.accent.opacity(0.16))

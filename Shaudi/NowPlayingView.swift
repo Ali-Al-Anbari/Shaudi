@@ -39,6 +39,7 @@ struct NowPlayingView: View {
     private struct PageContent {
         let title: String
         let artist: String
+        let videoID: String
         let thumbnailURL: URL?
         let coverMedia: TrackCoverMedia?
     }
@@ -357,27 +358,15 @@ struct NowPlayingView: View {
             case .animatedGIF(let image):
                 AnimatedTrackCover(image: image)
             case nil:
-                normalArtwork(thumbnailURL: content.thumbnailURL)
+                normalArtwork(videoID: content.videoID, thumbnailURL: content.thumbnailURL)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func normalArtwork(thumbnailURL: URL?) -> some View {
-        Group {
-            if let thumbnailURL {
-                AsyncImage(url: thumbnailURL) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        artworkPlaceholder
-                    }
-                }
-            } else {
-                artworkPlaceholder
-            }
+    private func normalArtwork(videoID: String, thumbnailURL: URL?) -> some View {
+        YouTubeArtworkView(videoID: videoID, fallback: thumbnailURL) {
+            artworkPlaceholder
         }
     }
 
@@ -594,6 +583,7 @@ struct NowPlayingView: View {
         return PageContent(
             title: track.title,
             artist: track.channelTitle ?? "Unknown artist",
+            videoID: track.youtubeVideoID,
             thumbnailURL: track.thumbnailURL,
             coverMedia: customCoverMedia
         )
@@ -611,6 +601,7 @@ struct NowPlayingView: View {
         return PageContent(
             title: track.displayTitle,
             artist: track.displayArtist ?? "Unknown artist",
+            videoID: track.youtubeVideoID,
             thumbnailURL: track.thumbnailURL,
             coverMedia: coverMedia
         )
