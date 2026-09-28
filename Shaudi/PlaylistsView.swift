@@ -589,7 +589,10 @@ struct PlaylistDetailView: View {
         playbackManager.play(playable, canonicalIdentity: item.songIdentity)
     }
 
-    private func loadRecommendations(forceRefresh: Bool = false) {
+    private func loadRecommendations(
+        forceRefresh: Bool = false,
+        excluding visibleBeforeRefresh: [ResolvedRecommendation] = []
+    ) {
         invalidateRecommendationRequests()
         guard !tracks.isEmpty else {
             recommendationResult = PlaylistRecommendationResult(
@@ -617,6 +620,7 @@ struct PlaylistDetailView: View {
                     playlistID: playlistID,
                     rotation: rotation,
                     forceRefresh: forceRefresh,
+                    excluding: visibleBeforeRefresh,
                     currentTracks: { tracks },
                     isCurrent: {
                         isPlaylistVisible && recommendationRequest.matches(
@@ -697,9 +701,10 @@ struct PlaylistDetailView: View {
     private func handleRefreshRecommendations() {
         guard !isRecommendationsLoading, !isFindingMore else { return }
         recommendationRotation += 1
-        let playlistID = String(describing: playlist.persistentModelID)
-        PlaylistRecommendationService.shared.cache.remove(playlistID: playlistID)
-        loadRecommendations(forceRefresh: true)
+        loadRecommendations(
+            forceRefresh: true,
+            excluding: recommendationResult.visibleRecommendations
+        )
     }
 
     private func handleAddRecommendation(_ item: ResolvedRecommendation) {

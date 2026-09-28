@@ -347,12 +347,13 @@ final class PlaylistRecommendationService {
         playlistID: String? = nil,
         rotation: Int = 0,
         forceRefresh: Bool = false,
+        excluding visibleBeforeRefresh: [ResolvedRecommendation] = [],
         currentTracks: (() -> [Track])? = nil,
         isCurrent: () -> Bool = { true }
     ) async throws -> PlaylistRecommendationResult {
         let signature = trackSignature(for: tracks)
 
-        if !forceRefresh, let playlistID {
+        if !forceRefresh, visibleBeforeRefresh.isEmpty, let playlistID {
             if let cached = cache.get(playlistID: playlistID, trackSignature: signature) {
                 try validateRequest(signature: signature, currentTracks: currentTracks?() ?? tracks, isCurrent: isCurrent)
                 let valid = revalidate(cached, for: currentTracks?() ?? tracks, playlistID: playlistID)
@@ -389,11 +390,17 @@ final class PlaylistRecommendationService {
             )
         }
 
-        let diverseCandidates = applyArtistDiversity(to: candidates)
+        let excludedVideoIDs = Set(visibleBeforeRefresh.map {
+            $0.youtubeResult.youtubeVideoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        let excludedIdentities = Set(visibleBeforeRefresh.map(\.songIdentity))
+        let diverseCandidates = applyArtistDiversity(to: candidates.filter {
+            !excludedIdentities.contains($0.identity)
+        })
         let (resolved, deferred) = try await resolveCandidatesSafely(
             diverseCandidates,
-            existingVideoIDs: profile.existingVideoIDs,
-            existingIdentities: profile.existingIdentities,
+            existingVideoIDs: profile.existingVideoIDs.union(excludedVideoIDs),
+            existingIdentities: profile.existingIdentities.union(excludedIdentities),
             playlistID: playlistID
         )
 

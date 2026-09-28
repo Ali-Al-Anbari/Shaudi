@@ -118,6 +118,86 @@ final class PlaylistRecommendationTests: XCTestCase {
 
     // MARK: - 22 Deterministic Tests
 
+    func testRefreshReplacesFiveWithoutFeedbackAndExclusionsExpire() async throws {
+        let suiteName = "shaudi.tests.refresh.\(UUID().uuidString)"
+        defaultsSuiteNames.append(suiteName)
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let feedback = RecommendationFeedbackStore(defaults: defaults)
+        let personalization = RecommendationPersonalizationStore()
+        let rejections = PlaylistRejectionStore(defaults: defaults)
+        let service = PlaylistRecommendationService(
+            similarTracks: { _, _, _, _ in
+                (1...12).map { index in
+                    self.makeSimilar(
+                        artist: "Artist \(index)", title: "Song \(index)",
+                        match: 1 - Double(index) * 0.01
+                    )
+                }
+            },
+            safeResolve: { candidate in
+                self.makeResolved(
+                    artist: candidate.artist, title: candidate.title,
+                    videoID: "video_\(candidate.title.replacingOccurrences(of: " ", with: "_"))"
+                )
+            },
+            officialResolve: { _ in nil },
+            feedbackStore: feedback,
+            personalizationStore: personalization,
+            rejectionStore: rejections,
+            cache: PlaylistRecommendationCache()
+        )
+        let tracks = [makeTrack(id: "seed", title: "Seed", artist: "Seed Artist")]
+        let initial = try await service.recommendations(for: tracks, playlistID: "p")
+        let originalIDs = Set(initial.visibleRecommendations.map(\.youtubeResult.youtubeVideoID))
+        XCTAssertEqual(originalIDs.count, 5)
+        let feedbackBefore = feedback.snapshot
+        let personalizationBefore = personalization.profile
+
+        let refreshed = try await service.recommendations(
+            for: tracks, playlistID: "p", forceRefresh: true,
+            excluding: initial.visibleRecommendations
+        )
+        let refreshedIDs = Set(refreshed.visibleRecommendations.map(\.youtubeResult.youtubeVideoID))
+        XCTAssertEqual(refreshedIDs.count, 5)
+        XCTAssertTrue(originalIDs.isDisjoint(with: refreshedIDs))
+        XCTAssertEqual(feedback.snapshot, feedbackBefore)
+        XCTAssertEqual(personalization.profile, personalizationBefore)
+        XCTAssertTrue(initial.visibleRecommendations.allSatisfy {
+            !rejections.isRejected($0.songIdentity, videoID: $0.youtubeResult.youtubeVideoID, for: "p")
+        })
+        XCTAssertEqual(
+            Set(service.cache.get(playlistID: "p", trackSignature: service.trackSignature(for: tracks))!
+                .visibleRecommendations.map(\.youtubeResult.youtubeVideoID)),
+            refreshedIDs
+        )
+
+        let later = try await service.recommendations(for: tracks, playlistID: "p", forceRefresh: true)
+        XCTAssertFalse(originalIDs.isDisjoint(with: Set(later.visibleRecommendations.map(\.youtubeResult.youtubeVideoID))))
+    }
+
+    func testRefreshReturnsAvailableAlternativesWhenFewerThanFiveRemain() async throws {
+        let service = makeService(
+            similarTracks: { _, _, _, _ in
+                (1...7).map { index in
+                    self.makeSimilar(artist: "Artist \(index)", title: "Song \(index)", match: 1 - Double(index) * 0.01)
+                }
+            },
+            safeResolve: { candidate in
+                self.makeResolved(artist: candidate.artist, title: candidate.title, videoID: candidate.title)
+            }
+        )
+        let tracks = [makeTrack(id: "seed", title: "Seed", artist: "Seed Artist")]
+        let initial = try await service.recommendations(for: tracks, playlistID: "p")
+        XCTAssertEqual(initial.visibleRecommendations.count, 5)
+        let refreshed = try await service.recommendations(
+            for: tracks, playlistID: "p", forceRefresh: true,
+            excluding: initial.visibleRecommendations
+        )
+        XCTAssertEqual(refreshed.visibleRecommendations.count, 2)
+        XCTAssertTrue(Set(initial.visibleRecommendations.map(\.youtubeResult.youtubeVideoID))
+            .isDisjoint(with: Set(refreshed.visibleRecommendations.map(\.youtubeResult.youtubeVideoID))))
+    }
+
     // 1. playlist open may automatically perform bounded Last.fm work
     func testPlaylistOpenMayAutomaticallyPerformBoundedLastFMWork() async throws {
         let t1 = makeTrack(id: "v1", title: "Boulevard of Broken Dreams", artist: "Green Day")
