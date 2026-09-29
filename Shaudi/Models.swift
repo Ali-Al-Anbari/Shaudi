@@ -109,6 +109,7 @@ final class Playlist {
     var dateCreated: Date
     var lastPlayedAt: Date? = nil
     var artworkID: UUID? = nil
+    var recommendationPoolData: Data? = nil
 
     @Relationship(inverse: \Track.playlists)
     var tracks: [Track]

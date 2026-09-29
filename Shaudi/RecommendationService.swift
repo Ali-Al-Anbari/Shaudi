@@ -104,7 +104,8 @@ struct RecommendationSeed {
         artistSource = identity.artistSource
         identityConfidence = identity.confidence
 
-#if DEBUG
+// Opt in when diagnosing identity parsing; playlist playback also constructs seeds.
+#if DEBUG && SHAUDI_VERBOSE_RECOMMENDATION_IDENTITY
         print(
             "[RecommendationIdentity] rawTitle=\(rawTitle) "
                 + "rawChannel=\(sourceChannel ?? "")"
@@ -147,7 +148,7 @@ struct RecommendationSeed {
         artistSource = authoritativeSource
         identityConfidence = .authoritative
 
-#if DEBUG
+#if DEBUG && SHAUDI_VERBOSE_RECOMMENDATION_IDENTITY
         print(
             "[RecommendationIdentity] source=\(authoritativeSource.rawValue) "
                 + "canonicalArtist=\(canonicalIdentity.artist) "

@@ -122,6 +122,49 @@ struct PlaylistRecommendationResult {
     }
 }
 
+private struct SavedPlaylistRecommendation: Codable {
+    let artist: String
+    let title: String
+    let match: Double
+    let videoID: String
+    let youtubeTitle: String
+    let channelTitle: String
+    let thumbnailURL: URL?
+    let duration: TimeInterval?
+
+    init(_ item: ResolvedRecommendation) {
+        artist = item.artist
+        title = item.title
+        match = item.match.isFinite ? item.match : 0
+        videoID = item.youtubeResult.youtubeVideoID
+        youtubeTitle = item.youtubeResult.title
+        channelTitle = item.youtubeResult.channelTitle
+        thumbnailURL = item.youtubeResult.thumbnailURL
+        duration = item.youtubeResult.duration
+    }
+
+    var recommendation: ResolvedRecommendation? {
+        let identity = SongIdentity(artist: artist, title: title)
+        guard !videoID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !identity.artist.isEmpty, !identity.title.isEmpty,
+              !SongNormalization.text(identity.artist).isEmpty,
+              !SongNormalization.baseTitle(identity.title).isEmpty
+        else { return nil }
+        return ResolvedRecommendation(
+            artist: identity.artist,
+            title: identity.title,
+            match: match,
+            youtubeResult: YouTubeSearchResult(
+                youtubeVideoID: videoID,
+                title: youtubeTitle.isEmpty ? title : youtubeTitle,
+                channelTitle: channelTitle.isEmpty ? artist : channelTitle,
+                thumbnailURL: thumbnailURL,
+                duration: duration
+            )
+        )
+    }
+}
+
 @MainActor
 final class PlaylistRejectionStore {
     static let shared = PlaylistRejectionStore()
@@ -237,6 +280,9 @@ final class PlaylistRecommendationService {
     private let personalizationStore: RecommendationPersonalizationStore
     let rejectionStore: PlaylistRejectionStore
     let cache: PlaylistRecommendationCache
+    private var automaticGenerationTasks: [String: Task<PlaylistRecommendationResult, Error>] = [:]
+    private var refreshTasks: [String: Task<PlaylistRecommendationResult, Error>] = [:]
+    private var generationTokens: [String: UUID] = [:]
 
     convenience init() {
         self.init(
@@ -340,6 +386,233 @@ final class PlaylistRecommendationService {
         self.personalizationStore = personalizationStore
         self.rejectionStore = rejectionStore
         self.cache = cache
+    }
+
+    enum PoolError: LocalizedError {
+        case playlistUnavailable
+        case noNewRecommendations
+
+        var errorDescription: String? {
+            switch self {
+            case .playlistUnavailable: "This playlist is no longer available."
+            case .noNewRecommendations: "No new recommendations were available. Your saved songs are unchanged."
+            }
+        }
+    }
+
+    private func playlistKey(_ playlist: Playlist) -> String {
+        String(describing: playlist.persistentModelID)
+    }
+
+    private func visibleOnly(_ result: PlaylistRecommendationResult) -> PlaylistRecommendationResult {
+        PlaylistRecommendationResult(
+            visibleRecommendations: Array(result.visibleRecommendations.prefix(5)),
+            spareResolved: [],
+            deferredCandidates: []
+        )
+    }
+
+    private func persistPool(_ result: PlaylistRecommendationResult, for playlist: Playlist) throws {
+        guard let context = playlist.modelContext else { throw PoolError.playlistUnavailable }
+        let saved = visibleOnly(result).visibleRecommendations.map(SavedPlaylistRecommendation.init)
+        let data = try JSONEncoder().encode(saved)
+        let previous = playlist.recommendationPoolData
+        playlist.recommendationPoolData = data
+        do {
+            try context.save()
+            cache.remove(playlistID: playlistKey(playlist))
+        } catch {
+            playlist.recommendationPoolData = previous
+            throw error
+        }
+    }
+
+    private func generateCurrentPoolCandidates(
+        for playlist: Playlist,
+        key: String,
+        token: UUID,
+        rotation: Int = 0,
+        excluding: [ResolvedRecommendation] = []
+    ) async throws -> PlaylistRecommendationResult {
+        // The existing generator rejects a changed track signature. A single
+        // retry accommodates an edit made mid-request without accepting stale
+        // candidates or creating a continuing network loop.
+        for attempt in 0..<2 {
+            do {
+                return try await recommendations(
+                    for: playlist.tracksInPlaybackOrder,
+                    playlistID: key,
+                    rotation: rotation,
+                    forceRefresh: true,
+                    excluding: excluding,
+                    currentTracks: { playlist.tracksInPlaybackOrder },
+                    isCurrent: { self.generationTokens[key] == token && playlist.modelContext != nil }
+                )
+            } catch is CancellationError {
+                guard attempt == 0, !Task.isCancelled, generationTokens[key] == token else {
+                    throw CancellationError()
+                }
+            }
+        }
+        throw CancellationError()
+    }
+
+    /// A saved pool is authoritative. Validation removes invalid cards in place;
+    /// surviving cards are never topped up from spares or network work.
+    func savedPool(for playlist: Playlist) -> PlaylistRecommendationResult {
+        guard let data = playlist.recommendationPoolData else {
+            return visibleOnly(PlaylistRecommendationResult(
+                visibleRecommendations: [], spareResolved: [], deferredCandidates: []
+            ))
+        }
+        let saved = (try? JSONDecoder().decode([SavedPlaylistRecommendation].self, from: data)) ?? []
+        let restored = saved.compactMap(\.recommendation)
+        let valid = visibleOnly(revalidate(
+            PlaylistRecommendationResult(
+                visibleRecommendations: restored, spareResolved: [], deferredCandidates: []
+            ),
+            for: playlist.tracksInPlaybackOrder,
+            playlistID: playlistKey(playlist)
+        ))
+        if valid.visibleRecommendations.count != saved.count {
+            try? persistPool(valid, for: playlist)
+        }
+#if DEBUG
+        print("[PlaylistRecommendations] load saved count=\(valid.visibleRecommendations.count)")
+#endif
+        return valid
+    }
+
+    /// Callers share one independent task, so closing and reopening a playlist
+    /// cannot start another Last.fm pass while the first pass is running.
+    func generateIfPoolEmpty(for playlist: Playlist) async throws -> PlaylistRecommendationResult {
+        let existing = savedPool(for: playlist)
+        guard existing.visibleRecommendations.isEmpty else {
+#if DEBUG
+            print("[PlaylistRecommendations] skip generation reason=savedPoolExists")
+#endif
+            return existing
+        }
+        let key = playlistKey(playlist)
+        if let refreshTask = refreshTasks[key] { return try await refreshTask.value }
+        if let task = automaticGenerationTasks[key] { return try await task.value }
+
+        let token = UUID()
+        generationTokens[key] = token
+#if DEBUG
+        print("[PlaylistRecommendations] pool empty -> generating playlistID=\(key)")
+#endif
+        let task = Task { @MainActor [self, playlist] () throws -> PlaylistRecommendationResult in
+            defer {
+                if generationTokens[key] == token { automaticGenerationTasks[key] = nil }
+            }
+            let generated = try await generateCurrentPoolCandidates(
+                for: playlist, key: key, token: token
+            )
+            try Task.checkCancellation()
+            guard generationTokens[key] == token else { throw CancellationError() }
+            let alreadySaved = savedPool(for: playlist)
+            if !alreadySaved.visibleRecommendations.isEmpty { return alreadySaved }
+            let valid = visibleOnly(revalidate(
+                generated, for: playlist.tracksInPlaybackOrder, playlistID: key
+            ))
+            try persistPool(valid, for: playlist)
+            return valid
+        }
+        automaticGenerationTasks[key] = task
+        return try await task.value
+    }
+
+    /// Refresh exclusions live only for this request. The old SwiftData pool is
+    /// untouched until a nonempty replacement has passed validation and saves.
+    func refreshPool(
+        for playlist: Playlist,
+        rotation: Int = 0
+    ) async throws -> PlaylistRecommendationResult {
+        let oldPool = savedPool(for: playlist)
+        let key = playlistKey(playlist)
+        cancelPendingGeneration(for: playlist)
+        let token = generationTokens[key]!
+#if DEBUG
+        print("[PlaylistRecommendations] refresh requested playlistID=\(key) visible=\(oldPool.visibleRecommendations.count)")
+#endif
+        let task = Task { @MainActor [self, playlist] () throws -> PlaylistRecommendationResult in
+            defer {
+                if generationTokens[key] == token { refreshTasks[key] = nil }
+            }
+            let generated = try await generateCurrentPoolCandidates(
+                for: playlist,
+                key: key,
+                token: token,
+                rotation: rotation,
+                excluding: oldPool.visibleRecommendations
+            )
+            try Task.checkCancellation()
+            guard generationTokens[key] == token else { throw CancellationError() }
+            let valid = visibleOnly(revalidate(
+                generated, for: playlist.tracksInPlaybackOrder, playlistID: key
+            ))
+            guard !valid.visibleRecommendations.isEmpty else {
+                cache.remove(playlistID: key)
+                throw PoolError.noNewRecommendations
+            }
+            try persistPool(valid, for: playlist)
+            return valid
+        }
+        refreshTasks[key] = task
+        return try await task.value
+    }
+
+    func cancelPendingGeneration(for playlist: Playlist) {
+        let key = playlistKey(playlist)
+        generationTokens[key] = UUID()
+        automaticGenerationTasks.removeValue(forKey: key)?.cancel()
+        refreshTasks.removeValue(forKey: key)?.cancel()
+    }
+
+    func removeSavedRecommendation(
+        _ item: ResolvedRecommendation,
+        from playlist: Playlist,
+        reason: String,
+        reject: Bool = false
+    ) throws -> PlaylistRecommendationResult {
+        cancelPendingGeneration(for: playlist)
+        let key = playlistKey(playlist)
+        if reject {
+            rejectionStore.reject(
+                item.songIdentity,
+                videoID: item.youtubeResult.youtubeVideoID,
+                for: key
+            )
+        }
+        let videoID = item.youtubeResult.youtubeVideoID
+        let current = savedPool(for: playlist)
+        let remaining = visibleOnly(PlaylistRecommendationResult(
+            visibleRecommendations: current.visibleRecommendations.filter {
+                $0.youtubeResult.youtubeVideoID != videoID
+            },
+            spareResolved: [], deferredCandidates: []
+        ))
+        try persistPool(remaining, for: playlist)
+#if DEBUG
+        print("[PlaylistRecommendations] removed recommendation reason=\(reason) remaining=\(remaining.visibleRecommendations.count)")
+#endif
+        return remaining
+    }
+
+    func saveExplicitExpansion(
+        _ result: PlaylistRecommendationResult,
+        for playlist: Playlist,
+        expectedCurrent: PlaylistRecommendationResult
+    ) throws -> PlaylistRecommendationResult {
+        let persistedIDs = savedPool(for: playlist).visibleRecommendations.map(\.youtubeResult.youtubeVideoID)
+        let expectedIDs = expectedCurrent.visibleRecommendations.map(\.youtubeResult.youtubeVideoID)
+        guard persistedIDs == expectedIDs else { throw CancellationError() }
+        let valid = visibleOnly(revalidate(
+            result, for: playlist.tracksInPlaybackOrder, playlistID: playlistKey(playlist)
+        ))
+        try persistPool(valid, for: playlist)
+        return valid
     }
 
     func recommendations(

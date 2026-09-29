@@ -300,6 +300,13 @@ struct PlaylistRecommendationsSectionView: View {
                     )
                 }
 
+                if let errorMessage, !result.visibleRecommendations.isEmpty {
+                    Text(errorMessage)
+                        .font(ShaudiTheme.bodyFont(size: 13, relativeTo: .footnote))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                }
+
                 if result.canFindMore {
                     findMoreButton
                 }
