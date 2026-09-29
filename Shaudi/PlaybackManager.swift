@@ -6,6 +6,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import Network
 import SwiftData
 #if os(iOS)
 import MediaPlayer
@@ -38,6 +39,52 @@ private final class WeakReference<Value: AnyObject>: @unchecked Sendable {
 
     init(_ value: Value) {
         self.value = value
+    }
+}
+
+enum SignedStreamURLPolicy {
+    // Googlevideo URLs observed in diagnostics commonly last about six hours.
+    // Leave 15 minutes for startup and later range requests; when expiry is
+    // absent, cap reuse at four hours instead of assuming an unlimited lifetime.
+    static let expirySafetyMargin: TimeInterval = 15 * 60
+    static let maximumAgeWithoutExpiration: TimeInterval = 4 * 60 * 60
+
+    enum Rejection: String {
+        case expired
+        case nearExpiry
+        case tooOld
+    }
+
+    static func expirationDate(in url: URL) -> Date? {
+        guard let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "expire" })?.value,
+            let seconds = TimeInterval(raw), seconds.isFinite, seconds > 0
+        else { return nil }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    static func rejection(
+        resolvedAt: Date,
+        expiresAt: Date?,
+        now: Date = .now
+    ) -> Rejection? {
+        if let expiresAt {
+            if now >= expiresAt { return .expired }
+            if now.addingTimeInterval(expirySafetyMargin) >= expiresAt { return .nearExpiry }
+            return nil
+        }
+        return now.timeIntervalSince(resolvedAt) >= maximumAgeWithoutExpiration
+            ? .tooOld : nil
+    }
+}
+
+enum PlaybackNetworkRoute: Equatable {
+    case unavailable, wifi, cellular, other
+
+    static func shouldInvalidateSpeculativeURLs(from old: Self, to new: Self) -> Bool {
+        (old == .wifi && new == .cellular)
+            || (old == .cellular && new == .wifi)
+            || (old == .unavailable && (new == .wifi || new == .cellular))
     }
 }
 
@@ -173,10 +220,44 @@ final class PlaybackManager: ObservableObject {
     private struct StreamDiagnostics {
         let fileExtension: String
         let audioBitrate: Int?
+#if DEBUG
+        let itag: Int?
+        let mimeType: String
+        let codec: String
+        let contentLength: Int64?
+        let approximateDuration: TimeInterval?
+        let resolvedAt: Date
+        let expiresAt: Date?
+        let source: StreamResolutionSource
+        let resolutionID: UUID
+#endif
+    }
+
+    private struct CachedStream {
+        let url: URL
+        let resolvedAt: Date
+        let expiresAt: Date?
+        let source: StreamResolutionSource
+        let diagnostics: StreamDiagnostics
+    }
+
+    private enum RecoveryKind: String {
+        case cachedStartup
+        case midTrackStall
+        case midTrackFailedToEnd
+        case midTrackItemFailed
+    }
+
+    private struct RecoveryAttempt {
+        let requestID: UUID
+        let kind: RecoveryKind
+        let resumeAt: TimeInterval
+        let shouldPlay: Bool
     }
 
     private struct InFlightResolution {
         let id: UUID
+        let source: StreamResolutionSource
         let task: Task<URL, Error>
     }
 
@@ -192,6 +273,8 @@ final class PlaybackManager: ObservableObject {
         let track: Track
         let videoID: String
         let streamURL: URL
+        let resolvedAt: Date
+        let expiresAt: Date?
         let item: AVPlayerItem
         let player: AVPlayer
         let playbackRange: EffectivePlaybackRange
@@ -258,6 +341,15 @@ final class PlaybackManager: ObservableObject {
     }
 
     private var player: AVPlayer?
+    private var playbackNetworkMonitor: NWPathMonitor?
+    private var activeNetworkRoute: PlaybackNetworkRoute?
+    private var startupWatchdogTask: Task<Void, Never>?
+    private var midTrackStallTask: Task<Void, Never>?
+    private var retriedPlaybackRequestID: UUID?
+    private var recoveryAttempt: RecoveryAttempt?
+    private var activePlaybackStartTime: TimeInterval = 0
+    private var activeRequestStartedAt: TimeInterval = 0
+    private var urlOnlyCachedPlaybackRequestID: UUID?
     private var playbackTask: Task<Void, Never>?
     private var preResolutionTask: Task<Void, Never>?
     private var lookaheadTask: Task<Void, Never>?
@@ -269,6 +361,23 @@ final class PlaybackManager: ObservableObject {
     private var recommendationRefillID: UUID?
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlStatusObservation: NSKeyValueObservation?
+#if DEBUG
+    private var playbackDiagnosticTimeObserver: (player: AVPlayer, token: Any)?
+    private var playbackDiagnosticLogObservers: [NSObjectProtocol] = []
+    private var diagnosticNetworkPath = "unavailable"
+    private struct PlaybackTrace {
+        let requestID: UUID
+        let videoID: String
+        let startedAt: TimeInterval
+        var urlAvailableAt: TimeInterval?
+        var playRequestedAt: TimeInterval?
+        var playingAt: TimeInterval?
+        var firstAdvanceAt: TimeInterval?
+        var playPosition: TimeInterval?
+        var lastSnapshotAt: TimeInterval = 0
+    }
+    private var playbackTrace: PlaybackTrace?
+#endif
     private var nextItemStatusObservation: NSKeyValueObservation?
     private var playbackEndObserver: NSObjectProtocol?
     private var playbackFailedToEndObserver: NSObjectProtocol?
@@ -345,6 +454,10 @@ final class PlaybackManager: ObservableObject {
 
 #if DEBUG
     var testMetadataProvider: ((String) async throws -> YouTubeMetadata)?
+    var testStreamURLProvider: ((String) async throws -> URL)?
+    var testRecoveryPlaybackSink: ((URL, TimeInterval?, Bool, UUID) -> Void)?
+    var testStartupWatchdogDelay: TimeInterval?
+    var testStallRecoveryDelay: TimeInterval?
 #endif
 
     private var trimPreviewRange: (track: Track, range: EffectivePlaybackRange)?
@@ -357,8 +470,7 @@ final class PlaybackManager: ObservableObject {
     private var recommendationTransportMetadata: [String: RecommendationTransportMetadata] = [:]
     private var recommendationManualSeeds: [String: RecommendationSeed] = [:]
     private var recommendationRadioSession: RecommendationRadioSession?
-    private var resolvedStreamCache: [String: URL] = [:]
-    private var resolvedStreamDiagnostics: [String: StreamDiagnostics] = [:]
+    private var resolvedStreamCache: [String: CachedStream] = [:]
     private var inFlightResolutions: [String: InFlightResolution] = [:]
     private var nonSpeculativeStreamIDs: Set<String> = []
     private var dashboardSpeculativeStreamIDs: Set<String> = []
@@ -384,12 +496,14 @@ final class PlaybackManager: ObservableObject {
 
     init() {
 #if os(iOS)
+        configureNetworkPathMonitoring()
         configureRemoteCommands()
         configureAudioSessionDiagnostics()
 #endif
     }
 
     deinit {
+        playbackNetworkMonitor?.cancel()
 #if os(iOS)
         if let audioSessionInterruptionObserver {
             NotificationCenter.default.removeObserver(audioSessionInterruptionObserver)
@@ -683,7 +797,7 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 let videoID = candidate.videoID
-                if resolvedStreamCache[videoID] != nil {
+                if reusableCachedStream(for: videoID) != nil {
                     searchPreResolveLog("cacheHit videoID=\(videoID)")
                     continue
                 }
@@ -777,7 +891,7 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 let videoID = candidate.videoID
-                if resolvedStreamCache[videoID] != nil {
+                if reusableCachedStream(for: videoID) != nil {
                     dashboardLog("cache hit track=\(videoID)")
                     continue
                 }
@@ -856,7 +970,7 @@ final class PlaybackManager: ObservableObject {
                     return
                 }
 
-                if resolvedStreamCache[videoID] != nil {
+                if reusableCachedStream(for: videoID) != nil {
                     playlistLog("cache hit track=\(videoID)")
                     continue
                 }
@@ -1455,6 +1569,9 @@ final class PlaybackManager: ObservableObject {
     ) {
         invalidateCurrentRequest()
         clearPlayer()
+        retriedPlaybackRequestID = nil
+        recoveryAttempt = nil
+        urlOnlyCachedPlaybackRequestID = nil
 
         let requestID = UUID()
         let requestStartedAt = requestStartedAt ?? currentTime
@@ -1462,6 +1579,15 @@ final class PlaybackManager: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         activeRequestID = requestID
+        activeRequestStartedAt = requestStartedAt
+#if DEBUG
+        playbackTrace = PlaybackTrace(
+            requestID: requestID,
+            videoID: videoID,
+            startedAt: requestStartedAt
+        )
+        playbackDiagnostic("request.start origin=\(String(describing: playbackOrigin))", requestID: requestID)
+#endif
         completedPlaybackRequestID = nil
         currentTrack = persistentTrack
         currentPlayableTrack = playableTrack
@@ -1490,12 +1616,40 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
+        var preparedPlayback = preparedPlayback
+        if let prepared = preparedPlayback,
+           let rejection = SignedStreamURLPolicy.rejection(
+               resolvedAt: prepared.resolvedAt,
+               expiresAt: prepared.expiresAt
+           ) {
+            recoveryLog("prepared item discarded videoID=\(videoID) reason=\(rejection.rawValue)")
+            if resolvedStreamCache[videoID]?.url == prepared.streamURL {
+                removeCachedStream(for: videoID)
+            }
+            discard(prepared)
+            preparedPlayback = nil
+        }
+
         if
             let preparedPlayback,
             preparedPlayback.queueIndex == currentIndex,
             preparedPlayback.track === persistentTrack,
             preparedPlayback.videoID == videoID
         {
+#if DEBUG
+            playbackDiagnosticURLAvailable(
+                preparedPlayback.streamURL,
+                videoID: videoID,
+                requestID: requestID,
+                source: preparedPlayback.readyAt == nil ? "prepared-item-pending" : "prepared-item-prerolled"
+            )
+            playbackDiagnostic(
+                "prepared.handoff prepID=\(preparedPlayback.preparationID) itemStatus=\(preparedPlayback.item.status.rawValue) "
+                    + "prepAge=\(String(format: "%.3f", currentTime - preparedPlayback.preparationStartedAt))s "
+                    + "readyAge=\(preparedPlayback.readyAt.map { String(format: "%.3f", currentTime - $0) } ?? "none")s",
+                requestID: requestID
+            )
+#endif
             let wasFullyPrepared = preparedPlayback.readyAt != nil
             startupMetrics = StartupMetrics(
                 videoID: videoID,
@@ -1529,7 +1683,17 @@ final class PlaybackManager: ObservableObject {
             discard(preparedPlayback)
         }
 
-        if let cachedURL = resolvedStreamCache[videoID] {
+        if let cachedStream = reusableCachedStream(for: videoID) {
+            let cachedURL = cachedStream.url
+            urlOnlyCachedPlaybackRequestID = requestID
+#if DEBUG
+            playbackDiagnosticURLAvailable(
+                cachedURL,
+                videoID: videoID,
+                requestID: requestID,
+                source: "in-memory-cache"
+            )
+#endif
             markStreamAsNonSpeculative(videoID)
             startupMetrics = StartupMetrics(
                 videoID: videoID,
@@ -1540,7 +1704,7 @@ final class PlaybackManager: ObservableObject {
             log("Using cached URL but unprepared item for \(videoID)")
             logSelectedStream(
                 videoID: videoID,
-                diagnostics: resolvedStreamDiagnostics[videoID],
+                diagnostics: cachedStream.diagnostics,
                 source: .memoryCache
             )
             startPlayback(
@@ -1574,6 +1738,11 @@ final class PlaybackManager: ObservableObject {
     }
 
     func pause() {
+#if DEBUG
+        if let activeRequestID {
+            playbackDiagnosticSnapshot("userPause", requestID: activeRequestID, item: player?.currentItem, player: player)
+        }
+#endif
         activeInterruptionContext = nil
         cancelPendingCompletionFallbacks(reason: "user paused")
 
@@ -1852,6 +2021,11 @@ final class PlaybackManager: ObservableObject {
         }
 
         state = .loading
+#if DEBUG
+        if let activeRequestID {
+            playbackDiagnosticSnapshot("userResume", requestID: activeRequestID, item: player.currentItem, player: player)
+        }
+#endif
         player.play()
 #if os(iOS)
         synchronizeNowPlayingPlaybackState()
@@ -1871,6 +2045,10 @@ final class PlaybackManager: ObservableObject {
 
         let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
         let targetTime = clampedPlaybackTime(time, to: playbackRange)
+#if DEBUG
+        playbackDiagnostic("userSeek.begin target=\(targetTime)s from=\(player.currentTime().seconds)s", requestID: requestID)
+        playbackDiagnosticSnapshot("beforeUserSeek", requestID: requestID, item: player.currentItem, player: player)
+#endif
 
         finishActiveListeningPeriod()
 
@@ -1880,6 +2058,10 @@ final class PlaybackManager: ObservableObject {
             }
 
             let finished = await seekPlayer(player, to: targetTime)
+#if DEBUG
+            playbackDiagnostic("userSeek.end target=\(targetTime)s finished=\(finished) position=\(player.currentTime().seconds)s", requestID: requestID)
+            playbackDiagnosticSnapshot("afterUserSeek", requestID: requestID, item: player.currentItem, player: player)
+#endif
             guard
                 finished,
                 isActive(requestID),
@@ -1939,11 +2121,18 @@ final class PlaybackManager: ObservableObject {
         videoID: String,
         requestID: UUID,
         requestStartedAt: TimeInterval,
-        isJoiningInFlightResolution: Bool = false
+        isJoiningInFlightResolution: Bool = false,
+        forceFreshResolution: Bool = false,
+        retryStartTime: TimeInterval? = nil,
+        shouldPlay: Bool = true
     ) {
         state = .resolving
         let resolutionStartedAt = currentTime
-        let resolutionTask = resolutionTask(for: videoID, source: .foreground)
+        let resolutionTask = resolutionTask(
+            for: videoID,
+            source: .foreground,
+            forceFresh: forceFreshResolution
+        )
 
         playbackTask = Task { [weak self] in
             do {
@@ -1954,6 +2143,14 @@ final class PlaybackManager: ObservableObject {
                 guard let self, isActive(requestID) else {
                     return
                 }
+#if DEBUG
+                playbackDiagnosticURLAvailable(
+                    streamURL,
+                    videoID: videoID,
+                    requestID: requestID,
+                    source: isJoiningInFlightResolution ? "joined-resolution" : "fresh-resolution"
+                )
+#endif
 
                 let resolutionFinishedAt = currentTime
                 let resolutionTime = resolutionFinishedAt - resolutionStartedAt
@@ -1963,18 +2160,27 @@ final class PlaybackManager: ObservableObject {
                 }
                 logTiming("Stream resolution", seconds: resolutionTime, videoID: videoID)
 
+                let playAfterResolution = shouldPlay && !isAudioInterrupted && state != .paused
                 playbackTask = nil
                 state = .loading
                 if isJoiningInFlightResolution {
                     log("Using cached URL but unprepared item for \(videoID)")
                 }
+#if DEBUG
+                if let testRecoveryPlaybackSink, recoveryAttempt?.requestID == requestID {
+                    testRecoveryPlaybackSink(streamURL, retryStartTime, playAfterResolution, requestID)
+                    return
+                }
+#endif
                 startPlayback(
                     with: streamURL,
                     videoID: videoID,
                     requestID: requestID,
                     requestStartedAt: requestStartedAt,
                     playerPreparationStartedAt: resolutionFinishedAt,
-                    usedCachedStream: isJoiningInFlightResolution
+                    usedCachedStream: isJoiningInFlightResolution,
+                    playbackStartTimeOverride: retryStartTime,
+                    shouldPlay: playAfterResolution
                 )
             } catch is CancellationError {
                 guard
@@ -2010,6 +2216,11 @@ final class PlaybackManager: ObservableObject {
                 }
 
                 playbackTask = nil
+                if recoveryAttempt?.requestID == requestID {
+                    recoveryLog("recovery failed requestID=\(requestID) stage=resolution error=\(Self.errorMessage(for: error))")
+                    recoveryAttempt = nil
+                    clearPlayer()
+                }
                 if case StreamResolutionError.noPlayableStream = error {
                     invalidateVideoResolutionIfNeeded(videoID: videoID)
                     state = .failed(
@@ -2053,6 +2264,29 @@ final class PlaybackManager: ObservableObject {
             return false
         }
     }
+
+#if DEBUG
+    private static func resolutionFailureCategory(_ error: Error) -> String {
+        if error is CancellationError { return "cancellation" }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain { return "network" }
+#if canImport(JavaScriptCore)
+        if error is SignatureSolverError { return "signature-or-n-challenge" }
+#endif
+        guard let error = error as? YouTubeKitError else { return "other" }
+        switch error {
+        case .videoUnavailable, .videoPrivate, .recordingUnavailable,
+             .membersOnly, .videoRegionBlocked, .videoAgeRestricted:
+            return "video-unavailable-or-restricted"
+        case .htmlParseError, .extractError, .regexMatchError:
+            return "extraction-or-challenge-undetermined"
+        case .maxRetriesExceeded:
+            return "YouTubeKit-retries-exhausted"
+        case .liveStreamError:
+            return "livestream-unsupported"
+        }
+    }
+#endif
 
     private func deduplicatedDashboardCandidates(
         _ candidates: [DashboardWarmupCandidate]
@@ -2434,11 +2668,74 @@ final class PlaybackManager: ObservableObject {
 
     private func removeCachedStream(for videoID: String) {
         resolvedStreamCache.removeValue(forKey: videoID)
-        resolvedStreamDiagnostics.removeValue(forKey: videoID)
         dashboardSpeculativeStreamIDs.remove(videoID)
         playlistSpeculativeStreamIDs.remove(videoID)
         searchSpeculativeStreamIDs.remove(videoID)
         nonSpeculativeStreamIDs.remove(videoID)
+    }
+
+    private func reusableCachedStream(for videoID: String) -> CachedStream? {
+        guard let cached = resolvedStreamCache[videoID] else { return nil }
+        if let rejection = SignedStreamURLPolicy.rejection(
+            resolvedAt: cached.resolvedAt,
+            expiresAt: cached.expiresAt
+        ) {
+            removeCachedStream(for: videoID)
+            recoveryLog("evicted cached URL videoID=\(videoID) reason=\(rejection.rawValue)")
+            return nil
+        }
+        return cached
+    }
+
+    private func isSpeculativeStreamSource(_ source: StreamResolutionSource) -> Bool {
+        switch source {
+        case .preResolution, .lookahead, .dashboardWarmup,
+             .playlistWarmup, .searchPreResolve:
+            return true
+        case .foreground, .memoryCache:
+            return false
+        }
+    }
+
+    private func handleNetworkRouteChange(
+        to route: PlaybackNetworkRoute,
+        description: String
+    ) {
+        let previous = activeNetworkRoute
+        activeNetworkRoute = route
+#if DEBUG
+        diagnosticNetworkPath = description
+        if let requestID = activeRequestID {
+            playbackDiagnostic("networkPath.changed \(description)", requestID: requestID)
+            playbackDiagnosticSnapshot("networkPathChanged", requestID: requestID, item: player?.currentItem, player: player)
+        }
+#endif
+        guard let previous,
+              PlaybackNetworkRoute.shouldInvalidateSpeculativeURLs(from: previous, to: route)
+        else { return }
+
+        let activeVideoID = normalizedVideoID(currentPlayableTrack?.youtubeVideoID ?? "")
+        let preparedVideoID = preparedNextPlayback?.videoID ?? preparedNextVideoID
+        let evicted = resolvedStreamCache.compactMap { videoID, entry -> String? in
+            guard videoID != activeVideoID,
+                  videoID != preparedVideoID,
+                  isSpeculativeStreamSource(entry.source)
+            else { return nil }
+            return videoID
+        }
+        for videoID in evicted { removeCachedStream(for: videoID) }
+
+        let cancelled = inFlightResolutions.compactMap { videoID, resolution -> String? in
+            guard videoID != activeVideoID,
+                  videoID != preparedVideoID,
+                  isSpeculativeStreamSource(resolution.source)
+            else { return nil }
+            return videoID
+        }
+        for videoID in cancelled {
+            inFlightResolutions.removeValue(forKey: videoID)?.task.cancel()
+        }
+        recoveryLog("network path \(previous)->\(route) evictedSpeculativeURLs=\(evicted.count) cancelledSpeculativeResolutions=\(cancelled.count) activePreserved=true preparedPreserved=true")
     }
 
     private func normalizedVideoID(_ videoID: String) -> String {
@@ -2455,7 +2752,8 @@ final class PlaybackManager: ObservableObject {
 
     private func resolutionTask(
         for videoID: String,
-        source: StreamResolutionSource
+        source: StreamResolutionSource,
+        forceFresh: Bool = false
     ) -> Task<URL, Error> {
         switch source {
         case .dashboardWarmup:
@@ -2474,11 +2772,61 @@ final class PlaybackManager: ObservableObject {
             markStreamAsNonSpeculative(videoID)
         }
 
+        if forceFresh, let existingResolution = inFlightResolutions.removeValue(forKey: videoID) {
+            existingResolution.task.cancel()
+            recoveryLog("cancelled older in-flight resolution videoID=\(videoID)")
+        }
+
         if let existingResolution = inFlightResolutions[videoID] {
+#if DEBUG
+            log("[PlaybackProbe] resolution.join videoID=\(videoID) resolutionID=\(existingResolution.id) source=\(source.rawValue)")
+#endif
             return existingResolution.task
         }
 
         let resolutionID = UUID()
+#if DEBUG
+        if let testStreamURLProvider {
+            let task = Task { @MainActor [weak self] () throws -> URL in
+                guard let self else { throw CancellationError() }
+                defer {
+                    if inFlightResolutions[videoID]?.id == resolutionID {
+                        inFlightResolutions[videoID] = nil
+                    }
+                }
+                let url = try await testStreamURLProvider(videoID)
+                try Task.checkCancellation()
+                let now = Date.now
+                let diagnostics = StreamDiagnostics(
+                    fileExtension: url.pathExtension,
+                    audioBitrate: nil,
+                    itag: nil,
+                    mimeType: "unavailable",
+                    codec: "unavailable",
+                    contentLength: nil,
+                    approximateDuration: nil,
+                    resolvedAt: now,
+                    expiresAt: SignedStreamURLPolicy.expirationDate(in: url),
+                    source: source,
+                    resolutionID: resolutionID
+                )
+                resolvedStreamCache[videoID] = CachedStream(
+                    url: url,
+                    resolvedAt: now,
+                    expiresAt: SignedStreamURLPolicy.expirationDate(in: url),
+                    source: source,
+                    diagnostics: diagnostics
+                )
+                return url
+            }
+            inFlightResolutions[videoID] = InFlightResolution(
+                id: resolutionID,
+                source: source,
+                task: task
+            )
+            return task
+        }
+#endif
         let task = Task { @MainActor [weak self] () throws -> URL in
             guard let self else {
                 throw CancellationError()
@@ -2490,38 +2838,89 @@ final class PlaybackManager: ObservableObject {
                 }
             }
 
-            let streams = try await YouTube(
-                videoID: videoID,
-                methods: [.local],
-                audioOnlyM4AIsSufficient: true
-            ).streams
+            let streams: [YouTubeKit.Stream]
+#if DEBUG
+            let extractionStartedAt = currentTime
+            log("[PlaybackProbe] resolution.start videoID=\(videoID) resolutionID=\(resolutionID) source=\(source.rawValue) method=local")
+#endif
+            do {
+                streams = try await YouTube(
+                    videoID: videoID,
+                    methods: [.local],
+                    audioOnlyM4AIsSufficient: true
+                ).streams
+            } catch {
+#if DEBUG
+                let nsError = error as NSError
+                log("[PlaybackProbe] resolution.fail videoID=\(videoID) resolutionID=\(resolutionID) stage=YouTubeKit.streams category=\(Self.resolutionFailureCategory(error)) domain=\(Self.redactedDiagnosticText(nsError.domain)) code=\(nsError.code) message=\(Self.redactedDiagnosticText(nsError.localizedDescription)) elapsed=\(String(format: "%.3f", currentTime - extractionStartedAt))s cachedURL=false retry=none secondaryFallback=none")
+#endif
+                throw error
+            }
 
             try Task.checkCancellation()
 
             let nativeAudioStreams = streams
                 .filterAudioOnly()
                 .filter(\.isNativelyPlayable)
+#if DEBUG
+            log("[PlaybackProbe] resolution.candidates videoID=\(videoID) resolutionID=\(resolutionID) all=\(streams.count) audioOnly=\(streams.filterAudioOnly().count) nativeAudioOnly=\(nativeAudioStreams.count) nativeM4A=\(nativeAudioStreams.filter { $0.fileExtension == .m4a }.count) elapsed=\(String(format: "%.3f", currentTime - extractionStartedAt))s")
+#endif
             let stream = nativeAudioStreams
                 .filter { $0.fileExtension == .m4a }
                 .highestAudioBitrateStream()
                 ?? nativeAudioStreams.highestAudioBitrateStream()
 
             guard let stream else {
+#if DEBUG
+                log("[PlaybackProbe] resolution.fail videoID=\(videoID) resolutionID=\(resolutionID) stage=Shaudi.selection category=no-native-audio-only-candidate retry=none secondaryFallback=none")
+#endif
                 throw StreamResolutionError.noPlayableStream
             }
 
+#if DEBUG
+            let query = URLComponents(url: stream.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            func numericQuery(_ key: String) -> Int64? {
+                query.first(where: { $0.name == key })?.value.flatMap(Int64.init)
+            }
+            let expiration = numericQuery("expire").map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            let diagnostics = StreamDiagnostics(
+                fileExtension: stream.fileExtension.rawValue,
+                audioBitrate: stream.bitrate ?? stream.averageBitrate,
+                itag: numericQuery("itag").flatMap(Int.init)
+                    ?? stream.url.pathComponents.firstIndex(of: "itag").flatMap { index in
+                        let nextIndex = stream.url.pathComponents.index(after: index)
+                        guard nextIndex < stream.url.pathComponents.endIndex else { return nil }
+                        return Int(stream.url.pathComponents[nextIndex])
+                    },
+                mimeType: stream.mimeType,
+                codec: stream.audioCodec.map { String(describing: $0) } ?? "unavailable",
+                contentLength: numericQuery("clen"),
+                approximateDuration: query.first(where: { $0.name == "dur" })?.value.flatMap(TimeInterval.init),
+                resolvedAt: .now,
+                expiresAt: expiration,
+                source: source,
+                resolutionID: resolutionID
+            )
+#else
             let diagnostics = StreamDiagnostics(
                 fileExtension: stream.fileExtension.rawValue,
                 audioBitrate: stream.bitrate ?? stream.averageBitrate
             )
+#endif
             logSelectedStream(videoID: videoID, diagnostics: diagnostics, source: source)
-            resolvedStreamDiagnostics[videoID] = diagnostics
-            resolvedStreamCache[videoID] = stream.url
+            resolvedStreamCache[videoID] = CachedStream(
+                url: stream.url,
+                resolvedAt: .now,
+                expiresAt: SignedStreamURLPolicy.expirationDate(in: stream.url),
+                source: source,
+                diagnostics: diagnostics
+            )
             return stream.url
         }
 
         inFlightResolutions[videoID] = InFlightResolution(
             id: resolutionID,
+            source: source,
             task: task
         )
         return task
@@ -2556,7 +2955,7 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        if let cachedURL = resolvedStreamCache[videoID] {
+        if let cachedURL = reusableCachedStream(for: videoID)?.url {
             markStreamAsNonSpeculative(videoID)
             log("Pre-resolution cache already available for \(videoID) (\(nextTrack.title))")
             beginPreparingNextItem(
@@ -2655,22 +3054,39 @@ final class PlaybackManager: ObservableObject {
 
         discardPreparedNextPlayback()
 
+        guard let cachedStream = reusableCachedStream(for: videoID), cachedStream.url == streamURL else {
+            recoveryLog("prepared item skipped videoID=\(videoID) reason=cached URL expired or replaced")
+            activePreResolutionID = nil
+            preparedNextVideoID = nil
+            return
+        }
         let preparationStartedAt = currentTime
         let asset = AVURLAsset(url: streamURL)
+#if DEBUG
+        log("[PlaybackProbe] prepared.T1 assetCreated videoID=\(videoID) prepID=\(preparationID) cache=\(streamAgeDescription(for: videoID))")
+#endif
         let item = AVPlayerItem(
             asset: asset,
             automaticallyLoadedAssetKeys: [.isPlayable, .duration]
         )
+#if DEBUG
+        log("[PlaybackProbe] prepared.T2_T4 itemCreated automaticAssetKeys=isPlayable,duration videoID=\(videoID) prepID=\(preparationID) dt=\(String(format: "%.3f", currentTime - preparationStartedAt))s")
+#endif
         let playbackRange = effectivePlaybackRange(for: PlayableTrack(track: track))
         applyEffectiveEndTime(to: item, playbackRange: playbackRange)
 
         let preparationPlayer = AVPlayer(playerItem: item)
+#if DEBUG
+        log("[PlaybackProbe] prepared.T5 playerAssigned videoID=\(videoID) prepID=\(preparationID) dt=\(String(format: "%.3f", currentTime - preparationStartedAt))s")
+#endif
         preparedNextPlayback = PreparedNextPlayback(
             preparationID: preparationID,
             queueIndex: queueIndex,
             track: track,
             videoID: videoID,
             streamURL: streamURL,
+            resolvedAt: cachedStream.resolvedAt,
+            expiresAt: cachedStream.expiresAt,
             item: item,
             player: preparationPlayer,
             playbackRange: playbackRange,
@@ -2772,7 +3188,7 @@ final class PlaybackManager: ObservableObject {
                 let videoID = candidate.videoID
                 let offset = candidateOffset + 2
 
-                if resolvedStreamCache[videoID] != nil {
+                if reusableCachedStream(for: videoID) != nil {
                     markStreamAsNonSpeculative(videoID)
                     log("Lookahead cache hit for \(videoID) at +\(offset)")
                     continue
@@ -2873,6 +3289,9 @@ final class PlaybackManager: ObservableObject {
 
         switch item.status {
         case .readyToPlay:
+#if DEBUG
+            log("[PlaybackProbe] prepared.T3_T6 readyToPlay videoID=\(videoID) prepID=\(preparationID) dt=\(String(format: "%.3f", currentTime - preparedNextPlayback.preparationStartedAt))s itemDuration=\(item.duration.seconds) buffer=\(bufferDescription(for: item))")
+#endif
             beginPrerollingNextItem(
                 preparationPlayer,
                 item: item,
@@ -2881,6 +3300,9 @@ final class PlaybackManager: ObservableObject {
             )
 
         case .failed:
+#if DEBUG
+            log("[PlaybackProbe] prepared.fail videoID=\(videoID) prepID=\(preparationID) dt=\(String(format: "%.3f", currentTime - preparedNextPlayback.preparationStartedAt))s")
+#endif
             handlePreparedNextItemFailure(
                 item,
                 preparationID: preparationID,
@@ -2937,6 +3359,9 @@ final class PlaybackManager: ObservableObject {
             }
 
             let finished = await preparationPlayer.preroll(atRate: 1)
+#if DEBUG
+            log("[PlaybackProbe] prepared.preroll videoID=\(videoID) prepID=\(preparationID) finished=\(finished) elapsed=\(String(format: "%.3f", currentTime - preparedNextPlayback.preparationStartedAt))s")
+#endif
 
             guard
                 !Task.isCancelled,
@@ -2991,7 +3416,7 @@ final class PlaybackManager: ObservableObject {
 
         logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
 
-        if resolvedStreamCache[videoID] == preparedNextPlayback.streamURL {
+        if resolvedStreamCache[videoID]?.url == preparedNextPlayback.streamURL {
             removeCachedStream(for: videoID)
             log("Next-item preparation failed for \(videoID); cached URL evicted")
         } else {
@@ -3061,6 +3486,9 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func discard(_ preparedPlayback: PreparedNextPlayback) {
+#if DEBUG
+        log("[PlaybackProbe] prepared.discard videoID=\(preparedPlayback.videoID) prepID=\(preparedPlayback.preparationID) itemStatus=\(preparedPlayback.item.status.rawValue) wasPrerolled=\(preparedPlayback.readyAt != nil)")
+#endif
         preparedPlayback.player.cancelPendingPrerolls()
         preparedPlayback.player.pause()
         preparedPlayback.player.replaceCurrentItem(with: nil)
@@ -3072,10 +3500,21 @@ final class PlaybackManager: ObservableObject {
         requestID: UUID,
         requestStartedAt: TimeInterval,
         playerPreparationStartedAt: TimeInterval,
-        usedCachedStream: Bool
+        usedCachedStream: Bool,
+        playbackStartTimeOverride: TimeInterval? = nil,
+        shouldPlay: Bool = true
     ) {
+#if DEBUG
+        playbackDiagnostic("T1_T2 assetAndImplicitLoadBegin via AVPlayerItem(url:) cache=\(streamAgeDescription(for: videoID))", requestID: requestID)
+#endif
         let item = AVPlayerItem(url: streamURL)
+#if DEBUG
+        playbackDiagnostic("T4 itemCreated assetType=\(type(of: item.asset))", requestID: requestID)
+#endif
         let player = AVPlayer(playerItem: item)
+#if DEBUG
+        playbackDiagnostic("T5 playerAssigned itemStatus=\(item.status.rawValue)", requestID: requestID)
+#endif
         let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
         startPlayback(
             with: item,
@@ -3086,7 +3525,10 @@ final class PlaybackManager: ObservableObject {
             playerPreparationStartedAt: playerPreparationStartedAt,
             usedCachedStream: usedCachedStream,
             playbackRange: playbackRange,
-            playbackStartTime: pendingTrimPreviewStartTime(for: currentTrack, in: playbackRange)
+            playbackStartTime: playbackStartTimeOverride.map {
+                clampedPlaybackTime($0, to: playbackRange)
+            } ?? pendingTrimPreviewStartTime(for: currentTrack, in: playbackRange),
+            shouldPlay: shouldPlay
         )
     }
 
@@ -3099,7 +3541,8 @@ final class PlaybackManager: ObservableObject {
         playerPreparationStartedAt: TimeInterval,
         usedCachedStream: Bool,
         playbackRange: EffectivePlaybackRange,
-        playbackStartTime: TimeInterval
+        playbackStartTime: TimeInterval,
+        shouldPlay: Bool = true
     ) {
         lifecycleLog("startPlayback with item videoID=\(videoID) requestID=\(requestID) cachedStream=\(usedCachedStream) range=\(playbackRange.startTime)...\(playbackRange.endTime.map { "\($0)s" } ?? "nil")")
 
@@ -3107,11 +3550,13 @@ final class PlaybackManager: ObservableObject {
             return
         }
 
-        do {
-            try activateAudioSession()
-        } catch {
-            state = .failed("The audio session could not start: \(error.localizedDescription)")
-            return
+        if recoveryAttempt?.requestID != requestID {
+            do {
+                try activateAudioSession()
+            } catch {
+                state = .failed("The audio session could not start: \(error.localizedDescription)")
+                return
+            }
         }
 
         let managerReference = WeakReference(self)
@@ -3120,7 +3565,21 @@ final class PlaybackManager: ObservableObject {
 
         applyEffectiveEndTime(to: item, playbackRange: playbackRange)
 
+        activePlaybackStartTime = playbackStartTime
         self.player = player
+        if urlOnlyCachedPlaybackRequestID == requestID {
+            scheduleCachedStartupWatchdog(
+                player: player,
+                item: item,
+                videoID: videoID,
+                requestID: requestID,
+                requestStartedAt: requestStartedAt
+            )
+        }
+#if DEBUG
+        playbackDiagnostic("itemAttached status=\(item.status.rawValue) playerStatus=\(player.status.rawValue) timeControl=\(player.timeControlStatus.rawValue)", requestID: requestID)
+        installPlaybackDiagnostics(on: player, item: item, requestID: requestID)
+#endif
         installPlaybackBoundaryObserver(
             on: player,
             item: item,
@@ -3186,17 +3645,17 @@ final class PlaybackManager: ObservableObject {
                 )
 
                 self.endLog("AVPlayerItemFailedToPlayToEndTime fired for request=\(requestID) error=\(String(describing: errorDesc)) itemCurrentTime=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s isNearEOF=\(isNearEOF) isActive=\(self.isActive(requestID))")
+#if DEBUG
+                self.playbackDiagnosticSnapshot("failedToPlayToEnd", requestID: requestID, item: item, player: self.player)
+                self.logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
+#endif
 
-                if isNearEOF {
-                    self.endLog("Failed-to-end within near-EOF tolerance (\(self.nearEOFTolerance)s) -> routing to natural completion")
-                    self.handlePlaybackCompletion(
-                        for: item,
-                        requestID: requestID,
-                        source: .failedToEnd
-                    )
-                } else {
-                    self.endLog("Failed-to-end not near EOF -> preserving normal failure handling")
-                }
+                self.handleFailedToEnd(
+                    for: item,
+                    requestID: requestID,
+                    position: currentPos,
+                    effectiveEnd: effectiveEnd
+                )
             }
         }
 
@@ -3219,23 +3678,32 @@ final class PlaybackManager: ObservableObject {
                 let currentPos = self.player?.currentTime().seconds ?? -1
                 let timeControl = self.player?.timeControlStatus.rawValue ?? -1
                 self.endLog("AVPlayerItemPlaybackStalled fired for request=\(requestID) itemCurrentTime=\(currentPos)s timeControlStatus=\(timeControl) isActive=\(self.isActive(requestID))")
+#if DEBUG
+                self.playbackDiagnosticSnapshot("playbackStalled", requestID: requestID, item: item, player: self.player)
+                self.logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
+#endif
                 self.handlePlaybackStalled(for: item, requestID: requestID)
             }
         }
 
         itemStatusObservation = item.observe(\.status, options: [.initial, .new]) {
-            [managerReference] _, _ in
+            [managerReference, itemReference] _, _ in
             Task { @MainActor in
                 guard
                     let self = managerReference.value,
                     self.isActive(requestID),
-                    let item = self.player?.currentItem
+                    let item = itemReference.value,
+                    self.player?.currentItem === item
                 else {
                     return
                 }
 
                 switch item.status {
                 case .readyToPlay:
+#if DEBUG
+                    self.playbackDiagnostic("T3_T6 assetPropertiesReadyAndItemReady itemDuration=\(item.duration.seconds)", requestID: requestID)
+                    self.playbackDiagnosticSnapshot("readyToPlay", requestID: requestID, item: item, player: self.player)
+#endif
                     self.lifecycleLog("itemStatus readyToPlay for \(videoID) requestID=\(requestID)")
                     self.logDurationDiagnostics(
                         for: item,
@@ -3258,6 +3726,9 @@ final class PlaybackManager: ObservableObject {
 #endif
 
                 case .failed:
+#if DEBUG
+                    self.playbackDiagnosticSnapshot("itemFailed", requestID: requestID, item: item, player: self.player)
+#endif
                     self.lifecycleLog("itemStatus failed for \(videoID) error=\(String(describing: item.error?.localizedDescription)) requestID=\(requestID)")
                     self.handlePlayerFailure(
                         item,
@@ -3277,13 +3748,15 @@ final class PlaybackManager: ObservableObject {
             }
         }
 
+        let playerReference = WeakReference(player)
         timeControlStatusObservation = player.observe(\.timeControlStatus, options: [.new]) {
-            [managerReference] _, _ in
+            [managerReference, playerReference] _, _ in
             Task { @MainActor in
                 guard
                     let self = managerReference.value,
                     self.isActive(requestID),
-                    let player = self.player
+                    let player = playerReference.value,
+                    self.player === player
                 else {
                     return
                 }
@@ -3296,6 +3769,13 @@ final class PlaybackManager: ObservableObject {
                 @unknown default: statusName = "unknown"
                 }
                 self.lifecycleLog("timeControlStatus=\(statusName) rate=\(player.rate) videoID=\(videoID) requestID=\(requestID)")
+#if DEBUG
+                self.playbackDiagnosticSnapshot("timeControl.\(statusName)", requestID: requestID, item: player.currentItem, player: player)
+                if player.timeControlStatus == .playing {
+                    self.playbackTrace?.playingAt = self.currentTime
+                    self.playbackDiagnostic("T8 playing", requestID: requestID)
+                }
+#endif
 
 #if os(iOS)
                 self.synchronizeNowPlayingPlaybackState()
@@ -3314,6 +3794,15 @@ final class PlaybackManager: ObservableObject {
                     return
                 }
 
+                self.startupWatchdogTask?.cancel()
+                self.startupWatchdogTask = nil
+                self.midTrackStallTask?.cancel()
+                self.midTrackStallTask = nil
+                self.urlOnlyCachedPlaybackRequestID = nil
+                if let attempt = self.recoveryAttempt, attempt.requestID == requestID {
+                    self.recoveryLog("recovery succeeded requestID=\(requestID) videoID=\(videoID) kind=\(attempt.kind.rawValue)")
+                    self.recoveryAttempt = nil
+                }
                 self.cancelPendingCompletionFallbacks(reason: "player resumed playing")
                 self.state = .playing
                 guard !self.isTrimPreviewActive else {
@@ -3345,16 +3834,25 @@ final class PlaybackManager: ObservableObject {
         beginPlayback(
             player,
             at: playbackStartTime,
-            requestID: requestID
+            requestID: requestID,
+            shouldPlay: shouldPlay
         )
     }
 
     private func beginPlayback(
         _ player: AVPlayer,
         at startTime: TimeInterval,
-        requestID: UUID
+        requestID: UUID,
+        shouldPlay: Bool = true
     ) {
         guard startTime > 0 else {
+            guard shouldPlay, !isAudioInterrupted, state != .paused else {
+                state = .paused
+                return
+            }
+#if DEBUG
+            playbackDiagnosticPlayRequested(player, requestID: requestID)
+#endif
             player.play()
 #if os(iOS)
             synchronizeNowPlayingPlaybackState()
@@ -3364,6 +3862,13 @@ final class PlaybackManager: ObservableObject {
 
         let currentTime = player.currentTime().seconds
         if currentTime.isFinite, abs(currentTime - startTime) < 0.05 {
+            guard shouldPlay, !isAudioInterrupted, state != .paused else {
+                state = .paused
+                return
+            }
+#if DEBUG
+            playbackDiagnosticPlayRequested(player, requestID: requestID)
+#endif
             player.play()
 #if os(iOS)
             synchronizeNowPlayingPlaybackState()
@@ -3376,7 +3881,13 @@ final class PlaybackManager: ObservableObject {
                 return
             }
 
+#if DEBUG
+            playbackDiagnostic("startup.seekBegin target=\(startTime)s", requestID: requestID)
+#endif
             let finished = await seekPlayer(player, to: startTime)
+#if DEBUG
+            playbackDiagnostic("startup.seekEnd target=\(startTime)s finished=\(finished)", requestID: requestID)
+#endif
             guard
                 finished,
                 isActive(requestID),
@@ -3385,8 +3896,16 @@ final class PlaybackManager: ObservableObject {
                 return
             }
 
+            guard shouldPlay, !isAudioInterrupted, state != .paused else {
+                state = .paused
+                return
+            }
+
 #if os(iOS)
             synchronizeNowPlayingPlaybackState()
+#endif
+#if DEBUG
+            playbackDiagnosticPlayRequested(player, requestID: requestID)
 #endif
             player.play()
 #if os(iOS)
@@ -3407,6 +3926,138 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
+    // Only URL-only cache hits get this seven-second watchdog. Normal starts are
+    // generally under a second; seven seconds leaves room for cellular buffering
+    // while cutting off the observed 15–24 second bad-cache starts.
+    private func scheduleCachedStartupWatchdog(
+        player: AVPlayer,
+        item: AVPlayerItem,
+        videoID: String,
+        requestID: UUID,
+        requestStartedAt: TimeInterval
+    ) {
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = Task { @MainActor [weak self] in
+#if DEBUG
+            let delay = self?.testStartupWatchdogDelay ?? 7
+#else
+            let delay: TimeInterval = 7
+#endif
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled,
+                  isActive(requestID),
+                  self.player === player,
+                  player.currentItem === item,
+                  urlOnlyCachedPlaybackRequestID == requestID,
+                  retriedPlaybackRequestID != requestID,
+                  player.timeControlStatus != .playing,
+                  item.status != .failed,
+                  !isAudioInterrupted,
+                  state != .paused
+            else { return }
+
+            recoveryLog("cached startup timeout requestID=\(requestID) videoID=\(videoID) elapsed=\(String(format: "%.1f", currentTime - requestStartedAt))s itemStatus=\(item.status.rawValue) timeControl=\(player.timeControlStatus.rawValue)")
+            _ = beginPlaybackRecovery(for: item, requestID: requestID, kind: .cachedStartup)
+        }
+    }
+
+    private func scheduleMidTrackStallRecovery(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        stalledAt: TimeInterval
+    ) {
+        midTrackStallTask?.cancel()
+        guard let stalledPlayer = player else { return }
+        midTrackStallTask = Task { @MainActor [weak self] in
+#if DEBUG
+            let delay = self?.testStallRecoveryDelay ?? 3
+#else
+            let delay: TimeInterval = 3
+#endif
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled,
+                  isActive(requestID),
+                  self.player === stalledPlayer,
+                  stalledPlayer.currentItem === item,
+                  !isAudioInterrupted,
+                  state != .paused,
+                  stalledPlayer.currentTime().seconds <= stalledAt + 0.5
+            else { return }
+            if !beginPlaybackRecovery(for: item, requestID: requestID, kind: .midTrackStall),
+               retriedPlaybackRequestID == requestID {
+                failExhaustedPlaybackRecovery(requestID: requestID, reason: "playback stalled again")
+            }
+        }
+    }
+
+    @discardableResult
+    private func beginPlaybackRecovery(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        kind: RecoveryKind,
+        positionOverride: TimeInterval? = nil
+    ) -> Bool {
+        guard isActive(requestID),
+              let currentPlayer = player,
+              currentPlayer.currentItem === item,
+              let videoID = currentPlayableTrack?.youtubeVideoID,
+              retriedPlaybackRequestID != requestID,
+              !isAudioInterrupted,
+              completedPlaybackRequestID != requestID
+        else { return false }
+
+        let playbackRange = effectivePlaybackRange(for: currentPlayableTrack)
+        let position = positionOverride ?? currentPlayer.currentTime().seconds
+        let resumeAt = clampedPlaybackTime(
+            position.isFinite && position >= 0 ? position : activePlaybackStartTime,
+            to: playbackRange
+        )
+        if kind != .cachedStartup,
+           isNearEffectivePlaybackEnd(position: resumeAt, effectiveEndTime: playbackRange.endTime) {
+            return false
+        }
+        let shouldPlay = kind == .cachedStartup
+            || state == .playing
+            || currentPlayer.rate > 0
+            || currentPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate
+
+        retriedPlaybackRequestID = requestID
+        let retryPosition = kind == .cachedStartup ? activePlaybackStartTime : resumeAt
+        recoveryAttempt = RecoveryAttempt(
+            requestID: requestID,
+            kind: kind,
+            resumeAt: retryPosition,
+            shouldPlay: shouldPlay
+        )
+        recoveryLog("\(kind == .cachedStartup ? "cached startup recovery" : "midtrack recovery") requestID=\(requestID) videoID=\(videoID) kind=\(kind.rawValue) resumeAt=\(String(format: "%.2f", retryPosition))s shouldPlay=\(shouldPlay)")
+        removeCachedStream(for: videoID)
+        recoveryLog("evicted cached URL requestID=\(requestID) videoID=\(videoID) reason=\(kind.rawValue)")
+        urlOnlyCachedPlaybackRequestID = nil
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
+        midTrackStallTask?.cancel()
+        midTrackStallTask = nil
+        clearPlayer(forRecovery: true)
+        if kind == .cachedStartup {
+            updateMetrics { metrics in
+                metrics.streamSource = "Fresh resolution after cached URL failure"
+                metrics.streamResolutionTime = nil
+                metrics.playerStartTime = nil
+                metrics.totalStartTime = nil
+            }
+        }
+        recoveryLog("fresh retry started requestID=\(requestID) videoID=\(videoID)")
+        resolveAndStartPlayback(
+            videoID: videoID,
+            requestID: requestID,
+            requestStartedAt: activeRequestStartedAt,
+            forceFreshResolution: true,
+            retryStartTime: retryPosition,
+            shouldPlay: shouldPlay
+        )
+        return true
+    }
+
     private func handlePlayerFailure(
         _ item: AVPlayerItem,
         videoID: String,
@@ -3419,33 +4070,47 @@ final class PlaybackManager: ObservableObject {
         }
 
         let error = item.error
+#if DEBUG
+        playbackDiagnosticSnapshot("playerFailure cached=\(usedCachedStream)", requestID: requestID, item: item, player: player)
+#endif
         logPlayerItemFailureDiagnostics(for: item, videoID: videoID)
 
         let failedDuringPreparation = startupMetrics?.totalStartTime == nil
+        if usedCachedStream && failedDuringPreparation,
+           beginPlaybackRecovery(for: item, requestID: requestID, kind: .cachedStartup) {
+            return
+        }
+        if !failedDuringPreparation,
+           beginPlaybackRecovery(for: item, requestID: requestID, kind: .midTrackItemFailed) {
+            return
+        }
+
+        if recoveryAttempt?.requestID == requestID {
+            recoveryLog("recovery failed requestID=\(requestID) videoID=\(videoID) stage=playerItem")
+            recoveryAttempt = nil
+        }
         removeCachedStream(for: videoID)
         cancelUpcomingPreResolutionObservation()
         clearPlayer()
-
-        if usedCachedStream && failedDuringPreparation {
-            log("Cached stream failed during preparation for \(videoID); evicting and resolving once")
-            updateMetrics { metrics in
-                metrics.streamSource = "Fresh resolution after cached URL failure"
-                metrics.streamResolutionTime = nil
-                metrics.playerStartTime = nil
-                metrics.totalStartTime = nil
-            }
-            resolveAndStartPlayback(
-                videoID: videoID,
-                requestID: requestID,
-                requestStartedAt: requestStartedAt
-            )
-            return
-        }
 
         state = .failed(
             "AVPlayer could not play the resolved stream: "
                 + (error?.localizedDescription ?? "Unknown playback error.")
         )
+#if os(iOS)
+        synchronizeNowPlayingPlaybackState()
+#endif
+    }
+
+    private func failExhaustedPlaybackRecovery(requestID: UUID, reason: String) {
+        guard isActive(requestID), retriedPlaybackRequestID == requestID else { return }
+        let videoID = currentPlayableTrack?.youtubeVideoID ?? "unknown"
+        recoveryLog("recovery failed requestID=\(requestID) videoID=\(videoID) reason=\(reason)")
+        removeCachedStream(for: videoID)
+        cancelUpcomingPreResolutionObservation()
+        clearPlayer()
+        recoveryAttempt = nil
+        state = .failed("Playback stopped because the audio stream failed again.")
 #if os(iOS)
         synchronizeNowPlayingPlaybackState()
 #endif
@@ -4029,7 +4694,12 @@ final class PlaybackManager: ObservableObject {
         endLog("AVPlayerItemPlaybackStalled: request=\(requestID) currentPos=\(currentPos)s effectiveEnd=\(String(describing: effectiveEnd))s isNearEOF=\(isNearEOF)")
 
         guard isNearEOF else {
-            endLog("Playback stall not near EOF; waiting for normal buffering recovery")
+            endLog("Playback stall not near EOF; allowing brief buffering recovery")
+            scheduleMidTrackStallRecovery(
+                for: item,
+                requestID: requestID,
+                stalledAt: currentPos
+            )
             return
         }
 
@@ -4051,6 +4721,32 @@ final class PlaybackManager: ObservableObject {
                 requestID: requestID,
                 source: .stalledFallback
             )
+        }
+    }
+
+    private func handleFailedToEnd(
+        for item: AVPlayerItem,
+        requestID: UUID,
+        position: TimeInterval,
+        effectiveEnd: TimeInterval?
+    ) {
+        if isNearEffectivePlaybackEnd(
+            position: position,
+            effectiveEndTime: effectiveEnd,
+            tolerance: nearEOFTolerance
+        ) {
+            endLog("Failed-to-end within near-EOF tolerance -> natural completion")
+            handlePlaybackCompletion(for: item, requestID: requestID, source: .failedToEnd)
+        } else {
+            endLog("Failed-to-end away from EOF -> bounded recovery")
+            if !beginPlaybackRecovery(
+                for: item,
+                requestID: requestID,
+                kind: .midTrackFailedToEnd,
+                positionOverride: position
+            ), retriedPlaybackRequestID == requestID {
+                failExhaustedPlaybackRecovery(requestID: requestID, reason: "failed to play to end again")
+            }
         }
     }
 
@@ -4380,9 +5076,177 @@ final class PlaybackManager: ObservableObject {
         log(
             "Selected audio stream for \(videoID): "
                 + "source=\(source.rawValue), "
-                + "itag=unavailable, "
+                + "itag=\(diagnostics?.itag.map(String.init) ?? "unavailable"), "
                 + "fileExtension=\(fileExtension), "
-                + "audioBitrate=\(audioBitrate)"
+                + "mime=\(diagnostics?.mimeType ?? "unavailable"), "
+                + "codec=\(diagnostics?.codec ?? "unavailable"), "
+                + "audioBitrate=\(audioBitrate), "
+                + "contentLength=\(diagnostics?.contentLength.map(String.init) ?? "unavailable"), "
+                + "urlDuration=\(diagnostics?.approximateDuration.map { String(format: "%.3f", $0) } ?? "unavailable"), "
+                + "urlExpiryRemaining=\(diagnostics?.expiresAt.map { String(format: "%.0f", $0.timeIntervalSinceNow) } ?? "unavailable")s"
+        )
+    }
+
+    private func streamAgeDescription(for videoID: String) -> String {
+        guard let cachedStream = resolvedStreamCache[videoID] else {
+            return "metadata-unavailable"
+        }
+        let diagnostics = cachedStream.diagnostics
+        let age = Date.now.timeIntervalSince(cachedStream.resolvedAt)
+        let expiry = cachedStream.expiresAt.map {
+            String(format: "%.0f", $0.timeIntervalSinceNow)
+        } ?? "unavailable"
+        return "source=\(diagnostics.source.rawValue) originResolutionID=\(diagnostics.resolutionID) age=\(String(format: "%.1f", age))s expiresIn=\(expiry)s itag=\(diagnostics.itag.map(String.init) ?? "unavailable")"
+    }
+
+    private func playbackDiagnosticURLAvailable(
+        _ url: URL,
+        videoID: String,
+        requestID: UUID,
+        source: String
+    ) {
+        guard playbackTrace?.requestID == requestID else { return }
+        playbackTrace?.urlAvailableAt = currentTime
+        let expiry = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "expire" })?.value
+            .flatMap(TimeInterval.init)
+            .map { String(format: "%.0f", $0 - Date.now.timeIntervalSince1970) } ?? "unavailable"
+        playbackDiagnostic(
+            "T0 urlAvailable source=\(source) host=\(url.host ?? "unavailable") "
+                + "expiresIn=\(expiry)s \(streamAgeDescription(for: videoID))",
+            requestID: requestID
+        )
+    }
+
+    private func playbackDiagnostic(_ event: String, requestID: UUID) {
+        guard let trace = playbackTrace, trace.requestID == requestID else { return }
+        print("[PlaybackProbe] requestID=\(requestID) videoID=\(trace.videoID) +\(String(format: "%.3f", currentTime - trace.startedAt))s \(event)")
+    }
+
+    private func playbackDiagnosticPlayRequested(_ player: AVPlayer, requestID: UUID) {
+        guard playbackTrace?.requestID == requestID else { return }
+        playbackTrace?.playRequestedAt = currentTime
+        playbackTrace?.playPosition = player.currentTime().seconds
+        playbackDiagnostic("T7 playRequested position=\(player.currentTime().seconds)s status=\(player.timeControlStatus.rawValue)", requestID: requestID)
+    }
+
+    private func bufferDescription(for item: AVPlayerItem) -> String {
+        let ranges = item.loadedTimeRanges.compactMap { value -> String? in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = range.end.seconds
+            guard start.isFinite, end.isFinite else { return nil }
+            return String(format: "%.2f..%.2f", start, end)
+        }
+        return "likely=\(item.isPlaybackLikelyToKeepUp) empty=\(item.isPlaybackBufferEmpty) full=\(item.isPlaybackBufferFull) loaded=[\(ranges.joined(separator: ","))]"
+    }
+
+    private func playbackDiagnosticSnapshot(
+        _ event: String,
+        requestID: UUID,
+        item: AVPlayerItem?,
+        player: AVPlayer?
+    ) {
+        guard let item, let player else { return }
+        let error = item.error as NSError?
+        let end = item.forwardPlaybackEndTime.seconds
+        let transport = "itemStatus=\(item.status.rawValue) playerStatus=\(player.status.rawValue) "
+            + "timeControl=\(player.timeControlStatus.rawValue) rate=\(player.rate) "
+            + "waiting=\(player.reasonForWaitingToPlay?.rawValue ?? "none")"
+        let timing = "position=\(player.currentTime().seconds)s itemDuration=\(item.duration.seconds)s "
+            + "trackDuration=\(currentPlayableTrack?.duration.map { String($0) } ?? "unavailable")s "
+            + "forwardEnd=\(end.isFinite ? String(end) : "nonfinite")s"
+        let failure = "errorDomain=\(error.map { Self.redactedDiagnosticText($0.domain) } ?? "none") "
+            + "errorCode=\(error?.code ?? 0)"
+        let access: String
+        if let event = item.accessLog()?.events.last {
+            access = "observedBitrate=\(event.observedBitrate) indicatedBitrate=\(event.indicatedBitrate) "
+                + "stalls=\(event.numberOfStalls) transferDuration=\(event.transferDuration)s "
+                + "serverAddressChanges=\(event.numberOfServerAddressChanges)"
+        } else {
+            access = "accessLog=none"
+        }
+        playbackDiagnostic(
+            "snapshot event=\(event) network=\(diagnosticNetworkPath) \(timing) \(transport) \(bufferDescription(for: item)) \(access) \(failure)",
+            requestID: requestID
+        )
+    }
+
+    private func installPlaybackDiagnostics(
+        on player: AVPlayer,
+        item: AVPlayerItem,
+        requestID: UUID
+    ) {
+        let managerReference = WeakReference(self)
+        let itemReference = WeakReference(item)
+        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let token = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+            Task { @MainActor in
+                guard let self = managerReference.value,
+                      let item = itemReference.value,
+                      self.isActive(requestID),
+                      self.player === player,
+                      player.currentItem === item else { return }
+                let now = self.currentTime
+                if var trace = self.playbackTrace, trace.requestID == requestID {
+                    if trace.firstAdvanceAt == nil,
+                       let startPosition = trace.playPosition,
+                       time.seconds.isFinite,
+                       time.seconds > startPosition + 0.05 {
+                        trace.firstAdvanceAt = now
+                        self.playbackTrace = trace
+                        self.playbackDiagnostic(
+                            "T9 firstTimeAdvance position=\(time.seconds)s "
+                                + "afterT7=\(trace.playRequestedAt.map { String(format: "%.3f", now - $0) } ?? "unavailable")s "
+                                + "afterT8=\(trace.playingAt.map { String(format: "%.3f", now - $0) } ?? "unavailable")s",
+                            requestID: requestID
+                        )
+                        self.playbackDiagnosticSnapshot("firstAdvance", requestID: requestID, item: item, player: player)
+                    } else if now - trace.lastSnapshotAt >= 2 {
+                        trace.lastSnapshotAt = now
+                        self.playbackTrace = trace
+                        self.playbackDiagnosticSnapshot("periodic", requestID: requestID, item: item, player: player)
+                    }
+                }
+            }
+        }
+        playbackDiagnosticTimeObserver = (player, token)
+
+        for name in [Notification.Name.AVPlayerItemNewErrorLogEntry, .AVPlayerItemNewAccessLogEntry] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: item, queue: .main) { _ in
+                Task { @MainActor in
+                    guard let self = managerReference.value,
+                          let item = itemReference.value,
+                          self.isActive(requestID),
+                          self.player?.currentItem === item else { return }
+                    self.playbackDiagnosticSnapshot(
+                        name == .AVPlayerItemNewErrorLogEntry ? "newErrorLog" : "newAccessLog",
+                        requestID: requestID,
+                        item: item,
+                        player: self.player
+                    )
+                    self.logPlayerItemAccessDiagnostics(for: item, requestID: requestID)
+                    if name == .AVPlayerItemNewErrorLogEntry {
+                        self.logPlayerItemFailureDiagnostics(for: item, videoID: self.currentPlayableTrack?.youtubeVideoID ?? "unavailable")
+                    }
+                }
+            }
+            playbackDiagnosticLogObservers.append(observer)
+        }
+    }
+
+    private func logPlayerItemAccessDiagnostics(for item: AVPlayerItem, requestID: UUID) {
+        guard let event = item.accessLog()?.events.last else {
+            playbackDiagnostic("accessLog events=none", requestID: requestID)
+            return
+        }
+        playbackDiagnostic(
+            "accessLog events=\(item.accessLog()?.events.count ?? 0) "
+                + "observedBitrate=\(event.observedBitrate) indicatedBitrate=\(event.indicatedBitrate) "
+                + "stalls=\(event.numberOfStalls) transferDuration=\(event.transferDuration)s "
+                + "serverAddressChanges=\(event.numberOfServerAddressChanges) "
+                + "playbackStartDate=\(event.playbackStartDate.map(String.init(describing:)) ?? "unavailable")",
+            requestID: requestID
         )
     }
 
@@ -5358,7 +6222,9 @@ final class PlaybackManager: ObservableObject {
         switch type {
         case .began:
             cancelPendingCompletionFallbacks(reason: "audio interrupted")
-            let wasPlaying = (state == .playing) || (player?.timeControlStatus == .playing)
+            let wasPlaying = (state == .playing)
+                || (player?.timeControlStatus == .playing)
+                || (recoveryAttempt?.shouldPlay == true)
             let rate = player?.rate ?? 0
             let timeControl = player?.timeControlStatus.rawValue ?? -1
             let currentVideo = currentPlayableTrack?.youtubeVideoID ?? "none"
@@ -5393,8 +6259,7 @@ final class PlaybackManager: ObservableObject {
                 context.wasPlaying,
                 shouldResume,
                 let activeRequestID,
-                context.requestID == activeRequestID,
-                let player
+                context.requestID == activeRequestID
             else {
                 interruptionLog("Interruption ended without auto-resume (shouldResume=\(shouldResume), context=\(String(describing: activeInterruptionContext)), activeRequestID=\(String(describing: activeRequestID)))")
                 activeInterruptionContext = nil
@@ -5402,6 +6267,23 @@ final class PlaybackManager: ObservableObject {
             }
 
             activeInterruptionContext = nil
+
+            if player == nil, recoveryAttempt?.requestID == activeRequestID {
+                do {
+                    try activateAudioSession()
+                    state = .resolving
+                    interruptionLog("Audio session reactivated while playback recovery resolves")
+                } catch {
+                    playbackTask?.cancel()
+                    playbackTask = nil
+                    recoveryAttempt = nil
+                    clearPlayer()
+                    state = .failed("The audio session could not resume: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            guard let player else { return }
 
             if let currentItem = player.currentItem, currentItem.status == .failed {
                 interruptionLog("Cannot resume: existing playerItem failed with error: \(String(describing: currentItem.error?.localizedDescription))")
@@ -5428,6 +6310,12 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func invalidateCurrentRequest() {
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
+        midTrackStallTask?.cancel()
+        midTrackStallTask = nil
+        recoveryAttempt = nil
+        urlOnlyCachedPlaybackRequestID = nil
         activeRequestID = nil
         activeInterruptionContext = nil
         completedPlaybackRequestID = nil
@@ -5437,19 +6325,25 @@ final class PlaybackManager: ObservableObject {
         playbackTask = nil
     }
 
-    private func clearPlayer() {
+    private func clearPlayer(forRecovery: Bool = false) {
         lifecycleLog("clearPlayer called: activeRequestID=\(String(describing: activeRequestID)), hadPlayer=\(player != nil)")
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
+        midTrackStallTask?.cancel()
+        midTrackStallTask = nil
         cancelPendingCompletionFallbacks(reason: "player cleared")
         completedPlaybackRequestID = nil
-        temporaryValidatedUIDuration = nil
+        if !forRecovery { temporaryValidatedUIDuration = nil }
         finishActiveListeningPeriod()
-        if listeningHistoryRecorder?.finalize(
-            requestID: activeRequestID,
-            outcome: pendingListeningHistoryOutcome
-        ) == true {
-            personalizationProfileNeedsRefresh = true
+        if !forRecovery {
+            if listeningHistoryRecorder?.finalize(
+                requestID: activeRequestID,
+                outcome: pendingListeningHistoryOutcome
+            ) == true {
+                personalizationProfileNeedsRefresh = true
+            }
+            pendingListeningHistoryOutcome = nil
         }
-        pendingListeningHistoryOutcome = nil
         removeTrimPreviewTimeObserver()
         removeListeningCheckpointObserver()
 
@@ -5468,6 +6362,16 @@ final class PlaybackManager: ObservableObject {
 
         itemStatusObservation = nil
         timeControlStatusObservation = nil
+#if DEBUG
+        if let playbackDiagnosticTimeObserver {
+            playbackDiagnosticTimeObserver.player.removeTimeObserver(playbackDiagnosticTimeObserver.token)
+            self.playbackDiagnosticTimeObserver = nil
+        }
+        for observer in playbackDiagnosticLogObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        playbackDiagnosticLogObservers.removeAll()
+#endif
 
         if let playbackBoundaryObserver {
             player?.removeTimeObserver(playbackBoundaryObserver)
@@ -5560,27 +6464,31 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func log(_ message: String) {
-        print("[Playback] \(message)")
+        print("[Playback] \(Self.redactedDiagnosticText(message))")
     }
 
     private func lifecycleLog(_ message: String) {
-        print("[PlaybackLifecycle] \(message)")
+        print("[PlaybackLifecycle] \(Self.redactedDiagnosticText(message))")
     }
 
     private func endLog(_ message: String) {
-        print("[PlaybackEnd] \(message)")
+        print("[PlaybackEnd] \(Self.redactedDiagnosticText(message))")
     }
 
     private func timingLog(_ message: String) {
-        print("[PlaybackTiming] \(message)")
+        print("[PlaybackTiming] \(Self.redactedDiagnosticText(message))")
     }
 
     private func advanceLog(_ message: String) {
-        print("[PlaybackAdvance] \(message)")
+        print("[PlaybackAdvance] \(Self.redactedDiagnosticText(message))")
     }
 
     private func interruptionLog(_ message: String) {
-        print("[AudioInterruption] \(message)")
+        print("[AudioInterruption] \(Self.redactedDiagnosticText(message))")
+    }
+
+    private func recoveryLog(_ message: String) {
+        print("[PlaybackRecovery] \(Self.redactedDiagnosticText(message))")
     }
 #else
     private func logTiming(_ label: String, seconds: TimeInterval, videoID: String) {}
@@ -5590,9 +6498,33 @@ final class PlaybackManager: ObservableObject {
     private func timingLog(_ message: String) {}
     private func advanceLog(_ message: String) {}
     private func interruptionLog(_ message: String) {}
+    private func recoveryLog(_ message: String) {}
 #endif
 
 #if os(iOS)
+    private func configureNetworkPathMonitoring() {
+        let monitor = NWPathMonitor()
+        let managerReference = WeakReference(self)
+        monitor.pathUpdateHandler = { path in
+            let route: PlaybackNetworkRoute
+            if path.status != .satisfied {
+                route = .unavailable
+            } else if path.usesInterfaceType(.wifi) {
+                route = .wifi
+            } else if path.usesInterfaceType(.cellular) {
+                route = .cellular
+            } else {
+                route = .other
+            }
+            let description = "\(route) expensive=\(path.isExpensive) constrained=\(path.isConstrained)"
+            Task { @MainActor in
+                managerReference.value?.handleNetworkRouteChange(to: route, description: description)
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "Shaudi.Playback.Network"))
+        playbackNetworkMonitor = monitor
+    }
+
     private func configureAudioSessionDiagnostics() {
         let center = NotificationCenter.default
         let managerRef = WeakReference(self)
@@ -5675,6 +6607,171 @@ final class PlaybackManager: ObservableObject {
 
 #if DEBUG
     /// Seed internal queue state for unit tests only. Does NOT start playback.
+    func seedSignedStreamForTesting(
+        videoID: String,
+        url: URL,
+        resolvedAt: Date = .now,
+        speculative: Bool = false
+    ) {
+        let source: StreamResolutionSource = speculative ? .lookahead : .foreground
+        let expiresAt = SignedStreamURLPolicy.expirationDate(in: url)
+        let diagnostics = StreamDiagnostics(
+            fileExtension: url.pathExtension,
+            audioBitrate: nil,
+            itag: nil,
+            mimeType: "unavailable",
+            codec: "unavailable",
+            contentLength: nil,
+            approximateDuration: nil,
+            resolvedAt: resolvedAt,
+            expiresAt: expiresAt,
+            source: source,
+            resolutionID: UUID()
+        )
+        resolvedStreamCache[videoID] = CachedStream(
+            url: url,
+            resolvedAt: resolvedAt,
+            expiresAt: expiresAt,
+            source: source,
+            diagnostics: diagnostics
+        )
+    }
+
+    func cachedStreamURLForTesting(_ videoID: String) -> URL? {
+        reusableCachedStream(for: videoID)?.url
+    }
+
+    func configureRecoveryForTesting(
+        requestID: UUID,
+        origin: PlaybackOrigin,
+        cachedURLOnly: Bool,
+        hasStarted: Bool,
+        startTime: TimeInterval = 0
+    ) {
+        playbackOrigin = origin
+        activeRequestID = requestID
+        activeRequestStartedAt = currentTime
+        activePlaybackStartTime = startTime
+        urlOnlyCachedPlaybackRequestID = cachedURLOnly ? requestID : nil
+        startupMetrics = StartupMetrics(
+            videoID: currentPlayableTrack?.youtubeVideoID ?? "",
+            streamSource: cachedURLOnly ? "In-memory cache" : "Fresh YouTubeKit resolution",
+            totalStartTime: hasStarted ? 0.5 : nil
+        )
+    }
+
+    func beginRecoveryForTesting(
+        item: AVPlayerItem,
+        requestID: UUID,
+        midTrack: Bool,
+        currentPosition: TimeInterval? = nil
+    ) -> Bool {
+        beginPlaybackRecovery(
+            for: item,
+            requestID: requestID,
+            kind: midTrack ? .midTrackItemFailed : .cachedStartup,
+            positionOverride: currentPosition
+        )
+    }
+
+    func triggerStallRecoveryForTesting(item: AVPlayerItem, requestID: UUID) {
+        handlePlaybackStalled(for: item, requestID: requestID)
+    }
+
+    func triggerFailedToEndRecoveryForTesting(
+        item: AVPlayerItem,
+        requestID: UUID,
+        position: TimeInterval,
+        effectiveEnd: TimeInterval?
+    ) {
+        handleFailedToEnd(
+            for: item,
+            requestID: requestID,
+            position: position,
+            effectiveEnd: effectiveEnd
+        )
+    }
+
+    func applyCurrentEndTimeForTesting(to item: AVPlayerItem) {
+        applyEffectiveEndTime(to: item, playbackRange: effectivePlaybackRange(for: currentPlayableTrack))
+    }
+
+    func seedPreparedNextForTesting(track: Track, queueIndex: Int, url: URL) -> (AVPlayer, AVPlayerItem) {
+        let preparationID = UUID()
+        let item = AVPlayerItem(url: url)
+        let preparedPlayer = AVPlayer(playerItem: item)
+        let range = effectivePlaybackRange(for: PlayableTrack(track: track))
+        applyEffectiveEndTime(to: item, playbackRange: range)
+        preparedNextPlayback = PreparedNextPlayback(
+            preparationID: preparationID,
+            queueIndex: queueIndex,
+            track: track,
+            videoID: track.youtubeVideoID,
+            streamURL: url,
+            resolvedAt: .now,
+            expiresAt: SignedStreamURLPolicy.expirationDate(in: url),
+            item: item,
+            player: preparedPlayer,
+            playbackRange: range,
+            preparationStartedAt: currentTime,
+            readyAt: currentTime
+        )
+        activePreResolutionID = preparationID
+        preparedNextVideoID = track.youtubeVideoID
+        return (preparedPlayer, item)
+    }
+
+    func takePreparedNextForTesting(queueIndex: Int, track: Track) -> (AVPlayer, AVPlayerItem)? {
+        guard let prepared = takePreparedNextPlayback(
+            queueIndex: queueIndex,
+            track: track,
+            videoID: track.youtubeVideoID
+        ) else { return nil }
+        return (prepared.player, prepared.item)
+    }
+
+    func startCachedWatchdogForTesting(item: AVPlayerItem, requestID: UUID) {
+        guard let player, let videoID = currentPlayableTrack?.youtubeVideoID else { return }
+        scheduleCachedStartupWatchdog(
+            player: player,
+            item: item,
+            videoID: videoID,
+            requestID: requestID,
+            requestStartedAt: activeRequestStartedAt
+        )
+    }
+
+    func cancelCurrentRequestForTesting() {
+        invalidateCurrentRequest()
+    }
+
+    func cancelCachedWatchdogForTesting() {
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
+        urlOnlyCachedPlaybackRequestID = nil
+    }
+
+    func confirmListeningHistoryForTesting(player: AVPlayer, requestID: UUID) {
+        recordListeningHistoryStartIfNeeded(player: player, requestID: requestID)
+    }
+
+    func changeNetworkRouteForTesting(to route: PlaybackNetworkRoute) {
+        handleNetworkRouteChange(to: route, description: "test")
+    }
+
+    func protectPreparedVideoForTesting(_ videoID: String) {
+        preparedNextVideoID = videoID
+    }
+
+    var recoveryAttemptForTesting: (requestID: UUID, kind: String, resumeAt: TimeInterval, shouldPlay: Bool)? {
+        guard let attempt = recoveryAttempt else { return nil }
+        return (attempt.requestID, attempt.kind.rawValue, attempt.resumeAt, attempt.shouldPlay)
+    }
+
+    var retriedRequestIDForTesting: UUID? { retriedPlaybackRequestID }
+    var playbackOriginForTesting: PlaybackOrigin? { playbackOrigin }
+    var currentPlayerForTesting: AVPlayer? { player }
+
     func seedQueueForTesting(
         tracks: [Track],
         currentIndex: Int,
