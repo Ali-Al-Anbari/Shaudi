@@ -76,17 +76,22 @@ struct LastFMRecommendationService: GenreTagFetching {
             URLQueryItem(name: "limit", value: String(limit))
         ])
 
+#if DEBUG
+        logSimilarTracksResponseStructure(data)
+#endif
+
         let response: SimilarTracksResponse
         do {
             response = try JSONDecoder().decode(SimilarTracksResponse.self, from: data)
         } catch {
 #if DEBUG
-            print("[LastFM] request failed=track.getSimilar response decoding: \(error.localizedDescription)")
+            print("[LastFM] request failed=track.getSimilar response decoding: \(String(reflecting: error))")
 #endif
             throw ServiceError.malformedResponse
         }
 
 #if DEBUG
+        print("[LastFM] decoded track count=\(response.similartracks.track.count)")
         if let attributes = response.similartracks.attributes {
             print(
                 "[LastFM] response artist=\(attributes.artist) "
@@ -111,6 +116,7 @@ struct LastFMRecommendationService: GenreTagFetching {
         }
 
 #if DEBUG
+        print("[LastFM] candidates after conversion=\(tracks.count)")
         print("[LastFM] candidates received=\(tracks.count)")
 #endif
         return tracks
@@ -213,7 +219,10 @@ struct LastFMRecommendationService: GenreTagFetching {
         }
 
 #if DEBUG
-        print("[LastFM] HTTP status=\(httpResponse.statusCode)")
+        print(
+            "[LastFM] method=\(method) HTTP status=\(httpResponse.statusCode) "
+                + "response bytes=\(data.count)"
+        )
 #endif
 
         guard (200..<300).contains(httpResponse.statusCode) else {
@@ -256,6 +265,39 @@ struct LastFMRecommendationService: GenreTagFetching {
         }
         return value
     }
+
+#if DEBUG
+    private func logSimilarTracksResponseStructure(_ data: Data) {
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            print("[LastFM] track.getSimilar response structure=invalid JSON object")
+            return
+        }
+        if root["error"] != nil || root["message"] != nil {
+            print(
+                "[LastFM] track.getSimilar API error=\(root["error"] ?? "missing") "
+                    + "message=\(root["message"] ?? "missing")"
+            )
+        }
+        guard let similar = root["similartracks"] as? [String: Any] else {
+            print(
+                "[LastFM] track.getSimilar similartacks exists=\(root["similartracks"] != nil) "
+                    + "track array exists=false"
+            )
+            return
+        }
+        let rawTracks = similar["track"] as? [Any]
+        print(
+            "[LastFM] track.getSimilar similartacks exists=true "
+                + "track array exists=\(rawTracks != nil) raw track count=\(rawTracks?.count ?? 0)"
+        )
+        if let attributes = similar["@attr"] as? [String: Any] {
+            print(
+                "[LastFM] track.getSimilar corrected artist=\(attributes["artist"] ?? "missing") "
+                    + "track=\(attributes["track"] ?? "missing")"
+            )
+        }
+    }
+#endif
 }
 
 private struct SimilarTracksResponse: Decodable {

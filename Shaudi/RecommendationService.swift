@@ -637,8 +637,14 @@ struct RecommendationService {
         _ limit: Int
     ) async throws -> [LastFMTopTrack]
 
+    typealias ListenBrainzFallbackOperation = (
+        _ seed: RecommendationSeed,
+        _ baseMatch: Double
+    ) async throws -> [LastFMSimilarTrack]
+
     private let similarTracksOperation: SimilarTracksOperation
     private let topTracksOperation: TopTracksOperation
+    private let listenBrainzFallbackOperation: ListenBrainzFallbackOperation?
     private let videoResolver: YouTubeRecommendationResolver
     private let resolutionCache: any YouTubeResolutionCaching
     private let feedbackStore: RecommendationFeedbackStore
@@ -678,6 +684,14 @@ struct RecommendationService {
         }
         topTracksOperation = { artist, limit in
             try await lastFMService.topTracks(artist: artist, limit: limit)
+        }
+        let fallback = RadioListenBrainzFallback()
+        listenBrainzFallbackOperation = { seed, baseMatch in
+            try await fallback.candidates(
+                for: seed,
+                baseMatch: baseMatch,
+                limit: RecommendationRadioPolicy.candidatePoolSize
+            )
         }
         videoResolver = YouTubeRecommendationResolver()
         resolutionCache = PersistentYouTubeResolutionCache.shared
@@ -736,12 +750,14 @@ struct RecommendationService {
         videoResolver: YouTubeRecommendationResolver,
         resolutionCache: any YouTubeResolutionCaching,
         feedbackStore: RecommendationFeedbackStore,
-        personalizationStore: RecommendationPersonalizationStore
+        personalizationStore: RecommendationPersonalizationStore,
+        listenBrainzFallback: ListenBrainzFallbackOperation? = nil
     ) {
         similarTracksOperation = { artist, title, limit, _ in
             try await similarTracks(artist, title, limit)
         }
         topTracksOperation = topTracks
+        listenBrainzFallbackOperation = listenBrainzFallback
         self.videoResolver = videoResolver
         self.resolutionCache = resolutionCache
         self.feedbackStore = feedbackStore
@@ -1111,12 +1127,24 @@ struct RecommendationService {
         for seed: RecommendationSeed,
         excludingSongIdentities: Set<RecommendationSongIdentity>
     ) async throws -> [RankedSong] {
-        let primary = try await primarySimilarTracks(for: seed)
+        let primary: [LastFMSimilarTrack]
+        do {
+            primary = try await primarySimilarTracks(for: seed)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+#if DEBUG
+            print("[Recommendations] Last.fm primary unavailable reason=\(error.localizedDescription)")
+#endif
+            primary = []
+        }
         let primaryRanked = filteredCandidates(
             primary,
             seed: seed,
             excluding: excludingSongIdentities
         ).sorted(by: rankedSongOrder)
+        try Task.checkCancellation()
         guard primaryRanked.count < resultLimit else {
             return primaryRanked
         }
@@ -1132,50 +1160,71 @@ struct RecommendationService {
         }
         print("[Recommendations] surrogateFallback requested artist=\(seed.cleanedArtist)")
 #endif
-        let topTracks: [LastFMTopTrack]
+        var surrogateCandidates: [LastFMSimilarTrack] = []
         do {
-            topTracks = try await topTracksOperation(seed.cleanedArtist, topTrackAnchorLimit)
+            let topTracks = try await topTracksOperation(seed.cleanedArtist, topTrackAnchorLimit)
+            if let surrogate = surrogateAnchor(from: topTracks, excluding: seed.songIdentity) {
+#if DEBUG
+                print("[Recommendations] surrogateAnchor=\(surrogate.artist) - \(surrogate.title)")
+#endif
+                surrogateCandidates = try await similarTracksOperation(
+                    surrogate.artist,
+                    surrogate.title,
+                    candidatePoolLimit,
+                    true
+                )
+            } else {
+#if DEBUG
+                print("[Recommendations] surrogateFallback unavailable reason=noTopTracks")
+#endif
+            }
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            try Task.checkCancellation()
 #if DEBUG
-            print("[Recommendations] surrogateFallback unavailable reason=topTracksFailed")
+            print("[Recommendations] surrogateFallback unavailable reason=\(error.localizedDescription)")
 #endif
-            return primaryRanked
-        }
-        guard let surrogate = surrogateAnchor(from: topTracks, excluding: seed.songIdentity) else {
-#if DEBUG
-            print("[Recommendations] surrogateFallback unavailable reason=noTopTracks")
-#endif
-            return primaryRanked
-        }
-
-#if DEBUG
-        print("[Recommendations] surrogateAnchor=\(surrogate.artist) - \(surrogate.title)")
-#endif
-        let surrogateCandidates: [LastFMSimilarTrack]
-        do {
-            surrogateCandidates = try await similarTracksOperation(
-                surrogate.artist,
-                surrogate.title,
-                candidatePoolLimit,
-                true
-            )
-        } catch {
-#if DEBUG
-            print("[Recommendations] surrogateCandidates received=0")
-#endif
-            return primaryRanked
         }
 #if DEBUG
         print("[Recommendations] surrogateCandidates received=\(surrogateCandidates.count)")
 #endif
-        guard !surrogateCandidates.isEmpty else {
-            return primaryRanked
-        }
-        return filteredCandidates(
-            primary + surrogateCandidates,
+        let lastFMCandidates = primary + surrogateCandidates
+        let lastFMRanked = filteredCandidates(
+            lastFMCandidates,
             seed: seed,
             excluding: excludingSongIdentities
         ).sorted(by: rankedSongOrder)
+        try Task.checkCancellation()
+        guard lastFMRanked.count < resultLimit,
+              let listenBrainzFallbackOperation else { return lastFMRanked }
+#if DEBUG
+        print("[Recommendations] ListenBrainz fallback activated")
+#endif
+        let lowestLastFMMatch = lastFMCandidates.map(\.match).min()
+        let baseMatch = lowestLastFMMatch.map { max(0, $0 - 0.02) } ?? 0.5
+        do {
+            try Task.checkCancellation()
+            let fallbackCandidates = try await listenBrainzFallbackOperation(seed, baseMatch)
+            try Task.checkCancellation()
+            let ranked = filteredCandidates(
+                lastFMCandidates + fallbackCandidates,
+                seed: seed,
+                excluding: excludingSongIdentities
+            ).sorted(by: rankedSongOrder)
+#if DEBUG
+            print("[Recommendations] fallback candidates accepted=\(ranked.count - lastFMRanked.count)")
+#endif
+            return ranked
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+#if DEBUG
+            print("[Recommendations] candidate fallback unavailable reason=\(error.localizedDescription)")
+#endif
+            return lastFMRanked
+        }
     }
 
     private func primarySimilarTracks(
